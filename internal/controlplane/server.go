@@ -155,6 +155,10 @@ func (s *Server) handleSetState(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
+	if !req.State.Valid() {
+		writeErr(w, http.StatusBadRequest, "invalid job state")
+		return
+	}
 	if err := s.st.SetJobState(r.Context(), id, req.State); handleStoreErr(w, err) {
 		return
 	}
@@ -169,6 +173,10 @@ func (s *Server) handleReportSync(w http.ResponseWriter, r *http.Request) {
 	}
 	var req api.ReportSyncRequest
 	if !readJSON(w, r, &req) {
+		return
+	}
+	if !req.Mode.Valid() {
+		writeErr(w, http.StatusBadRequest, "invalid sync mode")
 		return
 	}
 	sy, err := s.st.AddSync(r.Context(), id, req)

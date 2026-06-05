@@ -93,6 +93,13 @@ func handle(conn net.Conn, devicePath, manifestPath string) error {
 	if err := json.Unmarshal(payload, &hello); err != nil {
 		return fmt.Errorf("decode hello: %w", err)
 	}
+	// Validate before allocating/opening anything: a buggy or hostile (but
+	// CA-authenticated) agent must not be able to crash or OOM the receiver.
+	if err := hello.Validate(); err != nil {
+		_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, Message: err.Error()})
+		_ = w.Flush()
+		return err
+	}
 	log.Printf("session: job=%q source=%q device=%q size=%d block=%d full=%v",
 		hello.JobID, hello.SourceHostname, hello.DevicePath, hello.DeviceSize, hello.BlockSize, hello.FullSync)
 
@@ -167,6 +174,16 @@ func applyBlock(dev *blockdiff.Device, applied *blockdiff.Manifest, payload []by
 	hdr, raw, err := protocol.DecodeBlock(payload)
 	if err != nil {
 		return err
+	}
+	// Bound the declared block before allocating/decompressing: RawLen can never
+	// legitimately exceed the negotiated block size, and the write must land
+	// inside the device. This stops a hostile RawLen (e.g. ~4 GiB) from forcing a
+	// huge allocation, and a bad offset from writing out of range.
+	if hdr.RawLen == 0 || int64(hdr.RawLen) > int64(applied.BlockSize) {
+		return fmt.Errorf("block at %d: raw length %d exceeds block size %d", hdr.Offset, hdr.RawLen, applied.BlockSize)
+	}
+	if hdr.Offset < 0 || hdr.Offset+int64(hdr.RawLen) > applied.DeviceSize {
+		return fmt.Errorf("block at %d (len %d) is out of device bounds %d", hdr.Offset, hdr.RawLen, applied.DeviceSize)
 	}
 	if hdr.Codec == protocol.CodecFlate {
 		raw, err = codec.Decompress(raw, int(hdr.RawLen))

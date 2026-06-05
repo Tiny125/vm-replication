@@ -45,6 +45,31 @@ const (
 // peers. Block payloads (block size, at most a few MiB) sit well under this.
 const MaxPayload = 64 << 20 // 64 MiB
 
+// Block-size bounds for a negotiated session. The receiver rejects a Hello
+// outside these, which prevents a buggy/hostile (but authenticated) agent from
+// triggering a divide-by-zero (BlockSize 0) or an oversized per-block
+// allocation. MaxBlockSize stays under MaxPayload so a raw block always fits a
+// frame.
+const (
+	MinBlockSize = 512      // one sector
+	MaxBlockSize = 32 << 20 // 32 MiB
+)
+
+// MaxDeviceSize bounds the device a session may declare (256 TiB). It guards the
+// receiver's manifest allocation (one hash per block) against absurd sizes.
+const MaxDeviceSize = 256 << 40
+
+// Validate sanity-checks a decoded Hello before the receiver acts on it.
+func (h Hello) Validate() error {
+	if h.BlockSize < MinBlockSize || h.BlockSize > MaxBlockSize {
+		return fmt.Errorf("protocol: block size %d out of range [%d,%d]", h.BlockSize, MinBlockSize, MaxBlockSize)
+	}
+	if h.DeviceSize <= 0 || h.DeviceSize > MaxDeviceSize {
+		return fmt.Errorf("protocol: device size %d out of range (0,%d]", h.DeviceSize, MaxDeviceSize)
+	}
+	return nil
+}
+
 // HashLen is the digest length we carry per block (SHA-256).
 const HashLen = sha256.Size
 

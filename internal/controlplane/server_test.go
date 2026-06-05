@@ -111,6 +111,39 @@ func TestEndToEndFlow(t *testing.T) {
 	}
 }
 
+func TestRejectInvalidStateAndMode(t *testing.T) {
+	srv, token := newTestServer(t)
+
+	resp, data := do(t, http.MethodPost, srv.URL+"/api/v1/jobs", token, api.CreateJobRequest{Name: "j1"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create job: %d (%s)", resp.StatusCode, data)
+	}
+	var job api.Job
+	_ = json.Unmarshal(data, &job)
+	id := itoa(job.ID)
+
+	// A bogus state (XSS/metrics-injection vector) must be rejected.
+	resp, _ = do(t, http.MethodPost, srv.URL+"/api/v1/jobs/"+id+"/state", token,
+		map[string]string{"state": "<img src=x onerror=alert(1)>"})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("invalid state: status %d, want 400", resp.StatusCode)
+	}
+
+	// A bogus sync mode must be rejected.
+	resp, _ = do(t, http.MethodPost, srv.URL+"/api/v1/jobs/"+id+"/syncs", token,
+		map[string]any{"mode": "evil", "ok": true})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("invalid mode: status %d, want 400", resp.StatusCode)
+	}
+
+	// A valid state still works.
+	resp, _ = do(t, http.MethodPost, srv.URL+"/api/v1/jobs/"+id+"/state", token,
+		api.SetStateRequest{State: api.JobCutover})
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("valid state: status %d, want 200", resp.StatusCode)
+	}
+}
+
 func itoa(n int64) string {
 	return strings.TrimSpace(string(jsonNumber(n)))
 }

@@ -156,6 +156,14 @@ func (d *DMEra) Candidates(totalBlocks int64) ([]int64, bool, error) {
 }
 
 // Checkpoint records the current era so the next run reports deltas since now.
+//
+// Correctness depends on era_invalidate --written-since N being INCLUSIVE of
+// era N. We store the era observed before advancing (currentEra) and query
+// --written-since <that era> next run, so any blocks written during this sync
+// (still in the current open era) are re-reported and re-sent — idempotent and
+// safe. If a given era_invalidate build is exclusive, those in-flight blocks
+// could be missed; verify inclusivity on the target distro before relying on
+// dm-era for production (the default hashdiff backend has no such caveat).
 func (d *DMEra) Checkpoint() error {
 	era, err := d.currentEra()
 	if err != nil {

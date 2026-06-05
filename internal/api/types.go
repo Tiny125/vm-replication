@@ -25,6 +25,16 @@ const (
 	JobFailed  JobState = "failed"
 )
 
+// Valid reports whether s is a known job state. Used to reject arbitrary values
+// at API ingest so they cannot reach the dashboard or metrics labels.
+func (s JobState) Valid() bool {
+	switch s {
+	case JobActive, JobPaused, JobCutover, JobDone, JobFailed:
+		return true
+	}
+	return false
+}
+
 // SyncMode records whether a sync sent every block or only deltas.
 type SyncMode string
 
@@ -32,6 +42,11 @@ const (
 	SyncFull  SyncMode = "full"
 	SyncDelta SyncMode = "delta"
 )
+
+// Valid reports whether m is a known sync mode.
+func (m SyncMode) Valid() bool {
+	return m == SyncFull || m == SyncDelta
+}
 
 // Server is a registered source or target host in the inventory.
 type Server struct {

@@ -37,7 +37,11 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1) // SQLite: serialize writes; avoids "database is locked"
+	// SQLite: serialize access on one connection to avoid "database is locked".
+	// This is fine for a modest fleet; status/metrics use N+1 per-job queries, so
+	// for large fleets move to set-based aggregate SQL and allow WAL read
+	// concurrency before this single connection becomes a bottleneck.
+	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		db.Close()

@@ -16,6 +16,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/tiny125/vm-replication/internal/api"
@@ -134,11 +137,26 @@ func run(c cfg) (syncResult, error) {
 
 	// Establish a consistent read source (snapshot/freeze) if requested. The
 	// returned readPath is what we actually replicate from; cleanup releases it.
-	readPath, cleanup, err := prepareSource(c)
+	readPath, rawCleanup, err := prepareSource(c)
 	if err != nil {
 		return res, fmt.Errorf("prepare source consistency: %w", err)
 	}
+	// Run cleanup at most once, and also on SIGINT/SIGTERM so an interrupted run
+	// never leaves the source filesystem frozen or an LVM snapshot dangling
+	// (deferred cleanup alone would be skipped on a signal-driven exit).
+	var cleanupOnce sync.Once
+	cleanup := func() { cleanupOnce.Do(rawCleanup) }
 	defer cleanup()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		if _, ok := <-sigCh; ok {
+			log.Printf("agent: signal received, releasing source snapshot/freeze")
+			cleanup()
+			os.Exit(1)
+		}
+	}()
 
 	dev, err := blockdiff.OpenDeviceRead(readPath)
 	if err != nil {

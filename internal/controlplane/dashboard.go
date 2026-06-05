@@ -77,10 +77,10 @@ function render(rows){
     const src=st.source?st.source.name:(j.source_server_id||'—');
     const tgt=st.target?st.target.name:(j.target_addr||'—');
     const last=st.last_sync;
-    const lastTxt=last?(new Date(last.finished_at).toLocaleString()+' ('+last.mode+')'):'never';
+    const lastTxt=last?(new Date(last.finished_at).toLocaleString()+' ('+esc(last.mode)+')'):'never';
     h+='<tr>'+
       '<td><b>'+esc(j.name)+'</b></td>'+
-      '<td><span class="pill '+stateClass(j.state)+'">'+j.state+'</span></td>'+
+      '<td><span class="pill '+stateClass(j.state)+'">'+esc(j.state)+'</span></td>'+
       '<td class="muted">'+esc(String(src))+' → '+esc(String(tgt))+'</td>'+
       '<td><span class="pill '+rpoClass(st)+'">'+(st.last_ok_sync?fmtAge(st.rpo_seconds):'—')+(j.rpo_target_seconds?(' / '+j.rpo_target_seconds+'s'):'')+'</span></td>'+
       '<td class="muted">'+lastTxt+(last&&!last.ok?' <span class="bad">FAILED</span>':'')+'</td>'+

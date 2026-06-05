@@ -55,6 +55,29 @@ func TestValidateRejectsCorruption(t *testing.T) {
 	}
 }
 
+func TestHelloValidate(t *testing.T) {
+	ok := Hello{BlockSize: 4 << 20, DeviceSize: 10 << 20}
+	if err := ok.Validate(); err != nil {
+		t.Errorf("valid hello rejected: %v", err)
+	}
+	cases := []struct {
+		name string
+		h    Hello
+	}{
+		{"zero block size (divide-by-zero)", Hello{BlockSize: 0, DeviceSize: 1 << 20}},
+		{"tiny block size", Hello{BlockSize: 100, DeviceSize: 1 << 20}},
+		{"oversize block size", Hello{BlockSize: MaxBlockSize + 1, DeviceSize: 1 << 20}},
+		{"zero device size", Hello{BlockSize: 4 << 20, DeviceSize: 0}},
+		{"negative device size", Hello{BlockSize: 4 << 20, DeviceSize: -1}},
+		{"oversize device", Hello{BlockSize: 4 << 20, DeviceSize: MaxDeviceSize + 1}},
+	}
+	for _, c := range cases {
+		if err := c.h.Validate(); err == nil {
+			t.Errorf("%s: expected validation error, got nil", c.name)
+		}
+	}
+}
+
 func TestReadFrameRejectsOversize(t *testing.T) {
 	// Hand-craft a header announcing a payload above MaxPayload.
 	hdr := []byte{byte(MsgBlock), 0xff, 0xff, 0xff, 0xff}
