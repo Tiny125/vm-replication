@@ -9,10 +9,12 @@ blocks** of the raw disk over **mutually-authenticated TLS** to a **receiver**
 running on a Linode in Rescue Mode, then **converts** the replicated disk so it
 boots natively on Linode — with a near-zero-downtime cutover.
 
-> Status: **working MVP** — end-to-end replication + Linode provisioning and
-> boot-conversion tooling. See [`docs/DESIGN.md`](docs/DESIGN.md) for the
-> architecture and roadmap, and [`docs/CUTOVER.md`](docs/CUTOVER.md) for the
-> full migration runbook.
+> Status: **working** — end-to-end replication, a control plane with dashboard
+> and Prometheus metrics, systemd services, low-RPO dm-era change tracking,
+> application-consistent snapshots, and Linode provisioning + boot conversion.
+> See [`docs/DESIGN.md`](docs/DESIGN.md) for architecture, [`docs/CUTOVER.md`](docs/CUTOVER.md)
+> for the migration runbook, and [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for
+> running it as a managed service.
 
 ## How it works
 
@@ -30,6 +32,13 @@ boots natively on Linode — with a near-zero-downtime cutover.
   after the target confirms.
 - **Boots on Linode** — `machine-convert.sh` fixes the things a raw copy can't:
   virtio initramfs, GRUB, fstab, Lish serial console, and networking.
+- **Fleet control plane** — `controld` tracks inventory, jobs, and per-sync RPO;
+  a built-in dashboard and `/metrics` show replication lag at a glance, driven
+  from the `replctl` CLI.
+- **Low-RPO option** — `--cbt dmera` uses a device-mapper era target so only
+  kernel-flagged dirty blocks are read, instead of rescanning the whole disk.
+- **Consistent reads** — `--snapshot lvm` takes an app-consistent LVM snapshot
+  (with quiesce hooks) so databases replicate cleanly.
 
 ## Quick start (try it locally in 30 seconds)
 
@@ -82,18 +91,36 @@ scripts/gen-certs.sh certs <LINODE_IP>
 |---|---|
 | `cmd/agent` | source-side agent: diff + stream changed blocks |
 | `cmd/receiver` | target-side daemon: verify + write blocks to a disk |
+| `cmd/controld` | control plane: REST API + dashboard + Prometheus metrics |
+| `cmd/replctl` | CLI for the control plane (register, jobs, status, cutover) |
 | `internal/protocol` | length-prefixed wire framing + block encode/verify |
 | `internal/blockdiff` | device access, block geometry, CBT manifest |
+| `internal/cbt` | change-tracking backends: `hashdiff` and `dmera` |
+| `internal/snapshot` | consistent reads: LVM snapshot / fsfreeze + hooks |
 | `internal/codec` | optional DEFLATE block compression |
 | `internal/transport` | mTLS client/server configs |
-| `scripts/` | cert gen, smoke test, Linode provisioning, machine conversion |
-| `docs/` | `DESIGN.md` (architecture) and `CUTOVER.md` (runbook) |
+| `internal/store` | SQLite state for the control plane |
+| `internal/controlplane` · `internal/controlclient` · `internal/api` | API server, client, shared types |
+| `deploy/systemd` | unit files + env templates for agent/receiver/controld |
+| `scripts/` | cert gen, smoke tests, install, Linode provisioning, machine conversion, dm-era setup |
+| `docs/` | `DESIGN.md`, `CUTOVER.md`, `OPERATIONS.md` |
+
+## Run it as a managed service
+
+See [`docs/OPERATIONS.md`](docs/OPERATIONS.md). In short: start `controld`, create a
+job with `replctl`, install the agent timer, and watch RPO on the dashboard.
+
+```bash
+./bin/controld -listen :8088 -token "$CONTROL_TOKEN"      # control plane + dashboard
+replctl create-job -name mig-web01 -target <ip>:4444 -rpo 60
+sudo scripts/install.sh agent                              # systemd agent timer
+bash scripts/controld-smoke.sh                             # verify the whole loop locally
+```
 
 ## Limitations & roadmap
 
-This is an MVP. It gives crash-consistent replication (use an LVM/fs snapshot for
-app-consistency on the final pass), block-granularity CBT (re-reads the disk each
-cycle), and scripted orchestration. On the roadmap: a control plane (inventory,
-scheduling, RPO tracking), `dm-era` true CBT, application-consistent snapshots,
-resume/checkpoint acks, dedup + zstd, and automated reverse-sync rollback. Full
+Crash-consistent by default (use `--snapshot lvm` for app-consistency); the
+`hashdiff` CBT backend rescans the disk each cycle (use `--cbt dmera` for
+low-RPO). Still on the roadmap: resume/checkpoint acks mid-stream, dedup +
+zstd/LZ4 transport, parallel streams, and automated reverse-sync rollback. Full
 list in [`docs/DESIGN.md`](docs/DESIGN.md#7-roadmap-toward-the-full-sketch).

@@ -10,7 +10,13 @@
 
 # CBT manifests and disk images from local testing
 *.cbt
+*.era
 *.img
+
+# Control plane state
+*.db
+*.db-wal
+*.db-shm
 
 # Editor / OS noise
 .DS_Store

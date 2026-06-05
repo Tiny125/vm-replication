@@ -1,11 +1,104 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/tiny125/vm-replication/internal/api"
+	"github.com/tiny125/vm-replication/internal/cbt"
+	"github.com/tiny125/vm-replication/internal/controlclient"
+	"github.com/tiny125/vm-replication/internal/snapshot"
 )
+
+// registerSource best-effort registers this host in the control plane inventory.
+// Failures are logged but never block replication.
+func registerSource(client *controlclient.Client, name, device string) {
+	if !client.Enabled() {
+		return
+	}
+	if name == "" {
+		name, _ = os.Hostname()
+	}
+	host, _ := os.Hostname()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := client.RegisterServer(ctx, api.RegisterServerRequest{
+		Name:     name,
+		Role:     api.RoleSource,
+		Hostname: host,
+		Device:   device,
+	}); err != nil {
+		log.Printf("control plane: register source failed: %v", err)
+	}
+}
+
+// reportSync best-effort reports a completed (or failed) pass to the control
+// plane. Failures are logged but never change the agent's exit status.
+func reportSync(client *controlclient.Client, jobID int64, res syncResult, runErr error) {
+	if !client.Enabled() || jobID == 0 {
+		return
+	}
+	finished := res.finishedAt
+	if finished.IsZero() {
+		finished = time.Now()
+	}
+	req := api.ReportSyncRequest{
+		Mode:          res.mode,
+		StartedAt:     res.startedAt,
+		FinishedAt:    finished,
+		TotalBlocks:   res.total,
+		ChangedBlocks: res.changed,
+		BytesOnWire:   res.bytes,
+		DurationMS:    finished.Sub(res.startedAt).Milliseconds(),
+		OK:            runErr == nil,
+	}
+	if runErr != nil {
+		req.Error = runErr.Error()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := client.ReportSync(ctx, jobID, req); err != nil {
+		log.Printf("control plane: report sync failed: %v", err)
+	}
+}
+
+// buildTracker constructs the change-block-tracking backend for this run.
+func buildTracker(c cfg) (cbt.Tracker, error) {
+	switch cbt.Strategy(c.cbtMode) {
+	case "", cbt.StrategyHashDiff:
+		return cbt.HashDiff{}, nil
+	case cbt.StrategyDMEra:
+		return cbt.NewDMEra(cbt.DMEraConfig{
+			DMName:          c.dmera.name,
+			MetaDev:         c.dmera.meta,
+			CheckpointFile:  c.dmera.eraFile,
+			BlockSize:       c.blockSize,
+			EraBlockSectors: c.dmera.eraBlockSec,
+		})
+	default:
+		return nil, fmt.Errorf("unknown cbt strategy %q (want hashdiff|dmera)", c.cbtMode)
+	}
+}
+
+// prepareSource establishes a consistent read source according to c.snapMode.
+// It returns the path to read from and a cleanup function that must always be
+// called. For "none" it is a pass-through to the device itself.
+func prepareSource(c cfg) (string, func(), error) {
+	opts := snapshot.Options{
+		Mode:        snapshot.Mode(c.snapMode),
+		Device:      c.device,
+		PreHook:     c.preHook,
+		PostHook:    c.postHook,
+		LVMSnapSize: c.lvSize,
+	}
+	return snapshot.Prepare(opts)
+}
 
 // defaultManifestPath derives a checkpoint filename from the device path,
 // e.g. /dev/sda -> sda.cbt, ./disk.img -> disk.img.cbt.

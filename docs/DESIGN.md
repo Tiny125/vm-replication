@@ -35,9 +35,12 @@ to the fuller architecture.
 |---|---|---|
 | Change capture | Custom kernel CBT / dm-snapshot | **Userspace block diff** — `internal/blockdiff` reads the device, SHA-256s each block, persists a manifest checkpoint |
 | Transport | gRPC + dedup + LZ4 over mTLS | **Framed binary protocol** (`internal/protocol`) over **mTLS 1.3** (`internal/transport`), optional DEFLATE per block (`internal/codec`) |
-| Source | Kernel agent + delta extractor | **`cmd/agent`** — diff + stream changed blocks |
+| Source | Kernel agent + delta extractor | **`cmd/agent`** — diff + stream changed blocks; pluggable CBT (`internal/cbt`) and consistency (`internal/snapshot`) |
 | Target | Receiver, O_DIRECT writer, WAL | **`cmd/receiver`** — verify + write at offset, fsync, target manifest |
-| Control plane | Go API server + Postgres + Temporal | *(Roadmap)* — today the agent runs on a timer; orchestration is scripted |
+| Control plane | Go API server + Postgres + Temporal | **`cmd/controld`** — REST API + dashboard + Prometheus over SQLite (`internal/store`); driven by **`cmd/replctl`**; agents report each sync |
+| Change tracking | Custom kernel CBT | **`hashdiff`** (default) + **`dmera`** device-mapper era backend (`internal/cbt`) |
+| Consistency | — | **`internal/snapshot`** — LVM snapshot / fsfreeze + quiesce hooks |
+| Service mgmt | — | **systemd** units + installer (`deploy/systemd`, `scripts/install.sh`) |
 | Cutover engine | Snapshot + reverse-sync rollback | **Linode provisioning + machine-conversion scripts** (`scripts/`) + `docs/CUTOVER.md` |
 
 ---
@@ -128,14 +131,15 @@ See `docs/CUTOVER.md` for the runbook. In short:
 
 ## 7. Roadmap (toward the full sketch)
 
-| Priority | Item | Why |
+| Status | Item | Notes |
 |---|---|---|
-| High | Control plane (Go API + SQLite/Postgres) | inventory, job scheduling, RPO tracking, dashboard |
-| High | `systemd` units + installer | turn the agent into a managed continuous service |
-| Med | `dm-era` / dm-snapshot CBT | true low-RPO tracking without re-reading the whole disk |
-| Med | Application-consistent snapshots | quiesce DBs via fsfreeze / LVM snapshot for the final pass |
+| ✅ Done | Control plane (Go API + SQLite) | `controld` + `replctl`: inventory, jobs, RPO tracking, dashboard, `/metrics` |
+| ✅ Done | `systemd` units + installer | `deploy/systemd` + `scripts/install.sh` for agent/receiver/controld |
+| ✅ Done | `dm-era` CBT | `internal/cbt` `dmera` backend + `scripts/dm-era-setup.sh` |
+| ✅ Done | Application-consistent snapshots | `internal/snapshot`: LVM snapshot / fsfreeze + quiesce hooks |
 | Med | Resume + per-block checkpoint acks | restart an interrupted sync mid-stream |
 | Med | Dedup + LZ4/zstd, parallel streams | throughput on large/slow links |
+| Med | Job scheduling in `controld` | push schedules to agents instead of local timers |
 | Low | gRPC transport | swap the framed protocol; ecosystem tooling |
 | Low | Automated reverse-sync rollback / bidirectional | hot standby of the old source |
 

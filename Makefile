@@ -8,17 +8,24 @@ LDFLAGS   ?= -s -w
 GOFLAGS   ?=
 CGO_ENABLED ?= 0
 
-.PHONY: all build agent receiver test vet smoke certs clean
+.PHONY: all build agent receiver controld replctl test vet smoke certs clean
 
 all: build
 
-build: agent receiver
+build: agent receiver controld replctl
 
 agent:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN)/agent ./cmd/agent
 
 receiver:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN)/receiver ./cmd/receiver
+
+# controld links the pure-Go SQLite driver; still static (CGO disabled).
+controld:
+	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN)/controld ./cmd/controld
+
+replctl:
+	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN)/replctl ./cmd/replctl
 
 test:
 	$(GO) test ./...

@@ -105,9 +105,9 @@ func BlockLen(size int64, blockSize int, i int64) int {
 
 // Manifest holds one SHA-256 fingerprint per block. It is the CBT checkpoint.
 type Manifest struct {
-	BlockSize int
+	BlockSize  int
 	DeviceSize int64
-	Hashes    [][sha256.Size]byte
+	Hashes     [][sha256.Size]byte
 }
 
 // NewManifest allocates an empty (all-zero) manifest sized for the device.

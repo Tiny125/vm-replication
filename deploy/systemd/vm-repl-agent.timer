@@ -1,0 +1,13 @@
+# Fires the source agent on a cadence. Lower OnUnitActiveSec for a tighter RPO;
+# the agent skips runs gracefully if one is still in progress (oneshot).
+[Unit]
+Description=Run the vm-replication agent periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

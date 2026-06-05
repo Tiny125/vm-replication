@@ -53,10 +53,10 @@ type Hello struct {
 	ProtocolVersion int    `json:"protocol_version"`
 	JobID           string `json:"job_id"`
 	SourceHostname  string `json:"source_hostname"`
-	DevicePath      string `json:"device_path"`  // informational: source device name
-	DeviceSize      int64  `json:"device_size"`  // total bytes the target must hold
-	BlockSize       int    `json:"block_size"`   // fixed block granularity
-	FullSync        bool   `json:"full_sync"`    // true if agent is sending every block
+	DevicePath      string `json:"device_path"` // informational: source device name
+	DeviceSize      int64  `json:"device_size"` // total bytes the target must hold
+	BlockSize       int    `json:"block_size"`  // fixed block granularity
+	FullSync        bool   `json:"full_sync"`   // true if agent is sending every block
 }
 
 // HelloAck is the receiver's response to Hello.

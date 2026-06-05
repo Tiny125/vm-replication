@@ -18,8 +18,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/tiny125/vm-replication/internal/api"
 	"github.com/tiny125/vm-replication/internal/blockdiff"
 	"github.com/tiny125/vm-replication/internal/codec"
+	"github.com/tiny125/vm-replication/internal/controlclient"
 	"github.com/tiny125/vm-replication/internal/protocol"
 	"github.com/tiny125/vm-replication/internal/transport"
 )
@@ -37,6 +39,25 @@ func main() {
 		certFile   = flag.String("cert", "agent.crt", "agent certificate PEM")
 		keyFile    = flag.String("key", "agent.key", "agent private key PEM")
 		caFile     = flag.String("ca", "ca.crt", "CA certificate PEM")
+
+		// Control plane reporting (optional).
+		control      = flag.String("control", os.Getenv("CONTROL_URL"), "control plane base URL (default $CONTROL_URL); empty disables reporting")
+		controlToken = flag.String("control-token", os.Getenv("CONTROL_TOKEN"), "control plane bearer token (default $CONTROL_TOKEN)")
+		controlJob   = flag.Int64("control-job", 0, "control plane numeric job id to report syncs under")
+		sourceName   = flag.String("source-name", "", "inventory name for this source (default hostname)")
+
+		// Source consistency for the read (see internal/snapshot).
+		snapMode = flag.String("snapshot", "none", "consistency mode for the read: none|fsfreeze|lvm")
+		preHook  = flag.String("pre-hook", "", "command to quiesce the app before snapshot (e.g. DB flush)")
+		postHook = flag.String("post-hook", "", "command to resume the app after snapshot")
+		lvSize   = flag.String("lvm-snapshot-size", "5G", "size of the LVM snapshot when --snapshot=lvm")
+
+		// Change-block tracking backend (see internal/cbt).
+		cbtMode       = flag.String("cbt", "hashdiff", "change tracking: hashdiff (rescan+hash) | dmera (device-mapper era)")
+		dmeraName     = flag.String("dmera-name", "", "dm-era device-mapper name (when --cbt=dmera)")
+		dmeraMeta     = flag.String("dmera-meta", "", "dm-era metadata device path (when --cbt=dmera)")
+		dmeraEraFile  = flag.String("dmera-era-file", "", "file storing the last-synced era (default <dmera-name>.era)")
+		dmeraEraSects = flag.Int("dmera-era-block-sectors", 8, "dm-era block size in 512-byte sectors")
 	)
 	flag.Parse()
 
@@ -52,7 +73,7 @@ func main() {
 		sni = hostOf(*target)
 	}
 
-	if err := run(cfg{
+	c := cfg{
 		device:     *device,
 		target:     *target,
 		serverName: sni,
@@ -62,49 +83,115 @@ func main() {
 		full:       *full,
 		compress:   *compress,
 		tls:        transport.Files{CertFile: *certFile, KeyFile: *keyFile, CAFile: *caFile},
-	}); err != nil {
+		snapMode:   *snapMode,
+		preHook:    *preHook,
+		postHook:   *postHook,
+		lvSize:     *lvSize,
+		cbtMode:    *cbtMode,
+		dmera: dmeraCfg{
+			name:        *dmeraName,
+			meta:        *dmeraMeta,
+			eraFile:     *dmeraEraFile,
+			eraBlockSec: *dmeraEraSects,
+		},
+	}
+
+	client := controlclient.New(*control, *controlToken)
+	registerSource(client, *sourceName, *device)
+
+	res, err := run(c)
+	reportSync(client, *controlJob, res, err)
+	if err != nil {
 		log.Fatalf("agent: %v", err)
 	}
 }
 
 type cfg struct {
 	device, target, serverName, manifest, jobID string
-	blockSize                                    int
-	full, compress                               bool
-	tls                                          transport.Files
+	blockSize                                   int
+	full, compress                              bool
+	tls                                         transport.Files
+	snapMode, preHook, postHook, lvSize         string
+	cbtMode                                     string
+	dmera                                       dmeraCfg
 }
 
-func run(c cfg) error {
-	dev, err := blockdiff.OpenDeviceRead(c.device)
+type dmeraCfg struct {
+	name, meta, eraFile string
+	eraBlockSec         int
+}
+
+// syncResult captures stats for control-plane reporting and logging.
+type syncResult struct {
+	mode                  api.SyncMode
+	startedAt, finishedAt time.Time
+	total, changed, bytes int64
+	deviceSize            int64
+}
+
+func run(c cfg) (syncResult, error) {
+	res := syncResult{mode: api.SyncDelta, startedAt: time.Now()}
+
+	// Establish a consistent read source (snapshot/freeze) if requested. The
+	// returned readPath is what we actually replicate from; cleanup releases it.
+	readPath, cleanup, err := prepareSource(c)
 	if err != nil {
-		return fmt.Errorf("open source: %w", err)
+		return res, fmt.Errorf("prepare source consistency: %w", err)
+	}
+	defer cleanup()
+
+	dev, err := blockdiff.OpenDeviceRead(readPath)
+	if err != nil {
+		return res, fmt.Errorf("open source: %w", err)
 	}
 	defer dev.Close()
+	res.deviceSize = dev.Size
 
 	// Load the previous checkpoint unless a full sync is forced.
 	var prev *blockdiff.Manifest
 	if !c.full {
 		prev, err = blockdiff.LoadManifest(c.manifest)
 		if err != nil {
-			return fmt.Errorf("load manifest: %w", err)
+			return res, fmt.Errorf("load manifest: %w", err)
 		}
 	}
 	fullSync := !prev.Matches(dev.Size, c.blockSize)
 	if fullSync && prev != nil {
 		log.Printf("manifest geometry changed; promoting to full sync")
 	}
+	if fullSync {
+		res.mode = api.SyncFull
+	}
 
 	next := blockdiff.NewManifest(dev.Size, c.blockSize)
 	total := blockdiff.NumBlocks(dev.Size, c.blockSize)
+	res.total = total
+
+	// Pick the change-tracking backend and ask which blocks to consider.
+	tracker, err := buildTracker(c)
+	if err != nil {
+		return res, fmt.Errorf("cbt: %w", err)
+	}
+	defer tracker.Close()
+	candidates, considerAllCBT, err := tracker.Candidates(total)
+	if err != nil {
+		return res, fmt.Errorf("cbt candidates: %w", err)
+	}
+	considerAll := considerAllCBT || fullSync
+	if !considerAll {
+		// dm-era partial scan: blocks not reported dirty keep their prior hash.
+		copy(next.Hashes, prev.Hashes)
+		log.Printf("dm-era: %d candidate dirty blocks of %d", len(candidates), total)
+	}
 
 	// Connect to the receiver over mTLS.
 	tlsCfg, err := transport.ClientConfig(c.tls, c.serverName)
 	if err != nil {
-		return err
+		return res, err
 	}
 	conn, err := tls.Dial("tcp", c.target, tlsCfg)
 	if err != nil {
-		return fmt.Errorf("dial receiver: %w", err)
+		return res, fmt.Errorf("dial receiver: %w", err)
 	}
 	defer conn.Close()
 	w := bufio.NewWriterSize(conn, 1<<20)
@@ -120,20 +207,21 @@ func run(c cfg) error {
 		BlockSize:       c.blockSize,
 		FullSync:        fullSync,
 	}); err != nil {
-		return fmt.Errorf("send hello: %w", err)
+		return res, fmt.Errorf("send hello: %w", err)
 	}
 	if err := w.Flush(); err != nil {
-		return err
+		return res, err
 	}
 	if err := expectAck(r); err != nil {
-		return err
+		return res, err
 	}
 
 	start := time.Now()
 	buf := make([]byte, c.blockSize)
 	var changed, bytesWire int64
 
-	for i := int64(0); i < total; i++ {
+	// process reads, hashes, and (if changed vs the checkpoint) ships block i.
+	process := func(i int64) error {
 		blen := blockdiff.BlockLen(dev.Size, c.blockSize, i)
 		off := i * int64(c.blockSize)
 		if _, err := readBlockAt(dev, buf[:blen], off); err != nil {
@@ -143,7 +231,7 @@ func run(c cfg) error {
 		next.Hashes[i] = sum
 
 		if !fullSync && prev.Hashes[i] == sum {
-			continue // unchanged since checkpoint
+			return nil // unchanged since checkpoint (tracker may over-report)
 		}
 
 		payload := buf[:blen]
@@ -159,6 +247,21 @@ func run(c cfg) error {
 		}
 		changed++
 		bytesWire += int64(len(payload))
+		return nil
+	}
+
+	if considerAll {
+		for i := int64(0); i < total; i++ {
+			if err := process(i); err != nil {
+				return res, err
+			}
+		}
+	} else {
+		for _, i := range candidates {
+			if err := process(i); err != nil {
+				return res, err
+			}
+		}
 	}
 
 	if err := protocol.WriteJSON(w, protocol.MsgDone, protocol.Done{
@@ -166,34 +269,36 @@ func run(c cfg) error {
 		ChangedBlocks: changed,
 		BytesOnWire:   bytesWire,
 	}); err != nil {
-		return fmt.Errorf("send done: %w", err)
+		return res, fmt.Errorf("send done: %w", err)
 	}
 	if err := w.Flush(); err != nil {
-		return err
+		return res, err
 	}
 
 	ack, err := expectDoneAck(r)
 	if err != nil {
-		return err
+		return res, err
 	}
 	if !ack.OK {
-		return fmt.Errorf("receiver reported failure: %s", ack.Error)
+		return res, fmt.Errorf("receiver reported failure: %s", ack.Error)
 	}
 
 	// Only commit the new checkpoint once the receiver confirms the apply.
 	if err := next.Save(c.manifest); err != nil {
-		return fmt.Errorf("save manifest: %w", err)
+		return res, fmt.Errorf("save manifest: %w", err)
+	}
+	// Advance the change-tracker's marker (no-op for hashdiff).
+	if err := tracker.Checkpoint(); err != nil {
+		log.Printf("warning: cbt checkpoint failed: %v", err)
 	}
 
-	mode := "delta"
-	if fullSync {
-		mode = "full"
-	}
+	res.changed, res.bytes = changed, bytesWire
+	res.finishedAt = time.Now()
 	dur := time.Since(start)
 	log.Printf("%s sync complete: %d/%d blocks changed, %s on wire in %s (%.1f MiB/s)",
-		mode, changed, total, humanBytes(bytesWire), dur.Round(time.Millisecond),
+		res.mode, changed, total, humanBytes(bytesWire), dur.Round(time.Millisecond),
 		float64(bytesWire)/(1024*1024)/dur.Seconds())
-	return nil
+	return res, nil
 }
 
 func readBlockAt(dev *blockdiff.Device, p []byte, off int64) (int, error) {
