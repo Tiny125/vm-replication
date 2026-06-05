@@ -1,0 +1,17 @@
+# Build output
+/bin/
+
+# Generated mTLS material — never commit private keys
+/certs/
+*.crt
+*.key
+*.csr
+*.srl
+
+# CBT manifests and disk images from local testing
+*.cbt
+*.img
+
+# Editor / OS noise
+.DS_Store
+*.swp
