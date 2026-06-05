@@ -12,9 +12,11 @@ boots natively on Linode — with a near-zero-downtime cutover.
 > Status: **working** — end-to-end replication, a control plane with dashboard
 > and Prometheus metrics, systemd services, low-RPO dm-era change tracking,
 > application-consistent snapshots, and Linode provisioning + boot conversion.
-> See [`docs/DESIGN.md`](docs/DESIGN.md) for architecture, [`docs/CUTOVER.md`](docs/CUTOVER.md)
-> for the migration runbook, and [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for
-> running it as a managed service.
+>
+> **New here? Start with the [step-by-step guide → `docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md).**
+> Also: [`docs/CUTOVER.md`](docs/CUTOVER.md) (concise runbook),
+> [`docs/OPERATIONS.md`](docs/OPERATIONS.md) (managed service), and
+> [`docs/DESIGN.md`](docs/DESIGN.md) (architecture).
 
 ## How it works
 
@@ -103,7 +105,7 @@ scripts/gen-certs.sh certs <LINODE_IP>
 | `internal/controlplane` · `internal/controlclient` · `internal/api` | API server, client, shared types |
 | `deploy/systemd` | unit files + env templates for agent/receiver/controld |
 | `scripts/` | cert gen, smoke tests, install, Linode provisioning, machine conversion, dm-era setup |
-| `docs/` | `DESIGN.md`, `CUTOVER.md`, `OPERATIONS.md` |
+| `docs/` | `GETTING_STARTED.md`, `CUTOVER.md`, `OPERATIONS.md`, `DESIGN.md` |
 
 ## Run it as a managed service
 
