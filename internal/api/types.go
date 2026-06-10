@@ -143,3 +143,97 @@ type ReportSyncRequest struct {
 type SetStateRequest struct {
 	State JobState `json:"state"`
 }
+
+// ===========================================================================
+// Appliance model: a Migration is the turnkey, console-driven unit of work. It
+// supersedes the lower-level Job for appliance users — one migration moves one
+// source server to a Linode Image.
+// ===========================================================================
+
+// MigrationState is the lifecycle of an appliance migration.
+type MigrationState string
+
+const (
+	MigCreated       MigrationState = "created"        // record exists; provisioning storage
+	MigAwaitingAgent MigrationState = "awaiting_agent" // enrollment command issued; no agent yet
+	MigReplicating   MigrationState = "replicating"    // agent checked in; syncing
+	MigReady         MigrationState = "ready"          // validations passed; can cut over
+	MigMigrating     MigrationState = "migrating"      // converting + imaging
+	MigImageReady    MigrationState = "image_ready"    // Linode Image created
+	MigLaunched      MigrationState = "launched"       // new instance launched from the image
+	MigFailed        MigrationState = "failed"
+)
+
+// Migration is one source→Linode migration managed by the appliance console.
+type Migration struct {
+	ID    int64          `json:"id"`
+	Name  string         `json:"name"`
+	State MigrationState `json:"state"`
+
+	// Source details entered in the console.
+	SourceHostname string `json:"source_hostname"`
+	SourceDevice   string `json:"source_device"`
+	SourceDiskSize int64  `json:"source_disk_size"` // bytes
+
+	// Appliance-side resources.
+	ReceiverPort int    `json:"receiver_port"`
+	VolumeID     int64  `json:"volume_id,omitempty"`     // Linode Block Storage volume id
+	VolumeDevice string `json:"volume_device,omitempty"` // device path on the appliance
+	ImageID      string `json:"image_id,omitempty"`      // resulting Linode Image id
+	LaunchedID   int64  `json:"launched_linode_id,omitempty"`
+
+	// Live progress (updated by the embedded receiver + agent reports).
+	AgentLastSeen time.Time `json:"agent_last_seen"`
+	FullSyncDone  bool      `json:"full_sync_done"`
+	TotalBlocks   int64     `json:"total_blocks"`
+	ChangedBlocks int64     `json:"changed_blocks"` // in the most recent sync
+	BytesOnWire   int64     `json:"bytes_on_wire"`
+	LastSyncAt    time.Time `json:"last_sync_at"`
+	LastError     string    `json:"last_error,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// CreateMigrationRequest is the console "New migration" form.
+type CreateMigrationRequest struct {
+	Name           string `json:"name"`
+	SourceHostname string `json:"source_hostname"`
+	SourceDevice   string `json:"source_device"`
+	SourceDiskSize int64  `json:"source_disk_size"`
+}
+
+// ValidationCheck is one pre-cutover gate shown in the console.
+type ValidationCheck struct {
+	Name   string `json:"name"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail"`
+}
+
+// MigrationView is a migration plus its computed validation checks and the
+// enrollment command for the source. The token itself is only included right
+// after creation / on explicit request.
+type MigrationView struct {
+	Migration   Migration         `json:"migration"`
+	RPOSeconds  float64           `json:"rpo_seconds"`
+	Validations []ValidationCheck `json:"validations"`
+	CanMigrate  bool              `json:"can_migrate"`
+	EnrollCmd   string            `json:"enroll_cmd,omitempty"`
+}
+
+// LoginRequest authenticates to the console.
+type LoginRequest struct {
+	Password string `json:"password"`
+}
+
+// SetLinodeTokenRequest stores the Linode API token on the appliance.
+type SetLinodeTokenRequest struct {
+	Token string `json:"token"`
+}
+
+// FinalizeRequest controls what happens when a migration is cut over.
+type FinalizeRequest struct {
+	LaunchInstance bool   `json:"launch_instance"` // also boot a new Linode from the image
+	Region         string `json:"region,omitempty"`
+	Type           string `json:"type,omitempty"`
+	Label          string `json:"label,omitempty"`
+}

@@ -8,11 +8,15 @@ LDFLAGS   ?= -s -w
 GOFLAGS   ?=
 CGO_ENABLED ?= 0
 
-.PHONY: all build agent receiver controld replctl test vet smoke certs clean
+.PHONY: all build agent receiver controld replctl applianced test vet smoke certs clean
 
 all: build
 
-build: agent receiver controld replctl
+build: agent receiver controld replctl applianced
+
+# The turnkey "replication server" daemon (web console + enrollment + finalize).
+applianced:
+	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN)/applianced ./cmd/applianced
 
 agent:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN)/agent ./cmd/agent

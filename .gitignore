@@ -13,10 +13,13 @@
 *.era
 *.img
 
-# Control plane state
+# Control plane / appliance state
 *.db
 *.db-wal
 *.db-shm
+secret.key
+initial-admin-password.txt
+/data/
 
 # Editor / OS noise
 .DS_Store

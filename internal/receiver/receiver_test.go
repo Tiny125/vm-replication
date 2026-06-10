@@ -1,8 +1,7 @@
-package main
+package receiver
 
 import (
 	"crypto/sha256"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -31,7 +30,6 @@ func TestApplyBlockBounds(t *testing.T) {
 	if err := applyBlock(dev, applied, protocol.EncodeBlock(validHdr, good)); err != nil {
 		t.Fatalf("valid block rejected: %v", err)
 	}
-	// The bytes should have landed at the right offset.
 	readback := make([]byte, blockSize)
 	if _, err := dev.ReadAt(readback, blockSize); err != nil {
 		t.Fatalf("readback: %v", err)
@@ -63,6 +61,4 @@ func TestApplyBlockBounds(t *testing.T) {
 	if err := applyBlock(dev, applied, protocol.EncodeBlock(neg, good)); err == nil {
 		t.Error("expected rejection of negative offset")
 	}
-
-	_ = os.Remove(path)
 }

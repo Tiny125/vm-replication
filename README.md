@@ -13,9 +13,15 @@ boots natively on Linode — with a near-zero-downtime cutover.
 > and Prometheus metrics, systemd services, low-RPO dm-era change tracking,
 > application-consistent snapshots, and Linode provisioning + boot conversion.
 >
-> **New here? Start with the [step-by-step guide → `docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md).**
-> Also: [`docs/CUTOVER.md`](docs/CUTOVER.md) (concise runbook),
-> [`docs/OPERATIONS.md`](docs/OPERATIONS.md) (managed service), and
+> **Want the turnkey, AWS MGN–style web console?** See
+> **[`docs/APPLIANCE.md`](docs/APPLIANCE.md)** — one command installs a
+> replication server, you log in with a generated password, enter source
+> details, run a generated one-liner on the source, then click "Start migration"
+> to produce a launchable Linode image.
+>
+> Prefer the manual/CLI workflow? The [step-by-step guide → `docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md).
+> Also: [`docs/CUTOVER.md`](docs/CUTOVER.md) (runbook),
+> [`docs/OPERATIONS.md`](docs/OPERATIONS.md) (systemd/control plane), and
 > [`docs/DESIGN.md`](docs/DESIGN.md) (architecture).
 
 ## How it works
@@ -91,10 +97,12 @@ scripts/gen-certs.sh certs <LINODE_IP>
 
 | Path | What |
 |---|---|
+| `cmd/applianced` | turnkey appliance: web console + per-migration receivers + Linode finalize |
 | `cmd/agent` | source-side agent: diff + stream changed blocks |
-| `cmd/receiver` | target-side daemon: verify + write blocks to a disk |
+| `cmd/receiver` | standalone target-side daemon: verify + write blocks to a disk |
 | `cmd/controld` | control plane: REST API + dashboard + Prometheus metrics |
 | `cmd/replctl` | CLI for the control plane (register, jobs, status, cutover) |
+| `internal/appliance` · `internal/linode` | appliance server/console + Linode API client |
 | `internal/protocol` | length-prefixed wire framing + block encode/verify |
 | `internal/blockdiff` | device access, block geometry, CBT manifest |
 | `internal/cbt` | change-tracking backends: `hashdiff` and `dmera` |
@@ -105,7 +113,7 @@ scripts/gen-certs.sh certs <LINODE_IP>
 | `internal/controlplane` · `internal/controlclient` · `internal/api` | API server, client, shared types |
 | `deploy/systemd` | unit files + env templates for agent/receiver/controld |
 | `scripts/` | cert gen, smoke tests, install, Linode provisioning, machine conversion, dm-era setup |
-| `docs/` | `GETTING_STARTED.md`, `CUTOVER.md`, `OPERATIONS.md`, `DESIGN.md` |
+| `docs/` | `APPLIANCE.md`, `GETTING_STARTED.md`, `CUTOVER.md`, `OPERATIONS.md`, `DESIGN.md` |
 
 ## Run it as a managed service
 

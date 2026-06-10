@@ -92,6 +92,36 @@ CREATE TABLE IF NOT EXISTS syncs (
   error         TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_syncs_job ON syncs(job_id, id DESC);
+
+-- Appliance settings: admin password hash, encrypted Linode token, etc.
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+-- Appliance migrations: the turnkey, console-driven unit of work.
+CREATE TABLE IF NOT EXISTS migrations (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  name            TEXT NOT NULL UNIQUE,
+  state           TEXT NOT NULL,
+  source_hostname TEXT NOT NULL DEFAULT '',
+  source_device   TEXT NOT NULL DEFAULT '',
+  source_disk_size INTEGER NOT NULL DEFAULT 0,
+  enroll_token    TEXT NOT NULL,
+  receiver_port   INTEGER NOT NULL DEFAULT 0,
+  volume_id       INTEGER NOT NULL DEFAULT 0,
+  volume_device   TEXT NOT NULL DEFAULT '',
+  image_id        TEXT NOT NULL DEFAULT '',
+  launched_id     INTEGER NOT NULL DEFAULT 0,
+  agent_last_seen INTEGER NOT NULL DEFAULT 0,
+  full_sync_done  INTEGER NOT NULL DEFAULT 0,
+  total_blocks    INTEGER NOT NULL DEFAULT 0,
+  changed_blocks  INTEGER NOT NULL DEFAULT 0,
+  bytes_on_wire   INTEGER NOT NULL DEFAULT 0,
+  last_sync_at    INTEGER NOT NULL DEFAULT 0,
+  last_error      TEXT NOT NULL DEFAULT '',
+  created_at      INTEGER NOT NULL
+);
 `
 	_, err := s.db.Exec(schema)
 	return err
