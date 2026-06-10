@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# appliance-smoke.sh — end-to-end test of the turnkey appliance without Linode.
+# Starts applianced in file-fallback mode, logs in with the generated password,
+# creates a migration via the console API, runs the agent against the embedded
+# receiver, and drives the migration through to image_ready.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+WORK="$(mktemp -d)"
+PORT="${PORT:-18080}"
+trap 'rm -rf "$WORK"; [ -n "${APP_PID:-}" ] && kill "$APP_PID" 2>/dev/null || true' EXIT
+
+JAR="$WORK/cookies"
+BASE="http://127.0.0.1:$PORT"
+api() { curl -fsS -c "$JAR" -b "$JAR" "$@"; }
+
+echo "== Build =="
+( cd "$ROOT" && go build -o "$WORK/agent" ./cmd/agent && go build -o "$WORK/applianced" ./cmd/applianced )
+
+echo "== Certs (SAN 127.0.0.1) =="
+DAYS=30 "$ROOT/scripts/gen-certs.sh" "$WORK/certs" 127.0.0.1 >/dev/null
+
+echo "== Start applianced (file-fallback) =="
+( cd "$WORK" && ./applianced -listen "127.0.0.1:$PORT" -data-dir "$WORK/data" -public-host 127.0.0.1 \
+    -cert certs/receiver.crt -key certs/receiver.key -ca certs/ca.crt \
+    -agent-cert certs/agent.crt -agent-key certs/agent.key -agent-binary "$WORK/agent" \
+    >"$WORK/app.log" 2>&1 ) &
+APP_PID=$!
+for _ in $(seq 1 60); do grep -q "console on http" "$WORK/app.log" && break; sleep 0.1; done
+grep -q "console on http" "$WORK/app.log" || { echo "applianced did not start"; cat "$WORK/app.log"; exit 1; }
+
+PW="$(cat "$WORK/data/initial-admin-password.txt")"
+echo "   generated admin password: $PW"
+
+echo "== Login =="
+api -X POST "$BASE/login" -H 'Content-Type: application/json' -d "{\"password\":\"$PW\"}" >/dev/null
+echo "   OK (rejecting wrong password):"
+if curl -fsS -X POST "$BASE/login" -H 'Content-Type: application/json' -d '{"password":"wrong"}' >/dev/null 2>&1; then
+  echo "   FAIL: wrong password accepted"; exit 1
+fi
+echo "   OK"
+
+echo "== Create source image (16 MiB) =="
+dd if=/dev/urandom of="$WORK/source.img" bs=1M count=16 status=none
+SIZE=$(stat -c %s "$WORK/source.img")
+
+echo "== Create migration via console API =="
+MIG=$(api -X POST "$BASE/api/v1/migrations" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"web01\",\"source_hostname\":\"web01\",\"source_device\":\"$WORK/source.img\",\"source_disk_size\":$SIZE}")
+MID=$(echo "$MIG" | jq -r '.migration.id')
+RPORT=$(echo "$MIG" | jq -r '.migration.receiver_port')
+echo "   migration id=$MID receiver_port=$RPORT"
+echo "   enroll cmd: $(echo "$MIG" | jq -r '.enroll_cmd')"
+[ -n "$MID" ] && [ "$RPORT" -gt 0 ] || { echo "FAIL: bad migration"; exit 1; }
+
+echo "== Run agent against the embedded receiver =="
+ok=0
+for attempt in 1 2 3 4 5; do
+  if "$WORK/agent" -device "$WORK/source.img" -target "127.0.0.1:$RPORT" -server-name 127.0.0.1 \
+       -manifest "$WORK/source.cbt" -cert "$WORK/certs/agent.crt" -key "$WORK/certs/agent.key" -ca "$WORK/certs/ca.crt"; then
+    ok=1; break
+  fi
+  sleep 0.5
+done
+[ "$ok" = 1 ] || { echo "FAIL: agent never succeeded"; exit 1; }
+
+echo "== Verify replicated image matches source =="
+cmp -s "$WORK/source.img" "$WORK/data/migration-$MID.img" || { echo "FAIL: images differ"; exit 1; }
+echo "   OK: byte-identical"
+
+echo "== Check status + validations =="
+V=$(api "$BASE/api/v1/migrations/$MID")
+echo "$V" | jq -e '.migration.full_sync_done==true' >/dev/null || { echo "FAIL: full sync not recorded"; exit 1; }
+echo "$V" | jq -e '.can_migrate==true' >/dev/null || { echo "FAIL: validations not satisfied: $(echo "$V" | jq -c '.validations')"; exit 1; }
+echo "   OK: full_sync_done=true, can_migrate=true"
+
+echo "== Start migration (file-fallback finalize) =="
+api -X POST "$BASE/api/v1/migrations/$MID/start" -H 'Content-Type: application/json' -d '{}' >/dev/null
+for _ in $(seq 1 50); do
+  STATE=$(api "$BASE/api/v1/migrations/$MID" | jq -r '.migration.state')
+  [ "$STATE" = "image_ready" ] && break
+  [ "$STATE" = "failed" ] && { echo "FAIL: migration failed: $(api "$BASE/api/v1/migrations/$MID" | jq -r '.migration.last_error')"; exit 1; }
+  sleep 0.2
+done
+[ "$STATE" = "image_ready" ] || { echo "FAIL: state=$STATE, want image_ready"; exit 1; }
+echo "   OK: migration reached image_ready"
+
+echo
+echo "APPLIANCE SMOKE PASSED"

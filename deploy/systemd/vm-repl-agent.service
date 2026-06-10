@@ -1,0 +1,31 @@
+# Runs one replication pass on the source. Driven by vm-repl-agent.timer for
+# continuous, low-RPO replication. Configure via /etc/vm-repl/agent.env.
+[Unit]
+Description=vm-replication source agent (one sync pass)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/vm-repl/agent.env
+WorkingDirectory=/var/lib/vm-repl
+# Reads a raw block device, so it needs privilege; restrict the rest.
+ExecStart=/usr/local/bin/agent \
+  -device ${DEVICE} \
+  -target ${TARGET} \
+  -server-name ${SERVER_NAME} \
+  -manifest /var/lib/vm-repl/source.cbt \
+  -control ${CONTROL_URL} \
+  -control-token ${CONTROL_TOKEN} \
+  -control-job ${CONTROL_JOB} \
+  -source-name ${SOURCE_NAME} \
+  -cert ${CERT_DIR}/agent.crt \
+  -key ${CERT_DIR}/agent.key \
+  -ca ${CERT_DIR}/ca.crt \
+  $EXTRA_ARGS
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=5
+NoNewPrivileges=true
+ProtectHome=true
+ProtectControlGroups=true

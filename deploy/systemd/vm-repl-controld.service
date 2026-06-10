@@ -1,0 +1,23 @@
+# Control plane daemon: REST API, dashboard, and Prometheus metrics.
+# Configure via /etc/vm-repl/controld.env (CONTROL_TOKEN, LISTEN).
+[Unit]
+Description=vm-replication control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/vm-repl/controld.env
+ExecStart=/usr/local/bin/controld -listen ${LISTEN} -db /var/lib/vm-repl/controld.db
+Restart=on-failure
+RestartSec=5
+# Runs as an unprivileged dynamic user with its own state dir.
+DynamicUser=true
+StateDirectory=vm-repl
+WorkingDirectory=/var/lib/vm-repl
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

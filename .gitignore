@@ -1,0 +1,26 @@
+# Build output
+/bin/
+
+# Generated mTLS material — never commit private keys
+/certs/
+*.crt
+*.key
+*.csr
+*.srl
+
+# CBT manifests and disk images from local testing
+*.cbt
+*.era
+*.img
+
+# Control plane / appliance state
+*.db
+*.db-wal
+*.db-shm
+secret.key
+initial-admin-password.txt
+/data/
+
+# Editor / OS noise
+.DS_Store
+*.swp

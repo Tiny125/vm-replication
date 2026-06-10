@@ -1,0 +1,23 @@
+# Long-running target receiver. On a Linode staging instance this writes
+# incoming blocks to the raw disk. Configure via /etc/vm-repl/receiver.env.
+[Unit]
+Description=vm-replication target receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/vm-repl/receiver.env
+ExecStart=/usr/local/bin/receiver \
+  -listen ${LISTEN} \
+  -device ${DEVICE} \
+  -manifest /var/lib/vm-repl/target.cbt \
+  -cert ${CERT_DIR}/receiver.crt \
+  -key ${CERT_DIR}/receiver.key \
+  -ca ${CERT_DIR}/ca.crt
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
