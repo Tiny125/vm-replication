@@ -218,12 +218,13 @@ type ValidationCheck struct {
 // enrollment command for the source. The token itself is only included right
 // after creation / on explicit request.
 type MigrationView struct {
-	Migration   Migration         `json:"migration"`
-	RPOSeconds  float64           `json:"rpo_seconds"`
-	Validations []ValidationCheck `json:"validations"`
-	CanMigrate  bool              `json:"can_migrate"`
-	Assessed    bool              `json:"assessed"` // pre-migration assessment passed
-	EnrollCmd   string            `json:"enroll_cmd,omitempty"`
+	Migration    Migration         `json:"migration"`
+	RPOSeconds   float64           `json:"rpo_seconds"`
+	Validations  []ValidationCheck `json:"validations"`
+	CanMigrate   bool              `json:"can_migrate"`
+	Assessed     bool              `json:"assessed"` // pre-migration assessment passed
+	EnrollCmd    string            `json:"enroll_cmd,omitempty"`
+	UninstallCmd string            `json:"uninstall_cmd,omitempty"` // removes the agent from the source
 
 	// Live progress for the console: Phase is a human label ("initial sync",
 	// "finalizing", …); PercentDone/ETASeconds are -1 when unknown.

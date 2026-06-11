@@ -169,6 +169,35 @@ installs the mTLS material, and starts a **systemd timer** that replicates the
 disk to the appliance every 60 seconds. (First run is a full copy; later runs
 ship only changed blocks.)
 
+### If the first sync fails
+
+**No reinstall is needed — the agent retries every 60 seconds automatically.**
+Fix the cause and it heals on its own. The most common cause is the receiver
+port being blocked: open **inbound TCP 5000–5100** on the replication server's
+firewall — including any **Linode Cloud Firewall** attached to it in Cloud
+Manager (the on-box `ufw` rule the installer adds does not cover that). Check
+the real error with `journalctl -u vmrepl-agent -n 20`, and force an immediate
+retry with:
+
+```bash
+sudo systemctl start vmrepl-agent.service
+```
+
+Re-running the enrollment one-liner is also safe at any time — it stops the
+previous agent and replaces it atomically.
+
+### Removing the agent (after migration completes)
+
+One command removes everything enrollment installed (binary, timer, certs,
+checkpoint). The console shows it with a Copy button on completed migrations:
+
+```bash
+curl -fsSL -k --pinnedpubkey 'sha256//…' 'https://<replication-server>:8080/install/uninstall.sh' | sudo bash
+```
+
+The agent only ever *reads* the source disk; removal changes nothing about the
+server's data or OS.
+
 ---
 
 ## 6. Watch status and validation in the console

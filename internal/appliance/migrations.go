@@ -498,7 +498,14 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	if token != "" {
 		v.EnrollCmd = s.enrollCmd(token, m)
 	}
+	v.UninstallCmd = s.uninstallCmd()
 	return v
+}
+
+// uninstallCmd is the one-liner that removes the agent from a source server.
+func (s *Server) uninstallCmd() string {
+	return fmt.Sprintf("curl -fsSL %s'%s://%s:%d/install/uninstall.sh' | sudo bash",
+		s.curlPinFlag(), s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort)
 }
 
 func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCheck {

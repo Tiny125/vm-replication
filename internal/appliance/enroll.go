@@ -60,9 +60,18 @@ command -v curl >/dev/null || { echo "curl is required"; exit 1; }
 CURL="curl -fsSL"
 [ -n "$PIN" ] && CURL="$CURL -k --pinnedpubkey sha256//$PIN"
 
+# Re-running enrollment is safe: stop any previous agent first so the running
+# binary can be replaced (overwriting a running executable fails with
+# "text file busy" / curl error 23), and swap it in atomically.
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl stop vmrepl-agent.timer vmrepl-agent.service 2>/dev/null || true
+fi
+
 echo ">> Downloading agent"
-$CURL "$BASE/download/agent?token=$TOKEN" -o "$BIN"
-chmod +x "$BIN"
+TMP="$(mktemp "$(dirname "$BIN")/.vmrepl-agent.XXXXXX")"
+$CURL "$BASE/download/agent?token=$TOKEN" -o "$TMP"
+chmod 0755 "$TMP"
+mv -f "$TMP" "$BIN"   # atomic on the same filesystem; safe even if the old binary runs
 
 echo ">> Installing TLS material"
 mkdir -p "$ETC"
@@ -98,7 +107,15 @@ UNIT
   systemctl daemon-reload
   systemctl enable --now vmrepl-agent.timer
   echo ">> Starting initial full sync now (this can take a while)"
-  systemctl start vmrepl-agent.service || true
+  if systemctl start vmrepl-agent.service; then
+    echo ">> First sync succeeded."
+  else
+    echo ">> First sync FAILED — see: journalctl -u vmrepl-agent -n 20"
+    echo ">> No reinstall needed: the agent retries every 60s automatically."
+    echo ">> Common cause: receiver port $TARGET blocked — open TCP 5000-5100 on the"
+    echo ">> replication server's firewall (including any Linode Cloud Firewall)."
+    echo ">> Force a retry any time with: systemctl start vmrepl-agent.service"
+  fi
   echo ">> Enrolled. Follow progress in the console; logs: journalctl -u vmrepl-agent"
 else
   echo "systemd not found; run the agent manually on a schedule:"
@@ -107,6 +124,31 @@ else
 fi
 `, m.Name, base, token, m.SourceDevice, target, s.cfg.PublicHost, s.cfg.PublicKeyPin)
 
+	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+	_, _ = w.Write([]byte(script))
+}
+
+// handleUninstallScript serves a script that removes everything enrollment
+// installed on a source server. It is deliberately NOT token-gated: tokens are
+// deleted with their migration, but operators still need to clean up sources
+// afterwards — and the script contains no secrets, only removal commands.
+func (s *Server) handleUninstallScript(w http.ResponseWriter, r *http.Request) {
+	const script = `#!/usr/bin/env bash
+# vm-replication agent uninstall — removes everything enrollment installed.
+set -u
+[ "$(id -u)" -eq 0 ] || { echo "run as root (use sudo)"; exit 1; }
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl disable --now vmrepl-agent.timer 2>/dev/null
+  systemctl stop vmrepl-agent.service 2>/dev/null
+  rm -f /etc/systemd/system/vmrepl-agent.service /etc/systemd/system/vmrepl-agent.timer
+  systemctl daemon-reload
+fi
+rm -f /usr/local/bin/vmrepl-agent
+rm -rf /etc/vm-repl
+rm -f /var/lib/vmrepl-source.cbt
+echo "vm-replication agent removed. This server's data and OS were never modified."
+`
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
 	_, _ = w.Write([]byte(script))
 }
