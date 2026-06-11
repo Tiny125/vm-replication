@@ -41,7 +41,7 @@ type Progress func(writtenBlocks, totalBlocks int64, fullSync bool)
 // cancelled or the listener closes. onComplete (if non-nil) is called after each
 // successful session; onProgress (if non-nil) is called periodically during a
 // session. If once is true, Serve returns after the first successful session.
-func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress) error {
+func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress, onError func(error)) error {
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
@@ -57,6 +57,9 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 		stats, herr := Handle(conn, devicePath, manifestPath, onProgress)
 		if herr != nil {
 			log.Printf("receiver: session from %s ended with error: %v", conn.RemoteAddr(), herr)
+			if onError != nil {
+				onError(herr)
+			}
 		} else if onComplete != nil {
 			onComplete(stats)
 		}

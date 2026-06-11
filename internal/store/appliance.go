@@ -229,7 +229,7 @@ INSERT INTO migration_disks (migration_id, idx, source_device, size_bytes) VALUE
 }
 
 const diskCols = `id, idx, source_device, size_bytes, receiver_port, volume_id, volume_device,
- artifact_id, full_sync_done, total_blocks, changed_blocks, bytes_on_wire, last_sync_at, agent_last_seen`
+ artifact_id, full_sync_done, total_blocks, changed_blocks, bytes_on_wire, last_sync_at, agent_last_seen, last_error`
 
 func scanDisk(row interface{ Scan(...any) error }) (api.Disk, error) {
 	var d api.Disk
@@ -237,7 +237,7 @@ func scanDisk(row interface{ Scan(...any) error }) (api.Disk, error) {
 	var lastSync, agentSeen int64
 	if err := row.Scan(&d.ID, &d.Index, &d.SourceDevice, &d.SizeBytes, &d.ReceiverPort, &d.VolumeID,
 		&d.VolumeDevice, &d.ArtifactID, &full, &d.TotalBlocks, &d.ChangedBlocks, &d.BytesOnWire,
-		&lastSync, &agentSeen); err != nil {
+		&lastSync, &agentSeen, &d.LastError); err != nil {
 		return api.Disk{}, err
 	}
 	d.FullSyncDone = full != 0
@@ -357,6 +357,47 @@ func (s *Store) SetDiskArtifact(ctx context.Context, diskID int64, artifactID st
 	return err
 }
 
+// RecordDiskError records (or clears, with msg="") the last receiver-side
+// session error for a disk and refreshes its agent_last_seen.
+func (s *Store) RecordDiskError(ctx context.Context, diskID int64, msg string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE migration_disks SET last_error=?, agent_last_seen=? WHERE id=?`,
+		msg, unix(time.Now()), diskID)
+	return err
+}
+
+// AddEvent appends an entry to a migration's activity log.
+func (s *Store) AddEvent(ctx context.Context, migrationID int64, level, message string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO migration_events (migration_id, at, level, message) VALUES (?, ?, ?, ?)`,
+		migrationID, unix(time.Now()), level, message)
+	return err
+}
+
+// Events returns a migration's activity log, newest first (capped).
+func (s *Store) Events(ctx context.Context, migrationID int64, limit int) ([]api.Event, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, at, level, message FROM migration_events WHERE migration_id=? ORDER BY id DESC LIMIT ?`,
+		migrationID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []api.Event
+	for rows.Next() {
+		var e api.Event
+		var at int64
+		if err := rows.Scan(&e.ID, &at, &e.Level, &e.Message); err != nil {
+			return nil, err
+		}
+		e.At = fromUnix(at)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // SetMigrationImage records the boot artifact and launched instance.
 func (s *Store) SetMigrationImage(ctx context.Context, id int64, imageID string, launchedID int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE migrations SET image_id=?, launched_id=? WHERE id=?`, imageID, launchedID, id)
@@ -370,7 +411,7 @@ func (s *Store) RecordDiskSync(ctx context.Context, migrationID, diskID int64, f
 	if _, err := s.db.ExecContext(ctx, `
 UPDATE migration_disks
 SET total_blocks=?, changed_blocks=?, bytes_on_wire=bytes_on_wire+?,
-    last_sync_at=?, agent_last_seen=?, full_sync_done = (full_sync_done=1 OR ?)
+    last_sync_at=?, agent_last_seen=?, full_sync_done = (full_sync_done=1 OR ?), last_error=''
 WHERE id=?`,
 		total, changed, bytes, now, now, boolToInt(fullSync), diskID); err != nil {
 		return err
