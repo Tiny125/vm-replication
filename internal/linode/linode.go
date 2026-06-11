@@ -74,12 +74,18 @@ type Volume struct {
 	FilesystemPath string `json:"filesystem_path"`
 }
 
-// CreateVolume creates a Block Storage volume of sizeGiB in region, optionally
-// attached to linodeID (0 = unattached).
+// CreateVolume creates a Block Storage volume of sizeGiB. When linodeID is
+// non-zero the volume is created attached to that Linode and region is OMITTED:
+// the API requires the volume's region to match the Linode's, and rejects the
+// request if a different region is supplied ("The Linode's region does not
+// match the requested region for creation"). region is only sent for
+// unattached volumes.
 func (c *Client) CreateVolume(ctx context.Context, label, region string, sizeGiB int, linodeID int64) (Volume, error) {
-	req := map[string]any{"label": label, "region": region, "size": sizeGiB}
+	req := map[string]any{"label": label, "size": sizeGiB}
 	if linodeID != 0 {
 		req["linode_id"] = linodeID
+	} else {
+		req["region"] = region
 	}
 	var v Volume
 	err := c.do(ctx, http.MethodPost, "/volumes", req, &v)
@@ -102,6 +108,19 @@ func (c *Client) AttachVolume(ctx context.Context, volumeID, linodeID int64) err
 // DetachVolume detaches a volume from any Linode.
 func (c *Client) DetachVolume(ctx context.Context, volumeID int64) error {
 	return c.do(ctx, http.MethodPost, fmt.Sprintf("/volumes/%d/detach", volumeID), map[string]any{}, nil)
+}
+
+// DeleteVolume permanently deletes a volume.
+func (c *Client) DeleteVolume(ctx context.Context, volumeID int64) error {
+	return c.do(ctx, http.MethodDelete, fmt.Sprintf("/volumes/%d", volumeID), nil, nil)
+}
+
+// GetInstance fetches a Linode instance (used to learn the appliance's actual
+// region so launches and volumes default to it instead of a configured guess).
+func (c *Client) GetInstance(ctx context.Context, id int64) (Instance, error) {
+	var inst Instance
+	err := c.do(ctx, http.MethodGet, fmt.Sprintf("/linode/instances/%d", id), nil, &inst)
+	return inst, err
 }
 
 // CloneVolume clones a volume into a new immutable volume (the migration's

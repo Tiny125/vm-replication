@@ -37,6 +37,13 @@ const consoleHTML = `<!DOCTYPE html>
  .hide{display:none}
  .err{color:var(--red);font-size:12px;margin-top:8px}
  .prog{height:6px;background:#0e1116;border-radius:4px;overflow:hidden;margin-top:4px} .prog>div{height:100%;background:var(--accent)}
+ details{margin:6px 0} details>summary{cursor:pointer;color:var(--accent);font-size:12px;user-select:none;list-style:none}
+ details>summary::before{content:'▸ '} details[open]>summary::before{content:'▾ '}
+ details>div{margin-top:8px}
+ button.danger{color:var(--red);border-color:rgba(239,68,68,.4)} button.danger:hover{border-color:var(--red)}
+ .banner{border:1px solid rgba(34,197,94,.4);border-radius:8px;padding:10px 14px;margin:8px 0;color:var(--green);font-size:13px}
+ .banner a{color:var(--accent)}
+ .actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
 </style></head>
 <body>
  <h1>vm-<span>replication</span> · migration console</h1>
@@ -64,17 +71,22 @@ const consoleHTML = `<!DOCTYPE html>
 
    <div class="card">
      <h2>New migration</h2>
-     <div class="muted" style="font-size:12px;margin-bottom:8px">
-       Not sure what to enter? Run this on your <b>source server</b> — it prints all four values:
-     </div>
-     <div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px">
-       <pre id="srcCmd" style="flex:1;margin:0">echo "Hostname : $(hostname)"; lsblk -b -d -n -o NAME,SIZE,TYPE | awk '$3=="disk"{printf "Device   : /dev/%s\nSize(GB) : %d\n", $1, ($2+1073741823)/1073741824}'</pre>
-       <button onclick="copyText(document.getElementById('srcCmd').textContent,this)">Copy</button>
-     </div>
-     <div class="muted" style="font-size:11px;margin-bottom:12px">
-       Enter the <b>whole disk</b> (e.g. <code style="display:inline;padding:1px 4px">/dev/sda</code>), not a partition — pick the
-       disk whose partitions include the root filesystem (<code style="display:inline;padding:1px 4px">/</code>). Always round the size <b>up</b>.
-     </div>
+     <details>
+       <summary>How do I find the source details?</summary>
+       <div>
+         <div class="muted" style="font-size:12px;margin-bottom:8px">
+           Run this on your <b>source server</b> — it prints all four values:
+         </div>
+         <div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px">
+           <pre id="srcCmd" style="flex:1;margin:0">echo "Hostname : $(hostname)"; lsblk -b -d -n -o NAME,SIZE,TYPE | awk '$3=="disk"{printf "Device   : /dev/%s\nSize(GB) : %d\n", $1, ($2+1073741823)/1073741824}'</pre>
+           <button onclick="copyText(document.getElementById('srcCmd').textContent,this)">Copy</button>
+         </div>
+         <div class="muted" style="font-size:11px;margin-bottom:6px">
+           Enter the <b>whole disk</b> (e.g. <code style="display:inline;padding:1px 4px">/dev/sda</code>), not a partition — pick the
+           disk whose partitions include the root filesystem (<code style="display:inline;padding:1px 4px">/</code>). Always round the size <b>up</b>.
+         </div>
+       </div>
+     </details>
      <div class="row">
        <div><label>Name</label><input id="m_name" placeholder="web01"></div>
        <div><label>Source hostname</label><input id="m_host" placeholder="web01.prod"></div>
@@ -122,10 +134,13 @@ async function loadSettings(){
   const st=await api('GET','/api/v1/settings');
   let h='<h2>Linode automation</h2>';
   if(st.linode_token_set){
-    h+='<div class="check"><span class="y">✔</span> Linode API token stored. '+
-       (st.linode_automation?('Appliance Linode id '+esc(st.appliance_linode_id)+', region '+esc(st.region)+'.'):'(appliance Linode id unknown — file-fallback mode)')+'</div>';
+    h+='<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">'+
+       '<span class="check"><span class="y">✔</span> Linode API token stored. '+
+       (st.linode_automation?('Appliance Linode id '+esc(st.appliance_linode_id)+', volumes are created in the appliance’s own region.'):'(appliance Linode id unknown — file-fallback mode)')+'</span>'+
+       '<button class="danger" onclick="removeToken()">Remove token</button></div>';
   }else{
-    h+='<div class="muted" style="font-size:12px;margin-bottom:8px">'+
+    h+='<details><summary>What is this and how do I get a token?</summary><div>'+
+       '<div class="muted" style="font-size:12px;margin-bottom:8px">'+
        'A Linode <b>Personal Access Token</b> lets this appliance provision Block Storage volumes, '+
        'clone the migrated disk, and launch new instances on your behalf. Without it the tool runs in '+
        'file-fallback mode (no Linode provisioning). The token is stored <b>encrypted at rest</b> on this server '+
@@ -135,12 +150,16 @@ async function loadSettings(){
        '<b>How to get one:</b> open <a href="https://cloud.linode.com/profile/tokens" target="_blank" rel="noopener" style="color:var(--accent)">cloud.linode.com/profile/tokens</a> '+
        '&rarr; <i>Create a Personal Access Token</i>. Set all scopes to <b>None</b> except '+
        '<b>Linodes: Read/Write</b> and <b>Volumes: Read/Write</b>, then create and copy the token (shown once).'+
-       '</div>'+
-       '<div style="display:flex;gap:8px"><input id="ltok" type="password" placeholder="Linode API token"><button onclick="saveToken()">Save</button></div>';
+       '</div></div></details>'+
+       '<div style="display:flex;gap:8px;margin-top:8px"><input id="ltok" type="password" placeholder="Linode API token"><button onclick="saveToken()">Save</button></div>';
   }
   $('settings').innerHTML=h;
 }
 async function saveToken(){try{await api('POST','/api/v1/settings/linode-token',{token:$('ltok').value});loadSettings()}catch(e){alert('Error: '+e.message)}}
+async function removeToken(){
+  if(!confirm('Remove the stored Linode API token?\n\nVolume provisioning and finalize will stop working until you save a new token. Existing migrations and volumes are not affected.'))return;
+  try{await api('DELETE','/api/v1/settings/linode-token');loadSettings()}catch(e){alert('Error: '+e.message)}
+}
 
 async function createMig(){
   $('createErr').textContent='';
@@ -163,6 +182,43 @@ async function startMig(id){
   catch(e){alert('Cannot start: '+e.message)}
 }
 
+async function assessMig(id){
+  try{
+    const v=await api('POST','/api/v1/migrations/'+id+'/assess');
+    if(v.assessed){refresh()}
+    else{
+      const fails=(v.validations||[]).filter(c=>!c.ok).map(c=>'✘ '+c.name+' — '+c.detail).join('\n');
+      alert('Assessment failed:\n\n'+fails);
+      refresh();
+    }
+  }catch(e){alert('Assessment error: '+e.message)}
+}
+
+async function stopMig(id){
+  if(!confirm('Stop migration #'+id+'?\n\nThe finalize run is cancelled and replication resumes. You will need to re-run the assessment before starting again.'))return;
+  try{await api('POST','/api/v1/migrations/'+id+'/stop');refresh()}
+  catch(e){alert('Cannot stop: '+e.message)}
+}
+
+async function deleteMig(id,name){
+  if(!confirm('Delete migration #'+id+' ('+name+')?\n\nWARNING: this stops its receiver and deletes the replication volume with ALL replicated data for this migration. A completed artifact volume (vmrepl-img-'+id+') is kept. The agent on the source keeps running until you remove it there (systemctl disable --now vmrepl-agent.timer).\n\nThis cannot be undone.'))return;
+  try{await api('DELETE','/api/v1/migrations/'+id);refresh()}
+  catch(e){alert('Cannot delete: '+e.message)}
+}
+
+function fmtDur(s){if(s==null||s<0)return '—';s=Math.round(s);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
+
+function progressLine(v,m){
+  // Live phase + percent + ETA; the page polls every 5s so this self-refreshes.
+  let line='<span class="muted">'+esc(v.phase||'')+'</span>';
+  let width=0;
+  if(v.percent_done>=0){width=Math.max(2,Math.round(v.percent_done));line+=' · '+v.percent_done.toFixed(1)+'%';}
+  if(v.eta_seconds>=0){line+=' · est. '+fmtDur(v.eta_seconds)+' remaining';}
+  else if(m.state==='migrating'){line+=' · running '+fmtDur(v.elapsed_seconds);width=2;}
+  if(['image_ready','launched'].includes(m.state)){width=100;line+=' in '+fmtDur(v.elapsed_seconds);}
+  return line+'<div class="prog"><div style="width:'+width+'%"></div></div><span class="muted">'+fmtBytes(m.bytes_on_wire)+' received</span>';
+}
+
 function migCard(v){
   const m=v.migration;
   let h='<table style="margin-bottom:6px"><tr>'+
@@ -170,28 +226,45 @@ function migCard(v){
     '<td><span class="pill '+stateClass(m.state)+'">'+esc(m.state)+'</span>'+(m.last_error?'<div class="err">'+esc(m.last_error)+'</div>':'')+'</td>'+
     '<td class="muted">'+(m.full_sync_done?'baseline done':'baselining')+'</td>'+
     '<td class="muted">'+esc(m.source_hostname||'-')+'<br>'+esc(m.source_device)+'</td>'+
-    '<td>'+ (m.total_blocks? ((m.total_blocks-m.changed_blocks)+'/'+m.total_blocks+' blocks current'):'—') +
-       '<div class="prog"><div style="width:'+pct(m)+'%"></div></div><span class="muted">'+fmtBytes(m.bytes_on_wire)+' sent</span></td>'+
+    '<td>'+progressLine(v,m)+'</td>'+
     '<td class="muted">'+(v.rpo_seconds?Math.round(v.rpo_seconds)+'s':'—')+'</td>'+
     '</tr></table>';
-  // validations
-  h+='<div style="margin:8px 0">';
-  for(const c of (v.validations||[])){h+='<div class="check"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>'}
-  h+='</div>';
-  // enroll command
+
+  // Completed banner with where to find the artifact in the Linode account.
+  if(['image_ready','launched'].includes(m.state)){
+    h+='<div class="banner">✔ <b>Migration completed.</b> The migrated disk image is the volume '+
+       '<code style="display:inline;padding:1px 4px">vmrepl-img-'+m.id+'</code> ('+esc(m.image_id||'')+') in your Linode account — see '+
+       '<a href="https://cloud.linode.com/volumes" target="_blank" rel="noopener">cloud.linode.com/volumes</a>. '+
+       (m.launched_linode_id?('A new instance (Linode '+esc(m.launched_linode_id)+') was launched from it — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a>.')
+       :'Attach it to a new Linode and boot from it (GRUB 2) to launch the migrated server.')+'</div>';
+  }
+
+  // Validations + enrollment, collapsed once the baseline is replicating fine.
+  let checks='';
+  for(const c of (v.validations||[])){checks+='<div class="check"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>'}
+  const allOk=(v.validations||[]).every(c=>c.ok);
+  h+='<details'+(allOk?'':' open')+'><summary>Validation checks'+(allOk?' (all passing)':'')+'</summary><div>'+checks+'</div></details>';
   if(v.enroll_cmd && !m.full_sync_done && m.state!=='migrating'){
-    h+='<label>Run this on the source server ('+esc(m.source_hostname||m.source_device)+')</label>'+
+    h+='<details open><summary>Enroll the source server</summary><div>'+
+       '<label>Run this on '+esc(m.source_hostname||m.source_device)+'</label>'+
        '<div style="display:flex;gap:8px;align-items:flex-start"><pre id="enroll'+m.id+'" style="flex:1;margin:0">'+esc(v.enroll_cmd)+'</pre>'+
-       '<button onclick="copyText(document.getElementById(\'enroll'+m.id+'\').textContent,this)">Copy</button></div>';
+       '<button onclick="copyText(document.getElementById(\'enroll'+m.id+'\').textContent,this)">Copy</button></div></div></details>';
   }
-  // actions
-  if(v.can_migrate){h+='<button class="primary" onclick="startMig('+m.id+')">Start migration</button>';}
-  else if(['image_ready','launched'].includes(m.state)){
-    h+='<div class="check"><span class="y">✔</span> Migration complete. Artifact: <code style="display:inline">'+esc(m.image_id||'-')+'</code>'+(m.launched_linode_id?(' · launched Linode '+esc(m.launched_linode_id)):'')+'</div>';
+
+  // Actions: assess -> start; stop while running; delete always.
+  h+='<div class="actions">';
+  if(!['migrating','image_ready','launched'].includes(m.state)){
+    h+='<button onclick="assessMig('+m.id+')">Pre-migration assessment</button>';
+    if(v.assessed){h+='<span class="pill ok">✔ assessment successful</span>';}
+    if(v.can_migrate){
+      h+='<button class="primary"'+(v.assessed?'':' disabled title="Run the pre-migration assessment first"')+' onclick="startMig('+m.id+')">Start migration</button>';
+    }
   }
+  if(m.state==='migrating'){h+='<button class="danger" onclick="stopMig('+m.id+')">Stop</button>';}
+  h+='<span style="flex:1"></span><button class="danger" onclick="deleteMig('+m.id+',\''+esc(m.name)+'\')">Delete</button>';
+  h+='</div>';
   return '<div class="card" style="background:var(--surface2)">'+h+'</div>';
 }
-function pct(m){if(!m.total_blocks)return 0;return Math.max(2,Math.round(100*(m.total_blocks-m.changed_blocks)/m.total_blocks))}
 
 async function refresh(){
   try{

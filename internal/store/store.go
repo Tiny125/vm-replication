@@ -120,11 +120,26 @@ CREATE TABLE IF NOT EXISTS migrations (
   bytes_on_wire   INTEGER NOT NULL DEFAULT 0,
   last_sync_at    INTEGER NOT NULL DEFAULT 0,
   last_error      TEXT NOT NULL DEFAULT '',
+  assessed_at     INTEGER NOT NULL DEFAULT 0,
+  migrate_started INTEGER NOT NULL DEFAULT 0,
+  migrate_finished INTEGER NOT NULL DEFAULT 0,
   created_at      INTEGER NOT NULL
 );
 `
-	_, err := s.db.Exec(schema)
-	return err
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	// Upgrade pre-existing databases: ADD COLUMN fails with "duplicate column"
+	// when already applied, which is safe to ignore (SQLite has no IF NOT EXISTS
+	// for columns).
+	for _, stmt := range []string{
+		`ALTER TABLE migrations ADD COLUMN assessed_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE migrations ADD COLUMN migrate_started INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE migrations ADD COLUMN migrate_finished INTEGER NOT NULL DEFAULT 0`,
+	} {
+		_, _ = s.db.Exec(stmt)
+	}
+	return nil
 }
 
 func unix(t time.Time) int64 { return t.UTC().Unix() }
