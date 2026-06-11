@@ -9,7 +9,11 @@
 #
 #   sudo scripts/install-replication-server.sh [--public-host IP] [--region us-ord] [--port 8080]
 #
-# Requires: bash, openssl, and either Go (to build) or prebuilt binaries in ./bin.
+#   sudo scripts/install-replication-server.sh [--public-host IP] [--region us-ord] [--port 8080]
+#
+# It installs everything it needs (git, make, gcc, curl, openssl, jq, tar and a
+# recent Go) using the system package manager (apt/dnf/yum/zypper), builds the
+# binaries, and sets up the service. Requires: bash, root, and internet access.
 set -euo pipefail
 
 PUBLIC_HOST=""; REGION="us-ord"; PORT="8080"
@@ -18,7 +22,7 @@ while [ $# -gt 0 ]; do
     --public-host) PUBLIC_HOST="$2"; shift 2;;
     --region)      REGION="$2"; shift 2;;
     --port)        PORT="$2"; shift 2;;
-    -h|--help)     sed -n '2,16p' "$0"; exit 0;;
+    -h|--help)     sed -n '2,18p' "$0"; exit 0;;
     *) echo "unknown arg: $1"; exit 1;;
   esac
 done
@@ -28,7 +32,85 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ETC=/etc/vm-repl
 LIB=/var/lib/vm-repl
 OPT=/opt/vm-repl
-command -v openssl >/dev/null || { echo "openssl is required"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Dependency bootstrap: make the one-liner work on a bare server.
+# ---------------------------------------------------------------------------
+detect_pkg_mgr() {
+  for m in apt-get dnf yum zypper; do command -v "$m" >/dev/null 2>&1 && { echo "$m"; return; }; done
+  echo ""
+}
+
+install_packages() {
+  local mgr; mgr="$(detect_pkg_mgr)"
+  echo ">> Installing system packages (git make gcc curl openssl jq tar ca-certificates) via ${mgr:-<none>}"
+  case "$mgr" in
+    apt-get)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y || apt-get update -y
+      apt-get install -y --no-install-recommends git make gcc curl ca-certificates openssl jq tar
+      ;;
+    dnf)    dnf install -y git make gcc curl ca-certificates openssl jq tar ;;
+    yum)    yum install -y git make gcc curl ca-certificates openssl jq tar ;;
+    zypper) zypper --non-interactive install git make gcc curl ca-certificates openssl jq tar ;;
+    *) echo "WARNING: no supported package manager found; please install: git make gcc curl openssl jq tar" ;;
+  esac
+}
+
+# go_ok: true if a Go >= 1.21 toolchain is on PATH (older Go auto-downloads the
+# version this module needs via GOTOOLCHAIN).
+go_ok() {
+  command -v go >/dev/null 2>&1 || return 1
+  local v major rest minor
+  v="$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')"
+  major="${v%%.*}"; rest="${v#*.}"; minor="${rest%%.*}"
+  [ -n "$major" ] || return 1
+  if [ "$major" -gt 1 ] 2>/dev/null; then return 0; fi
+  if [ "$major" -eq 1 ] 2>/dev/null && [ "${minor:-0}" -ge 21 ] 2>/dev/null; then return 0; fi
+  return 1
+}
+
+install_go() {
+  local arch goarch gover url
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64)  goarch=amd64 ;;
+    aarch64|arm64) goarch=arm64 ;;
+    *) echo "unsupported CPU arch for Go auto-install: $arch — install Go manually"; exit 1 ;;
+  esac
+  gover="$(curl -fsSL --max-time 10 'https://go.dev/VERSION?m=text' 2>/dev/null | head -1)"
+  case "$gover" in go*) ;; *) gover="go1.25.1" ;; esac
+  url="https://go.dev/dl/${gover}.linux-${goarch}.tar.gz"
+  echo ">> Installing ${gover} (${goarch}) from go.dev"
+  curl -fsSL "$url" -o /tmp/go.tgz
+  rm -rf /usr/local/go
+  tar -C /usr/local -xzf /tmp/go.tgz
+  rm -f /tmp/go.tgz
+  ln -sf /usr/local/go/bin/go /usr/local/bin/go
+  ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+  export PATH="/usr/local/go/bin:$PATH"
+}
+
+# Decide whether we must build (no complete set of prebuilt binaries).
+NEED_BUILD=1
+if [ -x "$ROOT/bin/applianced" ] && [ -x "$ROOT/bin/agent" ] && [ -x "$ROOT/bin/receiver" ] \
+   && [ -x "$ROOT/bin/controld" ] && [ -x "$ROOT/bin/replctl" ]; then
+  NEED_BUILD=0
+fi
+
+# Install OS packages if any required tool is missing (runtime tools always;
+# build tools only when we must compile).
+missing=0
+for t in curl openssl tar; do command -v "$t" >/dev/null 2>&1 || missing=1; done
+if [ "$NEED_BUILD" -eq 1 ]; then
+  for t in git make gcc; do command -v "$t" >/dev/null 2>&1 || missing=1; done
+fi
+[ "$missing" -eq 1 ] && install_packages
+
+# Install Go only if we must build and a suitable one isn't already present.
+if [ "$NEED_BUILD" -eq 1 ] && ! go_ok; then install_go; fi
+
+command -v openssl >/dev/null 2>&1 || { echo "openssl unavailable after install; aborting"; exit 1; }
 
 # --- detect public host ---
 if [ -z "$PUBLIC_HOST" ]; then
@@ -38,14 +120,15 @@ if [ -z "$PUBLIC_HOST" ]; then
   echo ">> Detected public host: $PUBLIC_HOST"
 fi
 
-# --- build or locate binaries ---
-if [ ! -x "$ROOT/bin/applianced" ] || [ ! -x "$ROOT/bin/agent" ]; then
-  if command -v go >/dev/null 2>&1; then
-    echo ">> Building binaries"
-    ( cd "$ROOT" && make build >/dev/null )
-  else
-    echo "Go not found and ./bin is incomplete; install Go or provide prebuilt binaries."; exit 1
+# --- build binaries (deps are now in place) ---
+if [ "$NEED_BUILD" -eq 1 ]; then
+  if ! command -v make >/dev/null 2>&1 || ! go_ok; then
+    echo "build tools missing after bootstrap (need make + Go >= 1.21); aborting"; exit 1
   fi
+  echo ">> Building binaries"
+  ( cd "$ROOT" && make build >/dev/null )
+else
+  echo ">> Using prebuilt binaries in $ROOT/bin"
 fi
 
 # --- layout ---
