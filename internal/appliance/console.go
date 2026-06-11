@@ -237,6 +237,12 @@ function migCard(v){
        '<a href="https://cloud.linode.com/volumes" target="_blank" rel="noopener">cloud.linode.com/volumes</a>. '+
        (m.launched_linode_id?('A new instance (Linode '+esc(m.launched_linode_id)+') was launched from it — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a>.')
        :'Attach it to a new Linode and boot from it (GRUB 2) to launch the migrated server.')+'</div>';
+    if(v.uninstall_cmd){
+      h+='<details><summary>Remove the agent from the source server</summary><div>'+
+         '<div class="muted" style="font-size:12px;margin-bottom:6px">Replication is done — run this on '+esc(m.source_hostname||'the source')+' to remove the agent, its timer, certificates, and checkpoint in one go:</div>'+
+         '<div style="display:flex;gap:8px;align-items:flex-start"><pre id="unin'+m.id+'" style="flex:1;margin:0">'+esc(v.uninstall_cmd)+'</pre>'+
+         '<button onclick="copyText(document.getElementById(\'unin'+m.id+'\').textContent,this)">Copy</button></div></div></details>';
+    }
   }
 
   // Validations + enrollment, collapsed once the baseline is replicating fine.
@@ -248,7 +254,11 @@ function migCard(v){
     h+='<details open><summary>Enroll the source server</summary><div>'+
        '<label>Run this on '+esc(m.source_hostname||m.source_device)+'</label>'+
        '<div style="display:flex;gap:8px;align-items:flex-start"><pre id="enroll'+m.id+'" style="flex:1;margin:0">'+esc(v.enroll_cmd)+'</pre>'+
-       '<button onclick="copyText(document.getElementById(\'enroll'+m.id+'\').textContent,this)">Copy</button></div></div></details>';
+       '<button onclick="copyText(document.getElementById(\'enroll'+m.id+'\').textContent,this)">Copy</button></div>'+
+       '<div class="muted" style="font-size:11px;margin-top:6px">Already enrolled but the first sync failed? No reinstall needed — the agent retries every 60s. '+
+       'Fix the cause (most often: open TCP '+esc(m.receiver_port)+' on this server’s firewall, including any Linode Cloud Firewall), '+
+       'or force a retry on the source: <code style="display:inline;padding:1px 4px">sudo systemctl start vmrepl-agent.service</code></div>'+
+       '</div></details>';
   }
 
   // Actions: assess -> start; stop while running; delete always.

@@ -105,6 +105,21 @@ done
 api "$BASE/api/v1/migrations/$MID" | jq -e '.phase=="completed"' >/dev/null || { echo "FAIL: phase not completed"; exit 1; }
 echo "   OK: migration reached image_ready (phase=completed)"
 
+echo "== Uninstall command + script served =="
+api "$BASE/api/v1/migrations/$MID" | jq -e '.uninstall_cmd | contains("/install/uninstall.sh")' >/dev/null \
+  || { echo "FAIL: uninstall_cmd missing from view"; exit 1; }
+UN=$(curl -fsS --cacert "$CACERT" "$BASE/install/uninstall.sh")
+echo "$UN" | grep -q 'vmrepl-agent.timer' && echo "$UN" | grep -q 'rm -rf /etc/vm-repl' \
+  || { echo "FAIL: uninstall script incomplete"; exit 1; }
+echo "   OK: uninstall command exposed and script served"
+
+echo "== Enrollment script is re-run safe =="
+ENROLL_SH=$(curl -fsS --cacert "$CACERT" "$BASE/install/agent.sh?token=$(echo "$MIG" | jq -r '.enroll_cmd' | grep -o 'token=[a-f0-9]*' | cut -d= -f2)")
+echo "$ENROLL_SH" | grep -q 'systemctl stop vmrepl-agent.timer' || { echo "FAIL: installer does not stop prior agent"; exit 1; }
+echo "$ENROLL_SH" | grep -q 'mv -f "$TMP" "$BIN"' || { echo "FAIL: installer not atomic"; exit 1; }
+echo "$ENROLL_SH" | grep -q 'retries every 60s' || { echo "FAIL: retry hint missing"; exit 1; }
+echo "   OK: stop-before-replace, atomic install, retry hint present"
+
 echo "== Delete a migration =="
 M2=$(api -X POST "$BASE/api/v1/migrations" -H 'Content-Type: application/json' \
   -d "{\"name\":\"throwaway\",\"source_hostname\":\"x\",\"source_device\":\"$WORK/source.img\",\"source_disk_size\":$SIZE}")

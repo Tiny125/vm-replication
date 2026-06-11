@@ -96,6 +96,7 @@ func (s *Server) routes() {
 
 	// Enrollment (authenticated by per-migration token, not the session).
 	s.mux.HandleFunc("GET /install/agent.sh", s.handleAgentInstaller)
+	s.mux.HandleFunc("GET /install/uninstall.sh", s.handleUninstallScript)
 	s.mux.HandleFunc("GET /enroll/file", s.handleEnrollFile)
 	s.mux.HandleFunc("GET /download/agent", s.handleDownloadAgent)
 
