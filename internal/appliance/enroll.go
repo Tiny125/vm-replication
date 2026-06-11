@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/tiny125/vm-replication/internal/api"
 )
@@ -25,9 +26,9 @@ func (s *Server) migrationFromToken(w http.ResponseWriter, r *http.Request) (api
 }
 
 // handleAgentInstaller serves a self-contained bash script that installs the
-// agent on a source server, drops the mTLS material, and starts a systemd timer
-// that replicates to this migration's receiver. The source runs the one-liner
-// shown in the console.
+// agent on a source server and starts a systemd timer that replicates EVERY
+// disk of the migration — one agent invocation (ExecStart line) per disk, each
+// to its own receiver port. Re-running it is safe (stops + atomically replaces).
 func (s *Server) handleAgentInstaller(w http.ResponseWriter, r *http.Request) {
 	m, ok := s.migrationFromToken(w, r)
 	if !ok {
@@ -35,16 +36,22 @@ func (s *Server) handleAgentInstaller(w http.ResponseWriter, r *http.Request) {
 	}
 	token := r.URL.Query().Get("token")
 	base := fmt.Sprintf("%s://%s:%d", s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort)
-	target := fmt.Sprintf("%s:%d", s.cfg.PublicHost, m.ReceiverPort)
 
-	// Note: callers should already have validated the source device exists.
+	// Build the per-disk pieces: a precheck line and an ExecStart line per disk.
+	var checks, execs strings.Builder
+	for _, d := range m.Disks {
+		target := fmt.Sprintf("%s:%d", s.cfg.PublicHost, d.ReceiverPort)
+		manifest := fmt.Sprintf("/var/lib/vmrepl-source-disk%d.cbt", d.Index)
+		fmt.Fprintf(&checks, "[ -e %q ] || { echo \"source device %s not found — re-check the device in the console\"; exit 1; }\n", d.SourceDevice, d.SourceDevice)
+		fmt.Fprintf(&execs, "ExecStart=$BIN -device %s -target %s -server-name $SERVER_NAME -manifest %s -cert $ETC/agent.crt -key $ETC/agent.key -ca $ETC/ca.crt\n",
+			d.SourceDevice, target, manifest)
+	}
+
 	script := fmt.Sprintf(`#!/usr/bin/env bash
-# vm-replication source enrollment for migration %q
+# vm-replication source enrollment for migration %q (%d disk(s))
 set -euo pipefail
 BASE=%q
 TOKEN=%q
-DEVICE=%q
-TARGET=%q
 SERVER_NAME=%q
 PIN=%q
 BIN=/usr/local/bin/vmrepl-agent
@@ -52,17 +59,12 @@ ETC=/etc/vm-repl
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (use sudo)"; exit 1; }
 command -v curl >/dev/null || { echo "curl is required"; exit 1; }
-[ -e "$DEVICE" ] || { echo "source device $DEVICE not found — re-check the device in the console"; exit 1; }
-
-# Pin the appliance's public key so downloads are authenticated even with a
-# self-signed console certificate (trust on first use). -k skips CA-chain checks
-# (no public CA), while --pinnedpubkey still requires the exact server key.
+%s
 CURL="curl -fsSL"
 [ -n "$PIN" ] && CURL="$CURL -k --pinnedpubkey sha256//$PIN"
 
-# Re-running enrollment is safe: stop any previous agent first so the running
-# binary can be replaced (overwriting a running executable fails with
-# "text file busy" / curl error 23), and swap it in atomically.
+# Re-running is safe: stop any previous agent so the running binary can be
+# replaced (overwriting a running executable fails with "text file busy").
 if command -v systemctl >/dev/null 2>&1; then
   systemctl stop vmrepl-agent.timer vmrepl-agent.service 2>/dev/null || true
 fi
@@ -71,7 +73,7 @@ echo ">> Downloading agent"
 TMP="$(mktemp "$(dirname "$BIN")/.vmrepl-agent.XXXXXX")"
 $CURL "$BASE/download/agent?token=$TOKEN" -o "$TMP"
 chmod 0755 "$TMP"
-mv -f "$TMP" "$BIN"   # atomic on the same filesystem; safe even if the old binary runs
+mv -f "$TMP" "$BIN"   # atomic on the same filesystem
 
 echo ">> Installing TLS material"
 mkdir -p "$ETC"
@@ -81,7 +83,7 @@ done
 chmod 600 "$ETC/agent.key"
 
 if command -v systemctl >/dev/null 2>&1; then
-  echo ">> Installing systemd timer (replicate every 60s)"
+  echo ">> Installing systemd timer (replicate all disks every 60s)"
   cat >/etc/systemd/system/vmrepl-agent.service <<UNIT
 [Unit]
 Description=vm-replication source agent
@@ -89,8 +91,7 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=$BIN -device $DEVICE -target $TARGET -server-name $SERVER_NAME -manifest /var/lib/vmrepl-source.cbt -cert $ETC/agent.crt -key $ETC/agent.key -ca $ETC/ca.crt
-Nice=10
+%sNice=10
 IOSchedulingClass=best-effort
 UNIT
   cat >/etc/systemd/system/vmrepl-agent.timer <<UNIT
@@ -110,28 +111,27 @@ UNIT
   if systemctl start vmrepl-agent.service; then
     echo ">> First sync succeeded."
   else
-    echo ">> First sync FAILED — see: journalctl -u vmrepl-agent -n 20"
+    echo ">> First sync FAILED — see: journalctl -u vmrepl-agent -n 30"
     echo ">> No reinstall needed: the agent retries every 60s automatically."
-    echo ">> Common cause: receiver port $TARGET blocked — open TCP 5000-5100 on the"
+    echo ">> Common cause: a receiver port is blocked — open TCP 5000-5100 on the"
     echo ">> replication server's firewall (including any Linode Cloud Firewall)."
     echo ">> Force a retry any time with: systemctl start vmrepl-agent.service"
   fi
   echo ">> Enrolled. Follow progress in the console; logs: journalctl -u vmrepl-agent"
 else
-  echo "systemd not found; run the agent manually on a schedule:"
-  echo "  $BIN -device $DEVICE -target $TARGET -server-name $SERVER_NAME \\"
-  echo "      -cert $ETC/agent.crt -key $ETC/agent.key -ca $ETC/ca.crt"
+  echo "systemd not found; run the agent manually for each disk on a schedule."
 fi
-`, m.Name, base, token, m.SourceDevice, target, s.cfg.PublicHost, s.cfg.PublicKeyPin)
+`, m.Name, len(m.Disks), base, token, s.cfg.PublicHost, s.cfg.PublicKeyPin,
+		strings.TrimRight(checks.String(), "\n"), execs.String())
 
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
 	_, _ = w.Write([]byte(script))
 }
 
 // handleUninstallScript serves a script that removes everything enrollment
-// installed on a source server. It is deliberately NOT token-gated: tokens are
-// deleted with their migration, but operators still need to clean up sources
-// afterwards — and the script contains no secrets, only removal commands.
+// installed on a source server. Not token-gated by design: tokens die with
+// their migration, but operators still need to clean up sources afterwards, and
+// the script contains no secrets — only removal commands.
 func (s *Server) handleUninstallScript(w http.ResponseWriter, r *http.Request) {
 	const script = `#!/usr/bin/env bash
 # vm-replication agent uninstall — removes everything enrollment installed.
@@ -146,7 +146,7 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 rm -f /usr/local/bin/vmrepl-agent
 rm -rf /etc/vm-repl
-rm -f /var/lib/vmrepl-source.cbt
+rm -f /var/lib/vmrepl-source-disk*.cbt /var/lib/vmrepl-source.cbt
 echo "vm-replication agent removed. This server's data and OS were never modified."
 `
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")

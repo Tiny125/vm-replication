@@ -59,7 +59,11 @@ func TestMigrationLifecycle(t *testing.T) {
 	ctx := context.Background()
 
 	m, token, err := st.CreateMigration(ctx, api.CreateMigrationRequest{
-		Name: "web01", SourceHostname: "web01", SourceDevice: "/dev/sda", SourceDiskSize: 80 << 30,
+		Name: "web01", SourceHostname: "web01",
+		Devices: []api.DeviceSpec{
+			{Device: "/dev/sda", SizeBytes: 80 << 30},
+			{Device: "/dev/sdb", SizeBytes: 200 << 30},
+		},
 	})
 	if err != nil {
 		t.Fatalf("CreateMigration: %v", err)
@@ -67,35 +71,49 @@ func TestMigrationLifecycle(t *testing.T) {
 	if token == "" || m.State != api.MigCreated {
 		t.Fatalf("unexpected create result: token=%q state=%q", token, m.State)
 	}
+	if len(m.Disks) != 2 || m.Disks[0].SourceDevice != "/dev/sda" || m.Disks[1].Index != 1 {
+		t.Fatalf("disks not created correctly: %+v", m.Disks)
+	}
 
-	// Token lookup resolves to the same migration.
+	// Token lookup resolves to the same migration (with disks).
 	byTok, err := st.MigrationByToken(ctx, token)
-	if err != nil || byTok.ID != m.ID {
-		t.Fatalf("MigrationByToken: %v (id %d vs %d)", err, byTok.ID, m.ID)
+	if err != nil || byTok.ID != m.ID || len(byTok.Disks) != 2 {
+		t.Fatalf("MigrationByToken: %v (id %d vs %d, disks %d)", err, byTok.ID, m.ID, len(byTok.Disks))
 	}
 	if _, err := st.MigrationByToken(ctx, "bogus"); err == nil {
 		t.Fatal("bogus token should not resolve")
 	}
 
-	// A completed full sync advances state and sets full_sync_done.
-	if err := st.RecordMigrationSync(ctx, m.ID, true, 100, 100, 1<<20); err != nil {
-		t.Fatalf("RecordMigrationSync: %v", err)
+	// A completed full sync on disk 0 advances migration state and the disk.
+	if err := st.RecordDiskSync(ctx, m.ID, m.Disks[0].ID, true, 100, 100, 1<<20); err != nil {
+		t.Fatalf("RecordDiskSync: %v", err)
 	}
 	got, _ := st.Migration(ctx, m.ID)
-	if !got.FullSyncDone {
-		t.Error("full_sync_done should be true")
+	if !got.Disks[0].FullSyncDone {
+		t.Error("disk 0 full_sync_done should be true")
+	}
+	if got.Disks[1].FullSyncDone {
+		t.Error("disk 1 should not be done yet")
 	}
 	if got.State != api.MigReplicating {
 		t.Errorf("state = %q, want replicating", got.State)
 	}
-	if got.TotalBlocks != 100 || got.LastSyncAt.IsZero() {
-		t.Errorf("progress not recorded: %+v", got)
+	if got.Disks[0].TotalBlocks != 100 || got.Disks[0].LastSyncAt.IsZero() {
+		t.Errorf("disk 0 progress not recorded: %+v", got.Disks[0])
 	}
 
 	// A later delta keeps full_sync_done true.
-	_ = st.RecordMigrationSync(ctx, m.ID, false, 100, 3, 12<<20)
+	_ = st.RecordDiskSync(ctx, m.ID, m.Disks[0].ID, false, 100, 3, 12<<20)
 	got, _ = st.Migration(ctx, m.ID)
-	if !got.FullSyncDone {
+	if !got.Disks[0].FullSyncDone {
 		t.Error("full_sync_done must remain true after a delta")
+	}
+
+	// Deleting the migration cascades to its disks.
+	if err := st.DeleteMigration(ctx, m.ID); err != nil {
+		t.Fatalf("DeleteMigration: %v", err)
+	}
+	if _, err := st.Migration(ctx, m.ID); err == nil {
+		t.Error("migration should be gone after delete")
 	}
 }

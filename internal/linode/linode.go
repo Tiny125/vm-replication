@@ -189,6 +189,33 @@ func (c *Client) CreateConfigBootingVolume(ctx context.Context, linodeID, volume
 	return cfg.ID, err
 }
 
+// CreateConfigBootingVolumes creates a config profile that boots from the first
+// volume and attaches the rest as additional disks (sda, sdb, … up to sdh).
+// Returns the config id. The OS on the boot volume mounts the data volumes via
+// its fstab (typically by UUID, preserved in the clones).
+func (c *Client) CreateConfigBootingVolumes(ctx context.Context, linodeID int64, volumeIDs []int64, label string) (int64, error) {
+	slots := []string{"sda", "sdb", "sdc", "sdd", "sde", "sdf", "sdg", "sdh"}
+	devices := map[string]any{}
+	for i, vid := range volumeIDs {
+		if i >= len(slots) {
+			break
+		}
+		devices[slots[i]] = map[string]any{"volume_id": vid}
+	}
+	var cfg struct {
+		ID int64 `json:"id"`
+	}
+	err := c.do(ctx, http.MethodPost, fmt.Sprintf("/linode/instances/%d/configs", linodeID),
+		map[string]any{
+			"label":       label,
+			"kernel":      "linode/grub2",
+			"devices":     devices,
+			"root_device": "/dev/sda",
+			"helpers":     map[string]any{"network": true, "distro": false},
+		}, &cfg)
+	return cfg.ID, err
+}
+
 // Boot boots a Linode into the given config.
 func (c *Client) Boot(ctx context.Context, linodeID, configID int64) error {
 	return c.do(ctx, http.MethodPost, fmt.Sprintf("/linode/instances/%d/boot", linodeID),

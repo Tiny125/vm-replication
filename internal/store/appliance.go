@@ -163,26 +163,21 @@ func (s *Store) LinodeTokenSet(ctx context.Context) (bool, error) {
 
 // ---- migrations ----
 
+// migCols selects only the migration-level fields; per-disk state lives in
+// migration_disks and is loaded separately. (The legacy single-disk columns on
+// the migrations table remain for older databases but are no longer read.)
 const migCols = `id, name, state, source_hostname, source_device, source_disk_size,
- enroll_token, receiver_port, volume_id, volume_device, image_id, launched_id,
- agent_last_seen, full_sync_done, total_blocks, changed_blocks, bytes_on_wire,
- last_sync_at, last_error, assessed_at, migrate_started, migrate_finished, created_at`
+ image_id, launched_id, last_error, assessed_at, migrate_started, migrate_finished, created_at`
 
 func scanMigration(row interface{ Scan(...any) error }) (api.Migration, error) {
 	var m api.Migration
-	var state, enrollToken string // token is kept out of the JSON DTO
-	var fullDone int
-	var agentSeen, lastSync, assessed, migStart, migFinish, created int64
+	var state string
+	var assessed, migStart, migFinish, created int64
 	if err := row.Scan(&m.ID, &m.Name, &state, &m.SourceHostname, &m.SourceDevice, &m.SourceDiskSize,
-		&enrollToken, &m.ReceiverPort, &m.VolumeID, &m.VolumeDevice, &m.ImageID, &m.LaunchedID,
-		&agentSeen, &fullDone, &m.TotalBlocks, &m.ChangedBlocks, &m.BytesOnWire,
-		&lastSync, &m.LastError, &assessed, &migStart, &migFinish, &created); err != nil {
+		&m.ImageID, &m.LaunchedID, &m.LastError, &assessed, &migStart, &migFinish, &created); err != nil {
 		return api.Migration{}, err
 	}
 	m.State = api.MigrationState(state)
-	m.FullSyncDone = fullDone != 0
-	m.AgentLastSeen = fromUnix(agentSeen)
-	m.LastSyncAt = fromUnix(lastSync)
 	m.AssessedAt = fromUnix(assessed)
 	m.MigrateStarted = fromUnix(migStart)
 	m.MigrateFinished = fromUnix(migFinish)
@@ -198,46 +193,101 @@ func randToken(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// CreateMigration inserts a new migration with a fresh enrollment token and an
-// assigned receiver port (basePort + id offset is resolved by the caller via
-// AssignReceiverPort after insert).
+// CreateMigration inserts a migration plus one row per source disk (boot disk
+// first) and returns the migration (with disks) and its enrollment token. The
+// caller assigns receiver ports per disk after insert (AssignDiskPort).
 func (s *Store) CreateMigration(ctx context.Context, r api.CreateMigrationRequest) (api.Migration, string, error) {
 	token, err := randToken(24)
 	if err != nil {
 		return api.Migration{}, "", err
 	}
+	devices := r.Devices
+	if len(devices) == 0 && r.SourceDevice != "" { // single-disk back-compat
+		devices = []api.DeviceSpec{{Device: r.SourceDevice, SizeBytes: r.SourceDiskSize}}
+	}
+	if len(devices) == 0 {
+		return api.Migration{}, "", fmt.Errorf("store: at least one source device is required")
+	}
 	now := time.Now()
 	res, err := s.db.ExecContext(ctx, `
 INSERT INTO migrations (name, state, source_hostname, source_device, source_disk_size, enroll_token, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		r.Name, string(api.MigCreated), r.SourceHostname, r.SourceDevice, r.SourceDiskSize, token, unix(now))
+		r.Name, string(api.MigCreated), r.SourceHostname, devices[0].Device, devices[0].SizeBytes, token, unix(now))
 	if err != nil {
 		return api.Migration{}, "", err
 	}
 	id, _ := res.LastInsertId()
+	for i, d := range devices {
+		if _, err := s.db.ExecContext(ctx, `
+INSERT INTO migration_disks (migration_id, idx, source_device, size_bytes) VALUES (?, ?, ?, ?)`,
+			id, i, d.Device, d.SizeBytes); err != nil {
+			return api.Migration{}, "", err
+		}
+	}
 	m, err := s.Migration(ctx, id)
 	return m, token, err
 }
 
-// Migration looks up a migration by id.
+const diskCols = `id, idx, source_device, size_bytes, receiver_port, volume_id, volume_device,
+ artifact_id, full_sync_done, total_blocks, changed_blocks, bytes_on_wire, last_sync_at, agent_last_seen`
+
+func scanDisk(row interface{ Scan(...any) error }) (api.Disk, error) {
+	var d api.Disk
+	var full int
+	var lastSync, agentSeen int64
+	if err := row.Scan(&d.ID, &d.Index, &d.SourceDevice, &d.SizeBytes, &d.ReceiverPort, &d.VolumeID,
+		&d.VolumeDevice, &d.ArtifactID, &full, &d.TotalBlocks, &d.ChangedBlocks, &d.BytesOnWire,
+		&lastSync, &agentSeen); err != nil {
+		return api.Disk{}, err
+	}
+	d.FullSyncDone = full != 0
+	d.LastSyncAt = fromUnix(lastSync)
+	d.AgentLastSeen = fromUnix(agentSeen)
+	return d, nil
+}
+
+// loadDisks attaches the disk rows to a migration.
+func (s *Store) loadDisks(ctx context.Context, m *api.Migration) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+diskCols+` FROM migration_disks WHERE migration_id=? ORDER BY idx`, m.ID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	m.Disks = nil
+	for rows.Next() {
+		d, err := scanDisk(rows)
+		if err != nil {
+			return err
+		}
+		m.Disks = append(m.Disks, d)
+	}
+	return rows.Err()
+}
+
+// Migration looks up a migration (with its disks) by id.
 func (s *Store) Migration(ctx context.Context, id int64) (api.Migration, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+migCols+` FROM migrations WHERE id=?`, id)
 	m, err := scanMigration(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return api.Migration{}, ErrNotFound
 	}
-	return m, err
+	if err != nil {
+		return api.Migration{}, err
+	}
+	return m, s.loadDisks(ctx, &m)
 }
 
-// MigrationByToken looks up a migration by its enrollment token (constant-time
-// is unnecessary here: tokens are 24 random bytes and looked up by exact match).
+// MigrationByToken looks up a migration (with its disks) by enrollment token.
 func (s *Store) MigrationByToken(ctx context.Context, token string) (api.Migration, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+migCols+` FROM migrations WHERE enroll_token=?`, token)
 	m, err := scanMigration(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return api.Migration{}, ErrNotFound
 	}
-	return m, err
+	if err != nil {
+		return api.Migration{}, err
+	}
+	return m, s.loadDisks(ctx, &m)
 }
 
 // EnrollToken returns the enrollment token for a migration.
@@ -265,7 +315,15 @@ func (s *Store) ListMigrations(ctx context.Context) ([]api.Migration, error) {
 		}
 		out = append(out, m)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if err := s.loadDisks(ctx, &out[i]); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // SetMigrationState updates the state (and optionally clears/sets last_error).
@@ -281,42 +339,45 @@ func (s *Store) SetMigrationState(ctx context.Context, id int64, state api.Migra
 	return nil
 }
 
-// AssignReceiverPort sets the receiver port for a migration.
-func (s *Store) AssignReceiverPort(ctx context.Context, id int64, port int) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE migrations SET receiver_port=? WHERE id=?`, port, id)
+// AssignDiskPort sets the receiver port for a disk.
+func (s *Store) AssignDiskPort(ctx context.Context, diskID int64, port int) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE migration_disks SET receiver_port=? WHERE id=?`, port, diskID)
 	return err
 }
 
-// SetMigrationVolume records the provisioned volume and its device path.
-func (s *Store) SetMigrationVolume(ctx context.Context, id, volumeID int64, device string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE migrations SET volume_id=?, volume_device=? WHERE id=?`, volumeID, device, id)
+// SetDiskVolume records the provisioned volume and device path for a disk.
+func (s *Store) SetDiskVolume(ctx context.Context, diskID, volumeID int64, device string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE migration_disks SET volume_id=?, volume_device=? WHERE id=?`, volumeID, device, diskID)
 	return err
 }
 
-// SetMigrationImage records the resulting image and launched instance.
+// SetDiskArtifact records the cloned-artifact id for a disk.
+func (s *Store) SetDiskArtifact(ctx context.Context, diskID int64, artifactID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE migration_disks SET artifact_id=? WHERE id=?`, artifactID, diskID)
+	return err
+}
+
+// SetMigrationImage records the boot artifact and launched instance.
 func (s *Store) SetMigrationImage(ctx context.Context, id int64, imageID string, launchedID int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE migrations SET image_id=?, launched_id=? WHERE id=?`, imageID, launchedID, id)
 	return err
 }
 
-// RecordMigrationSync updates progress from a completed replication pass.
-func (s *Store) RecordMigrationSync(ctx context.Context, id int64, fullSync bool, total, changed, bytes int64) error {
+// RecordDiskSync updates one disk's progress from a completed replication pass
+// and advances the migration to "replicating" on first activity.
+func (s *Store) RecordDiskSync(ctx context.Context, migrationID, diskID int64, fullSync bool, total, changed, bytes int64) error {
 	now := unix(time.Now())
-	// full_sync_done becomes (and stays) true once any full sync completes.
-	_, err := s.db.ExecContext(ctx, `
-UPDATE migrations
+	if _, err := s.db.ExecContext(ctx, `
+UPDATE migration_disks
 SET total_blocks=?, changed_blocks=?, bytes_on_wire=bytes_on_wire+?,
-    last_sync_at=?, agent_last_seen=?,
-    full_sync_done = (full_sync_done=1 OR ?),
-    state = CASE WHEN state IN ('awaiting_agent','created') THEN 'replicating' ELSE state END
+    last_sync_at=?, agent_last_seen=?, full_sync_done = (full_sync_done=1 OR ?)
 WHERE id=?`,
-		total, changed, bytes, now, now, boolToInt(fullSync), id)
-	return err
-}
-
-// TouchAgent records that the agent for a migration checked in.
-func (s *Store) TouchAgent(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE migrations SET agent_last_seen=? WHERE id=?`, unix(time.Now()), id)
+		total, changed, bytes, now, now, boolToInt(fullSync), diskID); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE migrations SET state = CASE WHEN state IN ('awaiting_agent','created') THEN 'replicating' ELSE state END
+WHERE id=?`, migrationID)
 	return err
 }
 

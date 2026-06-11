@@ -32,10 +32,64 @@ For the manual/CLI workflow instead, see [`GETTING_STARTED.md`](GETTING_STARTED.
 
 ---
 
+## Prerequisites — sizing the replication server
+
+One appliance migrates **many servers (and many disks) in parallel** — each
+migration/disk gets its own receiver port, its own Block Storage volume, and its
+own worker. Two things to size: the **appliance instance** (compute) and your
+**Block Storage** (where the data lands).
+
+**Key fact:** replicated data lands on **per-disk Block Storage volumes**, *not*
+on the appliance's own boot disk — so the appliance instance itself stays small;
+your Block Storage scales with the sources.
+
+### Appliance instance (compute)
+
+| Concurrency | Recommended plan |
+|---|---|
+| 1–3 disks replicating at once | **2 vCPU / 4 GB** shared (e.g. `g6-standard-2`) |
+| 4–8 disks, or large/fast links | **Dedicated 4–8 vCPU / 8–16 GB** (e.g. `g6-dedicated-4`) |
+
+- **CPU is the scaling factor** — each in-flight transfer does SHA-256
+  verification + decompression at line rate. Prefer **Dedicated CPU** for many
+  concurrent full syncs. (A multi-disk source counts as multiple concurrent
+  transfers — an EC2 with 3 disks ≈ 3 workers.)
+- **RAM is tiny:** a few MB per active transfer plus ~8 MB of checkpoint per
+  **1 TB** of source. 4 GB is comfortable; 8 GB for heavy parallelism.
+- **Network** (source→appliance bandwidth) is usually the real bottleneck, not
+  the appliance.
+
+### Appliance boot disk
+
+Small — binaries, the SQLite DB, certs. **25–50 GB is plenty.** ⚠️ Only if you
+run *without* a Linode token (file-fallback mode) does data land on the boot
+disk; with a token (the normal path) it goes to the volumes.
+
+### Block Storage to provision (this is what scales)
+
+> peak Block Storage ≈ **sum of all source disk sizes replicating concurrently**
+> + **the largest single disk again** during its clone at cutover.
+
+Example: migrating one EC2 with 3 EBS volumes of 80 + 200 + 200 GB → ~480 GB of
+volumes during replication, peaking ~680 GB while the 200 GB disk clones. Make
+sure your **account Block Storage quota** covers it (raise it via a support
+ticket if needed).
+
+### Limits to know
+
+- **Volumes attachable to one Linode** caps simultaneous disks per appliance
+  (Linode allows up to 8 here; the launched instance also uses `sda`–`sdh`, so a
+  **single migration is limited to 8 disks**). For more parallelism, run more
+  appliances or migrate in batches.
+- The installer opens receiver ports **5000–5100**; that covers ~100 disks over
+  the appliance's lifetime. Widen the firewall range if you'll exceed that.
+
+---
+
 ## 1. Stand up the replication server
 
-Create a Linode (Ubuntu/Debian/RHEL-family, sized with enough disk for the
-appliance and room to attach volumes), SSH in as root, and run:
+Create a Linode (Ubuntu/Debian/RHEL-family — see sizing above), SSH in as root,
+and run:
 
 ```bash
 git clone https://github.com/Tiny125/vm-replication.git
@@ -131,43 +185,50 @@ server and is only ever sent to `api.linode.com`.
 
 ---
 
-## 4. Create a migration
+## 4. Create a migration (single or multi-disk)
 
-Click **New migration** and enter your source server's:
-- **Name** (label), **hostname**,
-- **disk device** (e.g. `/dev/sda` — the whole disk, not a partition),
-- **disk size (GB)**.
+Click **New migration**, enter a **Name** and **hostname**, then **add one disk
+row per source disk** (device + size in GB). The **first row is the boot disk**
+(the one whose partitions include the root filesystem `/`); additional rows are
+data disks. A server with everything on one disk just has a single row.
 
-Not sure of the device or size? The form has a **Copy** button for a discovery
-command — run it on your source server and it prints all four values:
+> **Migrating a multi-disk server (e.g. an EC2 with 3 EBS volumes)?** Add a row
+> for each disk. The appliance creates **one Linode volume per disk** and
+> replicates them independently and in parallel; at cutover each becomes its own
+> image volume, and a launched instance gets them all attached (boot as `sda`,
+> data as `sdb`, `sdc`, …). Up to 8 disks (Linode device slots `sda`–`sdh`).
+
+Not sure of the devices/sizes? The form's **How do I find the source details?**
+section has a copyable command that lists the hostname and **every** whole disk
+with its size rounded up:
 
 ```bash
 echo "Hostname : $(hostname)"; lsblk -b -d -n -o NAME,SIZE,TYPE | \
   awk '$3=="disk"{printf "Device   : /dev/%s\nSize(GB) : %d\n", $1, ($2+1073741823)/1073741824}'
 ```
 
-Enter the **whole disk** (the one whose partitions include the root filesystem
-`/`), not a partition, and the size **rounded up** (the command already rounds up
-for you).
+Use the **whole disks** (e.g. `/dev/sda`, `/dev/sdb`), not partitions. For LVM,
+if a volume group spans multiple disks, add **all** of its member disks.
 
-The console immediately shows a **one-line command**, e.g.:
+The console then shows a **one-line command**, e.g.:
 
 ```bash
 curl -fsSL -k --pinnedpubkey 'sha256//…' 'https://203.0.113.10:8080/install/agent.sh?token=…' | sudo bash
 ```
 
-The `--pinnedpubkey` flag pins this server's public key, so the agent download is
+The `--pinnedpubkey` flag pins this server's public key, so the download is
 authenticated and tamper-proof even though the certificate is self-signed (`-k`
-skips public-CA checking; the pin is what provides the security).
+skips public-CA checking; the pin provides the security).
 
 ---
 
 ## 5. Run the command on your source server
 
 SSH into the source as root and paste the command. It downloads the agent,
-installs the mTLS material, and starts a **systemd timer** that replicates the
-disk to the appliance every 60 seconds. (First run is a full copy; later runs
-ship only changed blocks.)
+installs the mTLS material, and starts a **systemd timer** that replicates
+**every disk of the migration** (one agent run per disk, each to its own
+receiver port) to the appliance every 60 seconds. First run is a full copy;
+later runs ship only changed blocks.
 
 ### If the first sync fails
 
@@ -202,29 +263,51 @@ server's data or OS.
 
 ## 6. Watch status and validation in the console
 
-The migration row shows live progress (blocks current, bytes sent, RPO lag) and
-a checklist:
-- ✔ Agent connected
-- ✔ Initial full sync complete
-- ✔ Replication lag within target
-- ✔ Storage provisioned
+Each migration shows aggregate progress and a **per-disk table** (expand
+**Disks**), plus a checklist that requires **all disks**:
+- ✔ Agent connected — _N/N disks checked in_
+- ✔ Initial full sync complete — _N/N disks baselined_
+- ✔ Replication lag within target — _worst lag across disks_
+- ✔ Storage provisioned — _N/N volumes ready_
 
-When all checks pass, the **Start migration** button enables.
+When all checks pass, run **Pre-migration assessment**; on success the **Cutover
+instance** button enables.
 
 ---
 
-## 7. Start the migration
+## 7. Cut over the instance
 
-Click **Start migration**. The appliance:
-1. stops accepting new blocks (quiesces),
-2. runs the **machine conversion** so the disk boots on Linode (virtio
-   initramfs, GRUB, fstab, Lish serial console, network reset),
-3. **clones the volume** into an immutable artifact (your migrated "snapshot"),
-4. optionally **launches a new Linode instance** booting from that artifact (you
-   choose when starting).
+Click **Cutover instance**. The appliance:
+1. stops accepting new blocks (quiesces all disks),
+2. runs the **machine conversion** on the **boot disk** so it boots on Linode
+   (virtio initramfs, GRUB, fstab, Lish serial console, network reset),
+3. **clones every disk's volume** into an immutable image volume
+   (`vmrepl-img-<id>-<diskIndex>`) — your migrated "snapshot(s)",
+4. optionally **launches a new Linode** with all image volumes attached (boot as
+   `sda`, data disks as `sdb`, `sdc`, …) and boots it.
 
-When it finishes, the row shows the artifact and (if launched) the new instance
-id. You can launch further instances from the cloned volume any time.
+So **a multi-disk migration produces multiple image volumes** — one per source
+disk. When it finishes, the completed banner lists them and links to
+**cloud.linode.com/volumes**.
+
+### Launching later / manually from the image volumes
+
+If you didn't auto-launch (or want more copies):
+1. In Cloud Manager, **create a Linode** in the **same region** as the volumes
+   (no distribution needed).
+2. **Attach** the image volumes: the boot volume first, then the data volumes.
+3. Create a **Configuration Profile**: Kernel **GRUB 2**, set **/dev/sda** to the
+   boot image volume, **/dev/sdb**…​ to the data image volumes, root device
+   `/dev/sda`, and enable the **Network Helper**.
+4. **Boot** into that profile and open the **Lish console** to confirm it comes
+   up. Data disks mount automatically if the source's `/etc/fstab` uses UUIDs
+   (the usual case) — the UUIDs are preserved in the clones. If fstab uses device
+   names like `/dev/xvdf`, update those entries to match the new `sdb`/`sdc`…
+   or (better) to `UUID=` once.
+
+> The image volumes are independent copies — launching from them doesn't disturb
+> the migration. You can keep replicating and cut over again, or launch several
+> instances from the same set of image volumes.
 
 ---
 

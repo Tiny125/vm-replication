@@ -75,24 +75,26 @@ const consoleHTML = `<!DOCTYPE html>
        <summary>How do I find the source details?</summary>
        <div>
          <div class="muted" style="font-size:12px;margin-bottom:8px">
-           Run this on your <b>source server</b> — it prints all four values:
+           Run this on your <b>source server</b> — it lists the hostname and <b>every disk</b> (add a row below for each one):
          </div>
          <div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px">
            <pre id="srcCmd" style="flex:1;margin:0">echo "Hostname : $(hostname)"; lsblk -b -d -n -o NAME,SIZE,TYPE | awk '$3=="disk"{printf "Device   : /dev/%s\nSize(GB) : %d\n", $1, ($2+1073741823)/1073741824}'</pre>
            <button onclick="copyText(document.getElementById('srcCmd').textContent,this)">Copy</button>
          </div>
          <div class="muted" style="font-size:11px;margin-bottom:6px">
-           Enter the <b>whole disk</b> (e.g. <code style="display:inline;padding:1px 4px">/dev/sda</code>), not a partition — pick the
-           disk whose partitions include the root filesystem (<code style="display:inline;padding:1px 4px">/</code>). Always round the size <b>up</b>.
+           Add <b>one row per whole disk</b> (e.g. <code style="display:inline;padding:1px 4px">/dev/sda</code>, <code style="display:inline;padding:1px 4px">/dev/sdb</code>),
+           not partitions. The disk whose partitions include the root filesystem (<code style="display:inline;padding:1px 4px">/</code>) is the
+           <b>boot disk</b> — put it <b>first</b>. Always round sizes <b>up</b>. Each disk becomes its own Linode volume.
          </div>
        </div>
      </details>
      <div class="row">
        <div><label>Name</label><input id="m_name" placeholder="web01"></div>
        <div><label>Source hostname</label><input id="m_host" placeholder="web01.prod"></div>
-       <div><label>Source device</label><input id="m_dev" placeholder="/dev/sda"></div>
-       <div><label>Disk size (GB)</label><input id="m_size" type="number" placeholder="80"></div>
      </div>
+     <label style="margin-top:10px">Source disks (first = boot disk)</label>
+     <div id="disks"></div>
+     <div style="margin-top:6px"><button onclick="addDisk()">+ Add disk</button></div>
      <div style="margin-top:12px"><button class="primary" onclick="createMig()">Create migration</button></div>
      <div id="createErr" class="err"></div>
    </div>
@@ -161,13 +163,33 @@ async function removeToken(){
   try{await api('DELETE','/api/v1/settings/linode-token');loadSettings()}catch(e){alert('Error: '+e.message)}
 }
 
+let diskSeq=0;
+function addDisk(dev,gb){
+  diskSeq++;
+  const id=diskSeq;
+  const row=document.createElement('div');
+  row.className='row'; row.id='disk'+id; row.style.marginBottom='6px';
+  row.innerHTML='<div><input class="d_dev" placeholder="/dev/sda'+(id>1?'':'  (boot disk)')+'" value="'+(dev||'')+'"></div>'+
+    '<div style="display:flex;gap:8px"><input class="d_size" type="number" placeholder="Size (GB)" value="'+(gb||'')+'" style="flex:1">'+
+    '<button class="danger" onclick="document.getElementById(\'disk'+id+'\').remove()">✕</button></div>';
+  $('disks').appendChild(row);
+}
 async function createMig(){
   $('createErr').textContent='';
-  const gb=parseInt($('m_size').value,10);
-  if(!gb||gb<=0){$('createErr').textContent='Enter a valid disk size in GB';return}
+  const rows=document.querySelectorAll('#disks .row');
+  const devices=[];
+  for(const r of rows){
+    const dev=r.querySelector('.d_dev').value.trim();
+    const gb=parseInt(r.querySelector('.d_size').value,10);
+    if(!dev) continue;
+    if(!gb||gb<=0){$('createErr').textContent='Each disk needs a positive size (GB): '+dev;return}
+    devices.push({device:dev,size_bytes:gb*1073741824});
+  }
+  if(!devices.length){$('createErr').textContent='Add at least one disk';return}
   try{
-    await api('POST','/api/v1/migrations',{name:$('m_name').value,source_hostname:$('m_host').value,source_device:$('m_dev').value,source_disk_size:gb*1073741824});
-    $('m_name').value=$('m_host').value=$('m_dev').value=$('m_size').value='';
+    await api('POST','/api/v1/migrations',{name:$('m_name').value,source_hostname:$('m_host').value,devices:devices});
+    $('m_name').value=$('m_host').value='';
+    $('disks').innerHTML=''; diskSeq=0; addDisk();
     refresh();
   }catch(e){$('createErr').textContent='Error: '+e.message}
 }
@@ -175,11 +197,11 @@ async function createMig(){
 function stateClass(s){return ({created:'warn',awaiting_agent:'warn',replicating:'warn',ready:'ok',migrating:'warn',image_ready:'ok',launched:'ok',failed:'bad'})[s]||'muted'}
 function fmtBytes(n){if(!n)return '0 B';const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return n.toFixed(1)+' '+u[i]}
 
-async function startMig(id){
-  if(!confirm('Start migration #'+id+'? This stops replication, converts the disk, and creates the launchable image.'))return;
-  const launch=confirm('Also launch a new Linode instance from the migrated image now? (OK = launch, Cancel = just create the image)');
+async function cutoverMig(id){
+  if(!confirm('Cut over migration #'+id+'?\n\nThis stops replication, converts the boot disk, and clones every disk into a launchable image volume.'))return;
+  const launch=confirm('Also launch a new Linode instance from the migrated images now?\n(OK = launch with all disks attached, Cancel = just create the image volumes)');
   try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:launch});refresh()}
-  catch(e){alert('Cannot start: '+e.message)}
+  catch(e){alert('Cannot cut over: '+e.message)}
 }
 
 async function assessMig(id){
@@ -201,12 +223,15 @@ async function stopMig(id){
 }
 
 async function deleteMig(id,name){
-  if(!confirm('Delete migration #'+id+' ('+name+')?\n\nWARNING: this stops its receiver and deletes the replication volume with ALL replicated data for this migration. A completed artifact volume (vmrepl-img-'+id+') is kept. The agent on the source keeps running until you remove it there (systemctl disable --now vmrepl-agent.timer).\n\nThis cannot be undone.'))return;
+  if(!confirm('Delete migration #'+id+' ('+name+')?\n\nWARNING: this stops all receivers and deletes the replication volumes with ALL replicated data for this migration. Completed image volumes (vmrepl-img-'+id+'-*) are kept. The agent on the source keeps running until you remove it (use the uninstall command shown on a completed migration, or: systemctl disable --now vmrepl-agent.timer).\n\nThis cannot be undone.'))return;
   try{await api('DELETE','/api/v1/migrations/'+id);refresh()}
   catch(e){alert('Cannot delete: '+e.message)}
 }
 
 function fmtDur(s){if(s==null||s<0)return '—';s=Math.round(s);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
+function disks(m){return m.disks||[]}
+function allDone(m){const d=disks(m);return d.length>0&&d.every(x=>x.full_sync_done)}
+function bytesTotal(m){return disks(m).reduce((a,d)=>a+(d.bytes_on_wire||0),0)}
 
 function progressLine(v,m){
   // Live phase + percent + ETA; the page polls every 5s so this self-refreshes.
@@ -216,7 +241,21 @@ function progressLine(v,m){
   if(v.eta_seconds>=0){line+=' · est. '+fmtDur(v.eta_seconds)+' remaining';}
   else if(m.state==='migrating'){line+=' · running '+fmtDur(v.elapsed_seconds);width=2;}
   if(['image_ready','launched'].includes(m.state)){width=100;line+=' in '+fmtDur(v.elapsed_seconds);}
-  return line+'<div class="prog"><div style="width:'+width+'%"></div></div><span class="muted">'+fmtBytes(m.bytes_on_wire)+' received</span>';
+  return line+'<div class="prog"><div style="width:'+width+'%"></div></div><span class="muted">'+fmtBytes(bytesTotal(m))+' received</span>';
+}
+
+function diskTable(m){
+  const d=disks(m); if(!d.length)return '';
+  let h='<table style="margin-top:6px"><tr><th>Disk</th><th>Device</th><th>Size</th><th>Port</th><th>Baseline</th><th>Volume</th></tr>';
+  for(const x of d){
+    h+='<tr><td>'+(x.index===0?'boot':('data '+x.index))+'</td>'+
+       '<td class="muted">'+esc(x.source_device)+'</td>'+
+       '<td class="muted">'+fmtBytes(x.size_bytes)+'</td>'+
+       '<td class="muted">'+x.receiver_port+'</td>'+
+       '<td>'+(x.full_sync_done?'<span class="y">✔ done</span>':'<span class="muted">baselining</span>')+'</td>'+
+       '<td class="muted">'+(x.artifact_id?esc(x.artifact_id):(x.volume_id?('vol '+x.volume_id):'file'))+'</td></tr>';
+  }
+  return h+'</table>';
 }
 
 function migCard(v){
@@ -224,25 +263,21 @@ function migCard(v){
   let h='<table style="margin-bottom:6px"><tr>'+
     '<th>#'+m.id+' '+esc(m.name)+'</th><th>State</th><th>Source</th><th>Progress</th><th>RPO</th></tr><tr>'+
     '<td><span class="pill '+stateClass(m.state)+'">'+esc(m.state)+'</span>'+(m.last_error?'<div class="err">'+esc(m.last_error)+'</div>':'')+'</td>'+
-    '<td class="muted">'+(m.full_sync_done?'baseline done':'baselining')+'</td>'+
-    '<td class="muted">'+esc(m.source_hostname||'-')+'<br>'+esc(m.source_device)+'</td>'+
+    '<td class="muted">'+disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining')+'</td>'+
+    '<td class="muted">'+esc(m.source_hostname||'-')+'</td>'+
     '<td>'+progressLine(v,m)+'</td>'+
     '<td class="muted">'+(v.rpo_seconds?Math.round(v.rpo_seconds)+'s':'—')+'</td>'+
     '</tr></table>';
 
-  // Completed banner with where to find the artifact in the Linode account.
+  h+='<details><summary>Disks ('+disks(m).length+')</summary><div>'+diskTable(m)+'</div></details>';
+
+  // Completed banner: every disk became its own image volume.
   if(['image_ready','launched'].includes(m.state)){
-    h+='<div class="banner">✔ <b>Migration completed.</b> The migrated disk image is the volume '+
-       '<code style="display:inline;padding:1px 4px">vmrepl-img-'+m.id+'</code> ('+esc(m.image_id||'')+') in your Linode account — see '+
-       '<a href="https://cloud.linode.com/volumes" target="_blank" rel="noopener">cloud.linode.com/volumes</a>. '+
-       (m.launched_linode_id?('A new instance (Linode '+esc(m.launched_linode_id)+') was launched from it — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a>.')
-       :'Attach it to a new Linode and boot from it (GRUB 2) to launch the migrated server.')+'</div>';
-    if(v.uninstall_cmd){
-      h+='<details><summary>Remove the agent from the source server</summary><div>'+
-         '<div class="muted" style="font-size:12px;margin-bottom:6px">Replication is done — run this on '+esc(m.source_hostname||'the source')+' to remove the agent, its timer, certificates, and checkpoint in one go:</div>'+
-         '<div style="display:flex;gap:8px;align-items:flex-start"><pre id="unin'+m.id+'" style="flex:1;margin:0">'+esc(v.uninstall_cmd)+'</pre>'+
-         '<button onclick="copyText(document.getElementById(\'unin'+m.id+'\').textContent,this)">Copy</button></div></div></details>';
-    }
+    const arts=disks(m).map(d=>'vmrepl-img-'+m.id+'-'+d.index+(d.artifact_id?(' ('+esc(d.artifact_id)+')'):'')).join(', ');
+    h+='<div class="banner">✔ <b>Migration completed.</b> '+disks(m).length+' image volume(s) created in your Linode account ('+
+       '<a href="https://cloud.linode.com/volumes" target="_blank" rel="noopener">cloud.linode.com/volumes</a>): <code style="display:inline;padding:1px 4px">'+arts+'</code>. '+
+       (m.launched_linode_id?('A new instance (Linode '+esc(m.launched_linode_id)+') was launched with all disks attached — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a>.')
+       :'To launch: create a Linode, attach these volumes (boot disk as sda, then sdb, sdc…) and boot from GRUB 2.')+'</div>';
   }
 
   // Validations + enrollment, collapsed once the baseline is replicating fine.
@@ -250,24 +285,29 @@ function migCard(v){
   for(const c of (v.validations||[])){checks+='<div class="check"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>'}
   const allOk=(v.validations||[]).every(c=>c.ok);
   h+='<details'+(allOk?'':' open')+'><summary>Validation checks'+(allOk?' (all passing)':'')+'</summary><div>'+checks+'</div></details>';
-  if(v.enroll_cmd && !m.full_sync_done && m.state!=='migrating'){
-    h+='<details open><summary>Enroll the source server</summary><div>'+
-       '<label>Run this on '+esc(m.source_hostname||m.source_device)+'</label>'+
+  if(v.enroll_cmd && !allDone(m) && m.state!=='migrating'){
+    h+='<details open><summary>Enroll the source server (replicates all '+disks(m).length+' disk(s))</summary><div>'+
+       '<label>Run this on '+esc(m.source_hostname||'the source')+'</label>'+
        '<div style="display:flex;gap:8px;align-items:flex-start"><pre id="enroll'+m.id+'" style="flex:1;margin:0">'+esc(v.enroll_cmd)+'</pre>'+
        '<button onclick="copyText(document.getElementById(\'enroll'+m.id+'\').textContent,this)">Copy</button></div>'+
-       '<div class="muted" style="font-size:11px;margin-top:6px">Already enrolled but the first sync failed? No reinstall needed — the agent retries every 60s. '+
-       'Fix the cause (most often: open TCP '+esc(m.receiver_port)+' on this server’s firewall, including any Linode Cloud Firewall), '+
+       '<div class="muted" style="font-size:11px;margin-top:6px">Already enrolled but a disk’s first sync failed? No reinstall needed — the agent retries every 60s. '+
+       'Most often a receiver port is blocked: open TCP 5000-5100 on this server’s firewall (including any Linode Cloud Firewall), '+
        'or force a retry on the source: <code style="display:inline;padding:1px 4px">sudo systemctl start vmrepl-agent.service</code></div>'+
        '</div></details>';
   }
+  if(v.uninstall_cmd && ['image_ready','launched'].includes(m.state)){
+    h+='<details><summary>Remove the agent from the source server</summary><div>'+
+       '<div style="display:flex;gap:8px;align-items:flex-start"><pre id="unin'+m.id+'" style="flex:1;margin:0">'+esc(v.uninstall_cmd)+'</pre>'+
+       '<button onclick="copyText(document.getElementById(\'unin'+m.id+'\').textContent,this)">Copy</button></div></div></details>';
+  }
 
-  // Actions: assess -> start; stop while running; delete always.
+  // Actions: assess -> cutover; stop while running; delete always.
   h+='<div class="actions">';
   if(!['migrating','image_ready','launched'].includes(m.state)){
     h+='<button onclick="assessMig('+m.id+')">Pre-migration assessment</button>';
     if(v.assessed){h+='<span class="pill ok">✔ assessment successful</span>';}
     if(v.can_migrate){
-      h+='<button class="primary"'+(v.assessed?'':' disabled title="Run the pre-migration assessment first"')+' onclick="startMig('+m.id+')">Start migration</button>';
+      h+='<button class="primary"'+(v.assessed?'':' disabled title="Run the pre-migration assessment first"')+' onclick="cutoverMig('+m.id+')">Cutover instance</button>';
     }
   }
   if(m.state==='migrating'){h+='<button class="danger" onclick="stopMig('+m.id+')">Stop</button>';}
@@ -285,7 +325,7 @@ async function refresh(){
   }catch(e){/* 401 handled in api() */}
 }
 
-async function start(){show('app');refresh();}
+async function start(){show('app');if(!document.querySelector('#disks .row'))addDisk();refresh();}
 async function init(){
   try{await api('GET','/api/v1/session');start();setInterval(()=>{if(!$('app').classList.contains('hide'))refresh()},5000);}
   catch(e){show('login')}

@@ -10,10 +10,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -269,19 +267,6 @@ func (s *Server) linodeClient(ctx context.Context) (*linode.Client, bool) {
 	return linode.New(tok), true
 }
 
-// dataDevicePath is where a migration's blocks land: the attached Linode volume
-// device, or a file under DataDir when Linode automation isn't configured.
-func (s *Server) dataDevicePath(m api.Migration) string {
-	if m.VolumeDevice != "" {
-		return m.VolumeDevice
-	}
-	return filepath.Join(s.cfg.DataDir, fmt.Sprintf("migration-%d.img", m.ID))
-}
-
-func (s *Server) manifestPath(m api.Migration) string {
-	return filepath.Join(s.cfg.DataDir, fmt.Sprintf("migration-%d.cbt", m.ID))
-}
-
 // StartActiveReceivers (re)starts receivers for all migrations that are mid-
 // replication, e.g. after the appliance restarts.
 func (s *Server) StartActiveReceivers() {
@@ -293,8 +278,8 @@ func (s *Server) StartActiveReceivers() {
 	for _, m := range migs {
 		switch m.State {
 		case api.MigAwaitingAgent, api.MigReplicating, api.MigReady:
-			if err := s.ensureReceiver(m); err != nil {
-				log.Printf("appliance: start receiver for migration %d: %v", m.ID, err)
+			if err := s.ensureReceivers(m); err != nil {
+				log.Printf("appliance: start receivers for migration %d: %v", m.ID, err)
 			}
 		}
 	}

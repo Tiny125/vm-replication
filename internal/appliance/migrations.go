@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 
 	"github.com/tiny125/vm-replication/internal/api"
@@ -17,37 +18,63 @@ import (
 	"github.com/tiny125/vm-replication/internal/transport"
 )
 
-// ---- receiver manager ----
+// A migration moves one source server with one or more disks. Each disk gets
+// its own receiver (port BaseReceiverPort+diskID), its own replication volume,
+// and its own cloned artifact at cutover.
 
-// ensureReceiver starts (idempotently) an embedded receiver for a migration,
-// listening on its assigned port and writing to its data device.
-func (s *Server) ensureReceiver(m api.Migration) error {
-	if m.ReceiverPort == 0 {
-		return fmt.Errorf("migration %d has no receiver port", m.ID)
+// ---- per-disk paths ----
+
+func (s *Server) diskDevicePath(m api.Migration, d api.Disk) string {
+	if d.VolumeDevice != "" {
+		return d.VolumeDevice
 	}
-	s.recMu.Lock()
-	defer s.recMu.Unlock()
-	if _, ok := s.receivers[m.ID]; ok {
-		return nil
-	}
+	return filepath.Join(s.cfg.DataDir, fmt.Sprintf("migration-%d-disk%d.img", m.ID, d.Index))
+}
+
+func (s *Server) diskManifestPath(m api.Migration, d api.Disk) string {
+	return filepath.Join(s.cfg.DataDir, fmt.Sprintf("migration-%d-disk%d.cbt", m.ID, d.Index))
+}
+
+// ---- receiver manager (one receiver per disk) ----
+
+// ensureReceivers starts (idempotently) an embedded receiver for every disk of
+// a migration, each on its own port writing to its own device.
+func (s *Server) ensureReceivers(m api.Migration) error {
 	tlsCfg, err := transport.ServerConfig(s.cfg.TLS)
 	if err != nil {
 		return err
 	}
-	ln, err := tls.Listen("tcp", fmt.Sprintf(":%d", m.ReceiverPort), tlsCfg)
+	for _, d := range m.Disks {
+		if d.ReceiverPort == 0 {
+			continue
+		}
+		if err := s.ensureDiskReceiver(m, d, tlsCfg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Config) error {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	if _, ok := s.receivers[d.ID]; ok {
+		return nil
+	}
+	ln, err := tls.Listen("tcp", fmt.Sprintf(":%d", d.ReceiverPort), tlsCfg)
 	if err != nil {
-		return fmt.Errorf("listen :%d: %w", m.ReceiverPort, err)
+		return fmt.Errorf("listen :%d: %w", d.ReceiverPort, err)
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
-	s.receivers[m.ID] = cancel
+	s.receivers[d.ID] = cancel
 
-	device := s.dataDevicePath(m)
-	manifest := s.manifestPath(m)
-	migID := m.ID
-	log.Printf("appliance: receiver for migration %d listening on :%d -> %s", migID, m.ReceiverPort, device)
+	device := s.diskDevicePath(m, d)
+	manifest := s.diskManifestPath(m, d)
+	migID, diskID := m.ID, d.ID
+	log.Printf("appliance: migration %d disk %d (%s) receiver on :%d -> %s", migID, d.Index, d.SourceDevice, d.ReceiverPort, device)
 
 	onProgress := func(written, total int64, fullSync bool) {
-		v, _ := s.progress.LoadOrStore(migID, &syncProgress{started: time.Now()})
+		v, _ := s.progress.LoadOrStore(diskID, &syncProgress{started: time.Now()})
 		p := v.(*syncProgress)
 		p.mu.Lock()
 		if written == 0 {
@@ -61,23 +88,26 @@ func (s *Server) ensureReceiver(m api.Migration) error {
 		err := receiver.Serve(ctx, ln, device, manifest, false, func(st receiver.Stats) {
 			total := blockdiff.NumBlocks(st.Hello.DeviceSize, st.Hello.BlockSize)
 			bytes := st.BlocksWritten * int64(st.Hello.BlockSize)
-			if err := s.st.RecordMigrationSync(s.ctx, migID, st.Hello.FullSync, total, st.ChangedBlocks, bytes); err != nil {
-				log.Printf("appliance: record sync for migration %d: %v", migID, err)
+			if err := s.st.RecordDiskSync(s.ctx, migID, diskID, st.Hello.FullSync, total, st.ChangedBlocks, bytes); err != nil {
+				log.Printf("appliance: record sync (migration %d disk %d): %v", migID, diskID, err)
 			}
 		}, onProgress)
 		if err != nil && ctx.Err() == nil {
-			log.Printf("appliance: receiver for migration %d stopped: %v", migID, err)
+			log.Printf("appliance: receiver (migration %d disk %d) stopped: %v", migID, diskID, err)
 		}
 	}()
 	return nil
 }
 
-func (s *Server) stopReceiver(id int64) {
+// stopReceivers stops every disk receiver for a migration.
+func (s *Server) stopReceivers(m api.Migration) {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
-	if cancel, ok := s.receivers[id]; ok {
-		cancel()
-		delete(s.receivers, id)
+	for _, d := range m.Disks {
+		if cancel, ok := s.receivers[d.ID]; ok {
+			cancel()
+			delete(s.receivers, d.ID)
+		}
 	}
 }
 
@@ -88,51 +118,67 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
-	if req.Name == "" || req.SourceDevice == "" || req.SourceDiskSize <= 0 {
-		writeErr(w, http.StatusBadRequest, "name, source_device and a positive source_disk_size are required")
+	devices := req.Devices
+	if len(devices) == 0 && req.SourceDevice != "" {
+		devices = []api.DeviceSpec{{Device: req.SourceDevice, SizeBytes: req.SourceDiskSize}}
+	}
+	if req.Name == "" || len(devices) == 0 {
+		writeErr(w, http.StatusBadRequest, "name and at least one source device are required")
 		return
 	}
+	for _, d := range devices {
+		if d.Device == "" || d.SizeBytes <= 0 {
+			writeErr(w, http.StatusBadRequest, "every disk needs a device path and a positive size")
+			return
+		}
+	}
+	if len(devices) > 8 {
+		writeErr(w, http.StatusBadRequest, "at most 8 disks per migration (Linode device slots sda–sdh)")
+		return
+	}
+	req.Devices = devices
+
 	ctx := r.Context()
 	m, token, err := s.st.CreateMigration(ctx, req)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	// Assign a unique receiver port.
-	port := s.cfg.BaseReceiverPort + int(m.ID)
-	if err := s.st.AssignReceiverPort(ctx, m.ID, port); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		writeErr(w, http.StatusInternalServerError, friendlyCreateErr(err))
 		return
 	}
 
-	// Provision storage: a Linode volume if automation is configured, else a
-	// file under DataDir (created lazily by the receiver on first write).
-	if err := s.provisionStorage(ctx, m.ID, req.SourceDiskSize); err != nil {
-		_ = s.st.SetMigrationState(ctx, m.ID, api.MigFailed, "provision storage: "+err.Error())
-		writeErr(w, http.StatusInternalServerError, "provision storage: "+err.Error())
-		return
+	// Assign a unique receiver port per disk and provision a volume per disk.
+	for _, d := range m.Disks {
+		port := s.cfg.BaseReceiverPort + int(d.ID)
+		if err := s.st.AssignDiskPort(ctx, d.ID, port); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := s.provisionDiskStorage(ctx, m, d); err != nil {
+			_ = s.st.SetMigrationState(ctx, m.ID, api.MigFailed, "provision storage: "+err.Error())
+			writeErr(w, http.StatusInternalServerError, "provision storage: "+err.Error())
+			return
+		}
 	}
 
 	_ = s.st.SetMigrationState(ctx, m.ID, api.MigAwaitingAgent, "")
 	m, _ = s.st.Migration(ctx, m.ID)
-	if err := s.ensureReceiver(m); err != nil {
-		log.Printf("appliance: ensureReceiver: %v", err)
+	if err := s.ensureReceivers(m); err != nil {
+		log.Printf("appliance: ensureReceivers: %v", err)
 	}
 	writeJSON(w, http.StatusCreated, s.view(ctx, m, token))
 }
 
-// provisionStorage creates and attaches a Linode volume for the migration when
+// provisionDiskStorage creates and attaches a Linode volume for one disk when
 // automation is configured; otherwise it's a no-op (file fallback).
-func (s *Server) provisionStorage(ctx context.Context, migID, sourceBytes int64) error {
+func (s *Server) provisionDiskStorage(ctx context.Context, m api.Migration, d api.Disk) error {
 	cl, ok := s.linodeClient(ctx)
 	if !ok || s.cfg.ApplianceLinodeID == 0 {
 		return nil // file fallback
 	}
-	sizeGiB := int((sourceBytes + (1 << 30) - 1) / (1 << 30))
+	sizeGiB := int((d.SizeBytes + (1 << 30) - 1) / (1 << 30))
 	if sizeGiB < 10 {
 		sizeGiB = 10 // Linode minimum volume size
 	}
-	label := fmt.Sprintf("vmrepl-%d", migID)
+	label := fmt.Sprintf("vmrepl-%d-%d", m.ID, d.Index)
 	vol, err := cl.CreateVolume(ctx, label, s.cfg.Region, sizeGiB, s.cfg.ApplianceLinodeID)
 	if err != nil {
 		return err
@@ -144,7 +190,7 @@ func (s *Server) provisionStorage(ctx context.Context, migID, sourceBytes int64)
 	if device == "" {
 		device = "/dev/disk/by-id/scsi-0Linode_Volume_" + label
 	}
-	return s.st.SetMigrationVolume(ctx, migID, vol.ID, device)
+	return s.st.SetDiskVolume(ctx, d.ID, vol.ID, device)
 }
 
 func (s *Server) handleListMigrations(w http.ResponseWriter, r *http.Request) {
@@ -175,9 +221,8 @@ func (s *Server) handleGetMigration(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.view(ctx, m, ""))
 }
 
-// handleAssessMigration runs the pre-migration assessment: it re-evaluates all
-// validation checks and records a pass (gating the Start button). A failed
-// assessment clears any earlier pass and returns the failing checks.
+// handleAssessMigration runs the pre-migration assessment: re-evaluates all
+// validation checks and records a pass (gating the Cutover button).
 func (s *Server) handleAssessMigration(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
@@ -190,8 +235,7 @@ func (s *Server) handleAssessMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view := s.view(ctx, m, "")
-	passed := allOK(view.Validations)
-	if err := s.st.SetAssessed(ctx, id, passed); err != nil {
+	if err := s.st.SetAssessed(ctx, id, allOK(view.Validations)); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -199,14 +243,16 @@ func (s *Server) handleAssessMigration(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.view(ctx, m, ""))
 }
 
+// handleStartMigration cuts over: it stops replication and runs finalize
+// (convert + clone every disk + optional launch). The console labels this
+// "Cutover instance".
 func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
 		return
 	}
 	var req api.FinalizeRequest
-	// Body is optional (defaults = no launch); tolerate an empty body.
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	_ = json.NewDecoder(r.Body).Decode(&req) // body optional
 	ctx := r.Context()
 	m, err := s.st.Migration(ctx, id)
 	if err != nil {
@@ -227,7 +273,7 @@ func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.st.SetMigrateStarted(ctx, id)
-	s.stopReceiver(id) // quiesce: stop accepting blocks during finalize
+	s.stopReceivers(m) // quiesce all disks during finalize
 
 	finCtx, cancel := context.WithCancel(s.ctx)
 	s.recMu.Lock()
@@ -237,8 +283,7 @@ func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "migrating"})
 }
 
-// handleStopMigration cancels an in-flight finalize and returns the migration
-// to replicating (the receiver restarts; the assessment must be re-run).
+// handleStopMigration cancels an in-flight finalize and resumes replication.
 func (s *Server) handleStopMigration(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
@@ -261,17 +306,17 @@ func (s *Server) handleStopMigration(w http.ResponseWriter, r *http.Request) {
 	if cancel != nil {
 		cancel()
 	}
-	_ = s.st.SetAssessed(ctx, id, false) // require a fresh assessment before retry
+	_ = s.st.SetAssessed(ctx, id, false)
 	_ = s.st.SetMigrationState(ctx, id, api.MigReplicating, "stopped by operator")
 	if m2, err := s.st.Migration(ctx, id); err == nil {
-		_ = s.ensureReceiver(m2)
+		_ = s.ensureReceivers(m2)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
 }
 
-// handleDeleteMigration removes a migration: stops its receiver, cancels any
-// finalize, best-effort detaches and deletes its replication volume (the cloned
-// artifact, if one was produced, is kept), and deletes the record.
+// handleDeleteMigration removes a migration: stops all receivers, cancels any
+// finalize, best-effort detaches+deletes every replication volume (cloned
+// artifacts are kept), and deletes the record.
 func (s *Server) handleDeleteMigration(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
@@ -289,30 +334,28 @@ func (s *Server) handleDeleteMigration(w http.ResponseWriter, r *http.Request) {
 		delete(s.finalizes, id)
 	}
 	s.recMu.Unlock()
-	s.stopReceiver(id)
-	s.progress.Delete(id)
+	s.stopReceivers(m)
 
-	if m.VolumeID != 0 {
-		if cl, ok := s.linodeClient(ctx); ok {
-			if err := cl.DetachVolume(ctx, m.VolumeID); err != nil {
-				log.Printf("appliance: detach volume %d: %v", m.VolumeID, err)
-			}
-			// Detach is async; retry the delete briefly.
+	cl, haveLinode := s.linodeClient(ctx)
+	for _, d := range m.Disks {
+		s.progress.Delete(d.ID)
+		if d.VolumeID != 0 && haveLinode {
+			_ = cl.DetachVolume(ctx, d.VolumeID)
 			var derr error
 			for i := 0; i < 10; i++ {
-				if derr = cl.DeleteVolume(ctx, m.VolumeID); derr == nil {
+				if derr = cl.DeleteVolume(ctx, d.VolumeID); derr == nil {
 					break
 				}
 				time.Sleep(2 * time.Second)
 			}
 			if derr != nil {
-				log.Printf("appliance: delete volume %d failed (remove it in Cloud Manager): %v", m.VolumeID, derr)
+				log.Printf("appliance: delete volume %d failed (remove it in Cloud Manager): %v", d.VolumeID, derr)
 			}
+		} else {
+			_ = os.Remove(s.diskDevicePath(m, d))
 		}
-	} else {
-		_ = os.Remove(s.dataDevicePath(m)) // file-fallback image
+		_ = os.Remove(s.diskManifestPath(m, d))
 	}
-	_ = os.Remove(s.manifestPath(m))
 
 	if err := s.st.DeleteMigration(ctx, id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -321,10 +364,9 @@ func (s *Server) handleDeleteMigration(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// finalize converts the replicated disk to boot on Linode and produces the
-// artifact (a cloned volume) plus an optional launched instance. Runs async
-// under a cancellable ctx (the console Stop button); state/last_error reflect
-// progress. Linode steps require a configured token.
+// finalize converts the boot disk to boot on Linode, clones every disk's volume
+// into an artifact, and optionally launches an instance with all artifacts
+// attached. Runs under a cancellable ctx (the Stop button).
 func (s *Server) finalize(ctx context.Context, m api.Migration, req api.FinalizeRequest) {
 	defer func() {
 		s.recMu.Lock()
@@ -332,16 +374,15 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		s.recMu.Unlock()
 	}()
 	canceled := func() bool { return ctx.Err() != nil }
-	device := s.dataDevicePath(m)
+	sctx := s.ctx // store writes survive a Stop (which owns its own transition)
 
-	// Store writes use the server context: ctx is canceled by the Stop button,
-	// and the Stop handler owns the state transition in that case.
-	sctx := s.ctx
+	boot := m.Disks[0]
+	bootDevice := s.diskDevicePath(m, boot)
 
-	// 1) Make the replicated disk bootable on Linode (virtio/GRUB/fstab/etc).
-	if s.cfg.ConvertScript != "" && isBlockDevice(device) {
-		log.Printf("appliance: migration %d: running machine conversion on %s", m.ID, device)
-		out, err := exec.CommandContext(ctx, "/bin/sh", s.cfg.ConvertScript, device).CombinedOutput()
+	// 1) Make the boot disk bootable on Linode (virtio/GRUB/fstab/etc).
+	if s.cfg.ConvertScript != "" && isBlockDevice(bootDevice) {
+		log.Printf("appliance: migration %d: machine conversion on boot disk %s", m.ID, bootDevice)
+		out, err := exec.CommandContext(ctx, "/bin/sh", s.cfg.ConvertScript, bootDevice).CombinedOutput()
 		if canceled() {
 			return
 		}
@@ -354,38 +395,42 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	}
 
 	cl, ok := s.linodeClient(sctx)
-	if !ok || m.VolumeID == 0 {
-		// No Linode automation: the converted data sits on the device; done.
+	if !ok || boot.VolumeID == 0 {
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigImageReady,
-			"Linode automation not configured; migrated data is on "+device)
+			"Linode automation not configured; migrated data is on the appliance volumes/files")
 		_ = s.st.SetMigrateFinished(sctx, m.ID)
 		return
 	}
 
-	// 2) Clone the volume into the immutable artifact ("snapshot").
-	artifactLabel := fmt.Sprintf("vmrepl-img-%d", m.ID)
-	log.Printf("appliance: migration %d: cloning volume %d -> %s", m.ID, m.VolumeID, artifactLabel)
-	clone, err := cl.CloneVolume(ctx, m.VolumeID, artifactLabel)
-	if canceled() {
-		return
-	}
-	if err != nil {
-		s.fail(m.ID, "clone volume: "+err.Error())
-		return
-	}
-	if _, err := cl.WaitVolumeActive(ctx, clone.ID, 10*time.Minute); err != nil {
+	// 2) Clone every disk's volume into an immutable artifact, in disk order.
+	cloneIDs := make([]int64, len(m.Disks))
+	for i, d := range m.Disks {
+		label := fmt.Sprintf("vmrepl-img-%d-%d", m.ID, d.Index)
+		log.Printf("appliance: migration %d: cloning disk %d volume %d -> %s", m.ID, d.Index, d.VolumeID, label)
+		clone, err := cl.CloneVolume(ctx, d.VolumeID, label)
 		if canceled() {
 			return
 		}
-		s.fail(m.ID, "wait clone active: "+err.Error())
-		return
+		if err != nil {
+			s.fail(m.ID, fmt.Sprintf("clone disk %d volume: %v", d.Index, err))
+			return
+		}
+		if _, err := cl.WaitVolumeActive(ctx, clone.ID, 15*time.Minute); err != nil {
+			if canceled() {
+				return
+			}
+			s.fail(m.ID, fmt.Sprintf("wait clone (disk %d) active: %v", d.Index, err))
+			return
+		}
+		cloneIDs[i] = clone.ID
+		_ = s.st.SetDiskArtifact(sctx, d.ID, fmt.Sprintf("volume:%d", clone.ID))
 	}
-	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", clone.ID), 0)
+	// The boot clone is the migration's headline artifact.
+	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", cloneIDs[0]), 0)
 
-	// 3) Optionally launch a new instance booting from the cloned volume.
+	// 3) Optionally launch a new instance booting from the boot artifact with the
+	//    data artifacts attached (sda, sdb, …).
 	if req.LaunchInstance {
-		// The cloned volume lives in the appliance's region, so the instance must
-		// too; resolve it from the appliance rather than trusting a flag.
 		region := req.Region
 		if region == "" {
 			if inst, err := cl.GetInstance(ctx, s.cfg.ApplianceLinodeID); err == nil && inst.Region != "" {
@@ -404,14 +449,16 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 			s.fail(m.ID, "create instance: "+err.Error())
 			return
 		}
-		if err := cl.AttachVolume(ctx, clone.ID, inst.ID); err != nil {
-			if canceled() {
+		for i, vid := range cloneIDs {
+			if err := cl.AttachVolume(ctx, vid, inst.ID); err != nil {
+				if canceled() {
+					return
+				}
+				s.fail(m.ID, fmt.Sprintf("attach artifact (disk %d): %v", i, err))
 				return
 			}
-			s.fail(m.ID, "attach artifact: "+err.Error())
-			return
 		}
-		cfgID, err := cl.CreateConfigBootingVolume(ctx, inst.ID, clone.ID, "boot-migrated")
+		cfgID, err := cl.CreateConfigBootingVolumes(ctx, inst.ID, cloneIDs, "boot-migrated")
 		if err != nil {
 			if canceled() {
 				return
@@ -426,7 +473,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 			s.fail(m.ID, "boot instance: "+err.Error())
 			return
 		}
-		_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", clone.ID), inst.ID)
+		_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", cloneIDs[0]), inst.ID)
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
 		_ = s.st.SetMigrateFinished(sctx, m.ID)
 		return
@@ -441,39 +488,66 @@ func (s *Server) fail(id int64, msg string) {
 	_ = s.st.SetMigrationState(context.Background(), id, api.MigFailed, msg)
 }
 
-// ---- view + validations ----
+// ---- view + validations (aggregate across disks) ----
 
 func (s *Server) view(ctx context.Context, m api.Migration, token string) api.MigrationView {
 	v := api.MigrationView{Migration: m, PercentDone: -1, ETASeconds: -1}
-	if !m.LastSyncAt.IsZero() {
-		v.RPOSeconds = time.Since(m.LastSyncAt).Seconds()
+
+	// RPO = worst (largest) lag across disks that have completed a sync.
+	var maxLag float64
+	for _, d := range m.Disks {
+		if !d.LastSyncAt.IsZero() {
+			if lag := time.Since(d.LastSyncAt).Seconds(); lag > maxLag {
+				maxLag = lag
+			}
+		}
 	}
-	v.Validations = s.validations(m, v.RPOSeconds)
+	v.RPOSeconds = maxLag
+	v.Validations = s.validations(m, maxLag)
 	v.CanMigrate = allOK(v.Validations) &&
 		(m.State == api.MigReplicating || m.State == api.MigReady || m.State == api.MigAwaitingAgent)
-	v.Assessed = !m.AssessedAt.IsZero() && v.CanMigrate // a pass goes stale if checks regress
+	v.Assessed = !m.AssessedAt.IsZero() && v.CanMigrate
 
-	// Live phase / percent / ETA for the console (auto-refreshed by polling).
 	switch m.State {
 	case api.MigCreated, api.MigAwaitingAgent:
 		v.Phase = "waiting for agent"
 	case api.MigReplicating, api.MigReady:
 		v.Phase = "replicating"
-		if p, ok := s.progress.Load(m.ID); ok {
-			sp := p.(*syncProgress)
-			sp.mu.Lock()
-			written, total, full, started := sp.written, sp.total, sp.fullSync, sp.started
-			sp.mu.Unlock()
-			// Percent + ETA are meaningful during the initial full sync, where the
-			// expected block count is known up front.
-			if full && !m.FullSyncDone && total > 0 && written < total {
-				v.Phase = "initial sync"
-				v.PercentDone = float64(written) / float64(total) * 100
-				if elapsed := time.Since(started); written > 0 && elapsed > 0 {
-					remain := float64(elapsed) * float64(total-written) / float64(written)
-					v.ETASeconds = int64(time.Duration(remain).Seconds())
+		// Aggregate initial-sync progress across all disks still baselining.
+		var sumWritten, sumTotal int64
+		var earliest time.Time
+		baselining := false
+		for _, d := range m.Disks {
+			if d.FullSyncDone {
+				if d.TotalBlocks > 0 {
+					sumWritten += d.TotalBlocks
+					sumTotal += d.TotalBlocks
 				}
-				v.ElapsedSeconds = int64(time.Since(started).Seconds())
+				continue
+			}
+			if p, ok := s.progress.Load(d.ID); ok {
+				sp := p.(*syncProgress)
+				sp.mu.Lock()
+				written, total, full, started := sp.written, sp.total, sp.fullSync, sp.started
+				sp.mu.Unlock()
+				if full && total > 0 {
+					baselining = true
+					sumWritten += written
+					sumTotal += total
+					if earliest.IsZero() || started.Before(earliest) {
+						earliest = started
+					}
+				}
+			}
+		}
+		if baselining && sumTotal > 0 {
+			v.Phase = "initial sync"
+			v.PercentDone = float64(sumWritten) / float64(sumTotal) * 100
+			if !earliest.IsZero() && sumWritten > 0 {
+				elapsed := time.Since(earliest)
+				remain := float64(elapsed) * float64(sumTotal-sumWritten) / float64(sumWritten)
+				v.ETASeconds = int64(time.Duration(remain).Seconds())
+				v.ElapsedSeconds = int64(elapsed.Seconds())
 			}
 		}
 	case api.MigMigrating:
@@ -492,7 +566,6 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	}
 
 	if token == "" {
-		// Look up the enrollment token so the console can show the command.
 		token, _ = s.st.EnrollToken(ctx, m.ID)
 	}
 	if token != "" {
@@ -502,28 +575,47 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	return v
 }
 
-// uninstallCmd is the one-liner that removes the agent from a source server.
-func (s *Server) uninstallCmd() string {
-	return fmt.Sprintf("curl -fsSL %s'%s://%s:%d/install/uninstall.sh' | sudo bash",
-		s.curlPinFlag(), s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort)
-}
-
 func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCheck {
-	agentSeen := !m.AgentLastSeen.IsZero() && time.Since(m.AgentLastSeen) < 5*time.Minute
-	lagOK := !m.LastSyncAt.IsZero() && rpoSec <= float64(s.cfg.RPOTargetSec)
-	storageOK := m.VolumeDevice != "" || s.cfg.ApplianceLinodeID == 0 // file fallback counts as ok
+	n := len(m.Disks)
+	agentsSeen, fullDone, storageOK := 0, 0, 0
+	var anySync bool
+	for _, d := range m.Disks {
+		if !d.AgentLastSeen.IsZero() && time.Since(d.AgentLastSeen) < 5*time.Minute {
+			agentsSeen++
+		}
+		if d.FullSyncDone {
+			fullDone++
+		}
+		if d.VolumeDevice != "" || s.cfg.ApplianceLinodeID == 0 {
+			storageOK++
+		}
+		if !d.LastSyncAt.IsZero() {
+			anySync = true
+		}
+	}
+	allAgents := n > 0 && agentsSeen == n
+	allFull := n > 0 && fullDone == n
+	allStorage := n > 0 && storageOK == n
+	lagOK := anySync && allFull && rpoSec <= float64(s.cfg.RPOTargetSec)
 
+	diskWord := func(k int) string { return fmt.Sprintf("%d/%d disks", k, n) }
 	return []api.ValidationCheck{
-		{Name: "Agent connected", OK: agentSeen, Detail: lastSeenDetail(m.AgentLastSeen)},
-		{Name: "Initial full sync complete", OK: m.FullSyncDone, Detail: boolDetail(m.FullSyncDone, "baseline replicated", "no full sync yet")},
-		{Name: fmt.Sprintf("Replication lag within %ds", s.cfg.RPOTargetSec), OK: lagOK, Detail: lagDetail(m.LastSyncAt, rpoSec)},
-		{Name: "Storage provisioned", OK: storageOK, Detail: boolDetail(storageOK, "ready", "volume not attached")},
+		{Name: "Agent connected", OK: allAgents, Detail: diskWord(agentsSeen) + " checked in"},
+		{Name: "Initial full sync complete", OK: allFull, Detail: diskWord(fullDone) + " baselined"},
+		{Name: fmt.Sprintf("Replication lag within %ds", s.cfg.RPOTargetSec), OK: lagOK, Detail: lagDetail2(anySync, rpoSec)},
+		{Name: "Storage provisioned", OK: allStorage, Detail: diskWord(storageOK) + " ready"},
 	}
 }
 
 func (s *Server) enrollCmd(token string, m api.Migration) string {
 	return fmt.Sprintf("curl -fsSL %s'%s://%s:%d/install/agent.sh?token=%s' | sudo bash",
 		s.curlPinFlag(), s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort, token)
+}
+
+// uninstallCmd is the one-liner that removes the agent from a source server.
+func (s *Server) uninstallCmd() string {
+	return fmt.Sprintf("curl -fsSL %s'%s://%s:%d/install/uninstall.sh' | sudo bash",
+		s.curlPinFlag(), s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort)
 }
 
 // scheme returns the console URL scheme (https unless explicitly http).
@@ -536,9 +628,8 @@ func (s *Server) scheme() string {
 
 // curlPinFlag returns the curl flags (with trailing space) that authenticate the
 // download against the self-signed console cert via public-key pinning. -k skips
-// CA-chain validation (we have no public CA) while --pinnedpubkey still requires
-// the server to prove possession of the pinned key, so the connection remains
-// MITM-proof. Empty when no pin is configured (plain HTTP / external CA).
+// CA-chain validation (no public CA) while --pinnedpubkey still requires the
+// pinned key, so the connection is MITM-proof. Empty for plain HTTP / external CA.
 func (s *Server) curlPinFlag() string {
 	if s.cfg.PublicKeyPin != "" {
 		return "-k --pinnedpubkey 'sha256//" + s.cfg.PublicKeyPin + "' "
@@ -580,23 +671,28 @@ func orDefault(v, def string) string {
 	return v
 }
 
-func boolDetail(ok bool, yes, no string) string {
-	if ok {
-		return yes
-	}
-	return no
-}
-
-func lastSeenDetail(t time.Time) string {
-	if t.IsZero() {
-		return "agent has not checked in"
-	}
-	return "last seen " + time.Since(t).Round(time.Second).String() + " ago"
-}
-
-func lagDetail(last time.Time, rpoSec float64) string {
-	if last.IsZero() {
+func lagDetail2(anySync bool, rpoSec float64) string {
+	if !anySync {
 		return "no completed sync yet"
 	}
-	return fmt.Sprintf("%.0fs since last successful sync", rpoSec)
+	return fmt.Sprintf("worst lag %.0fs across disks", rpoSec)
+}
+
+// friendlyCreateErr turns the SQLite unique-name violation into a clear message.
+func friendlyCreateErr(err error) string {
+	if err != nil && containsAny(err.Error(), "UNIQUE", "unique") && containsAny(err.Error(), "name") {
+		return "a migration with that name already exists — choose a different name"
+	}
+	return err.Error()
+}
+
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		for i := 0; i+len(sub) <= len(s); i++ {
+			if s[i:i+len(sub)] == sub {
+				return true
+			}
+		}
+	}
+	return false
 }
