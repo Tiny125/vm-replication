@@ -108,7 +108,17 @@ async function loadSettings(){
     h+='<div class="check"><span class="y">✔</span> Linode API token stored. '+
        (st.linode_automation?('Appliance Linode id '+esc(st.appliance_linode_id)+', region '+esc(st.region)+'.'):'(appliance Linode id unknown — file-fallback mode)')+'</div>';
   }else{
-    h+='<div class="muted" style="font-size:12px;margin-bottom:8px">Paste your Linode API token to enable volume provisioning and one-click finalize. Stored encrypted on this server.</div>'+
+    h+='<div class="muted" style="font-size:12px;margin-bottom:8px">'+
+       'A Linode <b>Personal Access Token</b> lets this appliance provision Block Storage volumes, '+
+       'clone the migrated disk, and launch new instances on your behalf. Without it the tool runs in '+
+       'file-fallback mode (no Linode provisioning). The token is stored <b>encrypted at rest</b> on this server '+
+       'and is only sent to api.linode.com.'+
+       '</div>'+
+       '<div class="muted" style="font-size:12px;margin-bottom:8px">'+
+       '<b>How to get one:</b> open <a href="https://cloud.linode.com/profile/tokens" target="_blank" rel="noopener" style="color:var(--accent)">cloud.linode.com/profile/tokens</a> '+
+       '&rarr; <i>Create a Personal Access Token</i>. Set all scopes to <b>None</b> except '+
+       '<b>Linodes: Read/Write</b> and <b>Volumes: Read/Write</b>, then create and copy the token (shown once).'+
+       '</div>'+
        '<div style="display:flex;gap:8px"><input id="ltok" type="password" placeholder="Linode API token"><button onclick="saveToken()">Save</button></div>';
   }
   $('settings').innerHTML=h;
