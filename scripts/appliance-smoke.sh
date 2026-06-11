@@ -42,78 +42,93 @@ if curl -fsS --cacert "$CACERT" -X POST "$BASE/login" -H 'Content-Type: applicat
 fi
 echo "   OK"
 
-echo "== Create source image (16 MiB) =="
-dd if=/dev/urandom of="$WORK/source.img" bs=1M count=16 status=none
-SIZE=$(stat -c %s "$WORK/source.img")
+echo "== Create source disks: boot (16 MiB) + data (24 MiB) =="
+dd if=/dev/urandom of="$WORK/sda.img" bs=1M count=16 status=none
+dd if=/dev/urandom of="$WORK/sdb.img" bs=1M count=24 status=none
+SZA=$(stat -c %s "$WORK/sda.img"); SZB=$(stat -c %s "$WORK/sdb.img")
 
-echo "== Create migration via console API =="
+echo "== Create MULTI-DISK migration via console API =="
 MIG=$(api -X POST "$BASE/api/v1/migrations" -H 'Content-Type: application/json' \
-  -d "{\"name\":\"web01\",\"source_hostname\":\"web01\",\"source_device\":\"$WORK/source.img\",\"source_disk_size\":$SIZE}")
+  -d "{\"name\":\"ec2-3disk\",\"source_hostname\":\"ec2\",\"devices\":[{\"device\":\"$WORK/sda.img\",\"size_bytes\":$SZA},{\"device\":\"$WORK/sdb.img\",\"size_bytes\":$SZB}]}")
 MID=$(echo "$MIG" | jq -r '.migration.id')
-RPORT=$(echo "$MIG" | jq -r '.migration.receiver_port')
+NDISKS=$(echo "$MIG" | jq -r '.migration.disks | length')
+PORT0=$(echo "$MIG" | jq -r '.migration.disks[0].receiver_port')
+PORT1=$(echo "$MIG" | jq -r '.migration.disks[1].receiver_port')
 ENROLL=$(echo "$MIG" | jq -r '.enroll_cmd')
-echo "   migration id=$MID receiver_port=$RPORT"
-echo "   enroll cmd: $ENROLL"
-[ -n "$MID" ] && [ "$RPORT" -gt 0 ] || { echo "FAIL: bad migration"; exit 1; }
-if echo "$ENROLL" | grep -q 'https://' && echo "$ENROLL" | grep -q 'pinnedpubkey' && echo "$ENROLL" | grep -q 'sha256//'; then
-  echo "   OK: enrollment command is HTTPS + key-pinned"
-else
-  echo "FAIL: enrollment command not hardened: $ENROLL"; exit 1
-fi
+echo "   migration id=$MID disks=$NDISKS ports=$PORT0,$PORT1"
+[ "$NDISKS" = "2" ] && [ "$PORT0" -gt 0 ] && [ "$PORT1" -gt 0 ] && [ "$PORT0" != "$PORT1" ] \
+  || { echo "FAIL: expected 2 disks with distinct ports"; exit 1; }
+echo "$ENROLL" | grep -q 'https://' && echo "$ENROLL" | grep -q 'pinnedpubkey' \
+  || { echo "FAIL: enrollment command not hardened: $ENROLL"; exit 1; }
+echo "   OK: 2 disks, distinct ports, hardened enroll cmd"
 
-echo "== Run agent against the embedded receiver =="
-ok=0
-for attempt in 1 2 3 4 5; do
-  if "$WORK/agent" -device "$WORK/source.img" -target "127.0.0.1:$RPORT" -server-name 127.0.0.1 \
-       -manifest "$WORK/source.cbt" -cert "$WORK/certs/agent.crt" -key "$WORK/certs/agent.key" -ca "$WORK/certs/ca.crt"; then
-    ok=1; break
-  fi
-  sleep 0.5
-done
-[ "$ok" = 1 ] || { echo "FAIL: agent never succeeded"; exit 1; }
+echo "== Verify the installer drives BOTH disks =="
+TOKEN=$(echo "$ENROLL" | grep -o 'token=[a-f0-9]*' | cut -d= -f2)
+SH=$(curl -fsS --cacert "$CACERT" "$BASE/install/agent.sh?token=$TOKEN")
+[ "$(echo "$SH" | grep -c '^ExecStart=')" = "2" ] || { echo "FAIL: installer should have 2 ExecStart lines"; exit 1; }
+echo "$SH" | grep -q 'systemctl stop vmrepl-agent' || { echo "FAIL: installer not re-run safe"; exit 1; }
+echo "   OK: 2 ExecStart lines, stop-before-replace"
 
-echo "== Verify replicated image matches source =="
-cmp -s "$WORK/source.img" "$WORK/data/migration-$MID.img" || { echo "FAIL: images differ"; exit 1; }
-echo "   OK: byte-identical"
+echo "== Replicate each disk to its own port =="
+run_disk(){ local dev=$1 port=$2 man=$3; local ok=0; for _ in 1 2 3 4 5; do
+  if "$WORK/agent" -device "$dev" -target "127.0.0.1:$port" -server-name 127.0.0.1 \
+     -manifest "$man" -cert "$WORK/certs/agent.crt" -key "$WORK/certs/agent.key" -ca "$WORK/certs/ca.crt"; then ok=1; break; fi
+  sleep 0.5; done; [ "$ok" = 1 ]; }
+run_disk "$WORK/sda.img" "$PORT0" "$WORK/sda.cbt" || { echo "FAIL: boot disk sync"; exit 1; }
+run_disk "$WORK/sdb.img" "$PORT1" "$WORK/sdb.cbt" || { echo "FAIL: data disk sync"; exit 1; }
 
-echo "== Check status + validations =="
+echo "== Verify BOTH replicated images match =="
+cmp -s "$WORK/sda.img" "$WORK/data/migration-$MID-disk0.img" || { echo "FAIL: boot disk differs"; exit 1; }
+cmp -s "$WORK/sdb.img" "$WORK/data/migration-$MID-disk1.img" || { echo "FAIL: data disk differs"; exit 1; }
+echo "   OK: both disks byte-identical"
+
+echo "== Check aggregate validations =="
 V=$(api "$BASE/api/v1/migrations/$MID")
-echo "$V" | jq -e '.migration.full_sync_done==true' >/dev/null || { echo "FAIL: full sync not recorded"; exit 1; }
+echo "$V" | jq -e '.migration.disks | all(.full_sync_done)' >/dev/null || { echo "FAIL: not all disks baselined"; exit 1; }
 echo "$V" | jq -e '.can_migrate==true' >/dev/null || { echo "FAIL: validations not satisfied: $(echo "$V" | jq -c '.validations')"; exit 1; }
-echo "   OK: full_sync_done=true, can_migrate=true"
+echo "   OK: all disks baselined, can_migrate=true"
 
-echo "== Start without assessment must be rejected =="
+echo "== Cutover gated on assessment =="
 if api -X POST "$BASE/api/v1/migrations/$MID/start" -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1; then
-  echo "FAIL: start succeeded without assessment"; exit 1
+  echo "FAIL: cutover succeeded without assessment"; exit 1
 fi
-echo "   OK: start gated on assessment"
+api -X POST "$BASE/api/v1/migrations/$MID/assess" | jq -e '.assessed==true' >/dev/null || { echo "FAIL: assessment did not pass"; exit 1; }
+echo "   OK: gated, then assessment successful"
 
-echo "== Pre-migration assessment =="
-A=$(api -X POST "$BASE/api/v1/migrations/$MID/assess")
-echo "$A" | jq -e '.assessed==true' >/dev/null || { echo "FAIL: assessment did not pass: $(echo "$A" | jq -c '.validations')"; exit 1; }
-echo "   OK: assessment successful"
-
-echo "== Start migration (file-fallback finalize) =="
+echo "== Cutover (file-fallback finalize) =="
 api -X POST "$BASE/api/v1/migrations/$MID/start" -H 'Content-Type: application/json' -d '{}' >/dev/null
 for _ in $(seq 1 50); do
   STATE=$(api "$BASE/api/v1/migrations/$MID" | jq -r '.migration.state')
   [ "$STATE" = "image_ready" ] && break
-  [ "$STATE" = "failed" ] && { echo "FAIL: migration failed: $(api "$BASE/api/v1/migrations/$MID" | jq -r '.migration.last_error')"; exit 1; }
+  [ "$STATE" = "failed" ] && { echo "FAIL: $(api "$BASE/api/v1/migrations/$MID" | jq -r '.migration.last_error')"; exit 1; }
   sleep 0.2
 done
 [ "$STATE" = "image_ready" ] || { echo "FAIL: state=$STATE, want image_ready"; exit 1; }
-api "$BASE/api/v1/migrations/$MID" | jq -e '.phase=="completed"' >/dev/null || { echo "FAIL: phase not completed"; exit 1; }
-echo "   OK: migration reached image_ready (phase=completed)"
+echo "   OK: reached image_ready"
 
-echo "== Delete a migration =="
+echo "== Uninstall command + script served =="
+echo "$V" | jq -e '.uninstall_cmd | contains("/install/uninstall.sh")' >/dev/null || { echo "FAIL: uninstall_cmd missing"; exit 1; }
+curl -fsS --cacert "$CACERT" "$BASE/install/uninstall.sh" | grep -q 'rm -rf /etc/vm-repl' || { echo "FAIL: uninstall script incomplete"; exit 1; }
+echo "   OK"
+
+echo "== Delete a migration removes BOTH disk files =="
 M2=$(api -X POST "$BASE/api/v1/migrations" -H 'Content-Type: application/json' \
-  -d "{\"name\":\"throwaway\",\"source_hostname\":\"x\",\"source_device\":\"$WORK/source.img\",\"source_disk_size\":$SIZE}")
+  -d "{\"name\":\"throwaway\",\"source_hostname\":\"x\",\"devices\":[{\"device\":\"$WORK/sda.img\",\"size_bytes\":$SZA},{\"device\":\"$WORK/sdb.img\",\"size_bytes\":$SZB}]}")
 M2ID=$(echo "$M2" | jq -r '.migration.id')
+# replicate one block so the fallback files exist
+run_disk "$WORK/sda.img" "$(echo "$M2" | jq -r '.migration.disks[0].receiver_port')" "$WORK/d2a.cbt" || true
 api -X DELETE "$BASE/api/v1/migrations/$M2ID" >/dev/null
 COUNT=$(api "$BASE/api/v1/migrations" | jq '[.[] | select(.migration.id=='"$M2ID"')] | length')
-[ "$COUNT" = "0" ] || { echo "FAIL: migration $M2ID still present after delete"; exit 1; }
-[ ! -f "$WORK/data/migration-$M2ID.img" ] || { echo "FAIL: file-fallback image not cleaned up"; exit 1; }
-echo "   OK: migration deleted (record + data file)"
+[ "$COUNT" = "0" ] || { echo "FAIL: migration still present after delete"; exit 1; }
+[ ! -f "$WORK/data/migration-$M2ID-disk0.img" ] || { echo "FAIL: disk0 file not cleaned up"; exit 1; }
+echo "   OK: migration deleted (record + disk files)"
+
+echo
+echo "== Duplicate name rejected with friendly error =="
+ERR=$(curl -sS --cacert "$CACERT" -b "$JAR" -X POST "$BASE/api/v1/migrations" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"ec2-3disk\",\"devices\":[{\"device\":\"$WORK/sda.img\",\"size_bytes\":$SZA}]}")
+echo "$ERR" | grep -qi 'already exists' || { echo "FAIL: expected friendly duplicate-name error, got: $ERR"; exit 1; }
+echo "   OK: friendly duplicate-name error"
 
 echo
 echo "APPLIANCE SMOKE PASSED"

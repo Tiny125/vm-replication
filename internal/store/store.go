@@ -125,6 +125,26 @@ CREATE TABLE IF NOT EXISTS migrations (
   migrate_finished INTEGER NOT NULL DEFAULT 0,
   created_at      INTEGER NOT NULL
 );
+
+-- One row per source disk in a migration (boot disk has idx 0).
+CREATE TABLE IF NOT EXISTS migration_disks (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  migration_id    INTEGER NOT NULL REFERENCES migrations(id) ON DELETE CASCADE,
+  idx             INTEGER NOT NULL,
+  source_device   TEXT NOT NULL,
+  size_bytes      INTEGER NOT NULL DEFAULT 0,
+  receiver_port   INTEGER NOT NULL DEFAULT 0,
+  volume_id       INTEGER NOT NULL DEFAULT 0,
+  volume_device   TEXT NOT NULL DEFAULT '',
+  artifact_id     TEXT NOT NULL DEFAULT '',
+  full_sync_done  INTEGER NOT NULL DEFAULT 0,
+  total_blocks    INTEGER NOT NULL DEFAULT 0,
+  changed_blocks  INTEGER NOT NULL DEFAULT 0,
+  bytes_on_wire   INTEGER NOT NULL DEFAULT 0,
+  last_sync_at    INTEGER NOT NULL DEFAULT 0,
+  agent_last_seen INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_disks_migration ON migration_disks(migration_id, idx);
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return err

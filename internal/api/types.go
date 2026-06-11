@@ -164,7 +164,30 @@ const (
 	MigFailed        MigrationState = "failed"
 )
 
+// Disk is one source block device within a migration. A migration has one or
+// more disks (index 0 is the boot disk); each gets its own receiver port, its
+// own replication volume on the appliance, and its own cloned artifact.
+type Disk struct {
+	ID           int64  `json:"id"`
+	Index        int    `json:"index"` // 0 = boot disk
+	SourceDevice string `json:"source_device"`
+	SizeBytes    int64  `json:"size_bytes"`
+
+	ReceiverPort int    `json:"receiver_port"`
+	VolumeID     int64  `json:"volume_id,omitempty"`
+	VolumeDevice string `json:"volume_device,omitempty"`
+	ArtifactID   string `json:"artifact_id,omitempty"` // cloned volume, "volume:<id>"
+
+	FullSyncDone  bool      `json:"full_sync_done"`
+	TotalBlocks   int64     `json:"total_blocks"`
+	ChangedBlocks int64     `json:"changed_blocks"`
+	BytesOnWire   int64     `json:"bytes_on_wire"`
+	LastSyncAt    time.Time `json:"last_sync_at"`
+	AgentLastSeen time.Time `json:"agent_last_seen"`
+}
+
 // Migration is one source→Linode migration managed by the appliance console.
+// It moves one source server (one or more disks) to launchable Linode volumes.
 type Migration struct {
 	ID    int64          `json:"id"`
 	Name  string         `json:"name"`
@@ -172,24 +195,17 @@ type Migration struct {
 
 	// Source details entered in the console.
 	SourceHostname string `json:"source_hostname"`
-	SourceDevice   string `json:"source_device"`
-	SourceDiskSize int64  `json:"source_disk_size"` // bytes
+	SourceDevice   string `json:"source_device"`    // boot disk (mirror of Disks[0])
+	SourceDiskSize int64  `json:"source_disk_size"` // boot disk size (bytes)
 
-	// Appliance-side resources.
-	ReceiverPort int    `json:"receiver_port"`
-	VolumeID     int64  `json:"volume_id,omitempty"`     // Linode Block Storage volume id
-	VolumeDevice string `json:"volume_device,omitempty"` // device path on the appliance
-	ImageID      string `json:"image_id,omitempty"`      // resulting Linode Image id
-	LaunchedID   int64  `json:"launched_linode_id,omitempty"`
+	// Disks (boot first). Authoritative per-disk state.
+	Disks []Disk `json:"disks"`
 
-	// Live progress (updated by the embedded receiver + agent reports).
-	AgentLastSeen time.Time `json:"agent_last_seen"`
-	FullSyncDone  bool      `json:"full_sync_done"`
-	TotalBlocks   int64     `json:"total_blocks"`
-	ChangedBlocks int64     `json:"changed_blocks"` // in the most recent sync
-	BytesOnWire   int64     `json:"bytes_on_wire"`
-	LastSyncAt    time.Time `json:"last_sync_at"`
-	LastError     string    `json:"last_error,omitempty"`
+	// Finalize result.
+	ImageID    string `json:"image_id,omitempty"` // primary (boot) artifact, "volume:<id>"
+	LaunchedID int64  `json:"launched_linode_id,omitempty"`
+
+	LastError string `json:"last_error,omitempty"`
 
 	// Pre-migration assessment + migration run timestamps.
 	AssessedAt      time.Time `json:"assessed_at"`
@@ -199,12 +215,21 @@ type Migration struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// CreateMigrationRequest is the console "New migration" form.
+// DeviceSpec is one source disk in a create-migration request.
+type DeviceSpec struct {
+	Device    string `json:"device"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+// CreateMigrationRequest is the console "New migration" form. Devices lists the
+// source disks (first = boot). For single-disk back-compat, SourceDevice +
+// SourceDiskSize are accepted when Devices is empty.
 type CreateMigrationRequest struct {
-	Name           string `json:"name"`
-	SourceHostname string `json:"source_hostname"`
-	SourceDevice   string `json:"source_device"`
-	SourceDiskSize int64  `json:"source_disk_size"`
+	Name           string       `json:"name"`
+	SourceHostname string       `json:"source_hostname"`
+	Devices        []DeviceSpec `json:"devices"`
+	SourceDevice   string       `json:"source_device,omitempty"`
+	SourceDiskSize int64        `json:"source_disk_size,omitempty"`
 }
 
 // ValidationCheck is one pre-cutover gate shown in the console.
@@ -218,12 +243,13 @@ type ValidationCheck struct {
 // enrollment command for the source. The token itself is only included right
 // after creation / on explicit request.
 type MigrationView struct {
-	Migration   Migration         `json:"migration"`
-	RPOSeconds  float64           `json:"rpo_seconds"`
-	Validations []ValidationCheck `json:"validations"`
-	CanMigrate  bool              `json:"can_migrate"`
-	Assessed    bool              `json:"assessed"` // pre-migration assessment passed
-	EnrollCmd   string            `json:"enroll_cmd,omitempty"`
+	Migration    Migration         `json:"migration"`
+	RPOSeconds   float64           `json:"rpo_seconds"`
+	Validations  []ValidationCheck `json:"validations"`
+	CanMigrate   bool              `json:"can_migrate"`
+	Assessed     bool              `json:"assessed"` // pre-migration assessment passed
+	EnrollCmd    string            `json:"enroll_cmd,omitempty"`
+	UninstallCmd string            `json:"uninstall_cmd,omitempty"`
 
 	// Live progress for the console: Phase is a human label ("initial sync",
 	// "finalizing", …); PercentDone/ETASeconds are -1 when unknown.
