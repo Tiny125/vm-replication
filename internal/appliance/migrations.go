@@ -304,8 +304,28 @@ func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCh
 }
 
 func (s *Server) enrollCmd(token string, m api.Migration) string {
-	return fmt.Sprintf("curl -fsSL 'http://%s:%d/install/agent.sh?token=%s' | sudo bash",
-		s.cfg.PublicHost, s.cfg.ConsolePort, token)
+	return fmt.Sprintf("curl -fsSL %s'%s://%s:%d/install/agent.sh?token=%s' | sudo bash",
+		s.curlPinFlag(), s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort, token)
+}
+
+// scheme returns the console URL scheme (https unless explicitly http).
+func (s *Server) scheme() string {
+	if s.cfg.Scheme == "" {
+		return "https"
+	}
+	return s.cfg.Scheme
+}
+
+// curlPinFlag returns the curl flags (with trailing space) that authenticate the
+// download against the self-signed console cert via public-key pinning. -k skips
+// CA-chain validation (we have no public CA) while --pinnedpubkey still requires
+// the server to prove possession of the pinned key, so the connection remains
+// MITM-proof. Empty when no pin is configured (plain HTTP / external CA).
+func (s *Server) curlPinFlag() string {
+	if s.cfg.PublicKeyPin != "" {
+		return "-k --pinnedpubkey 'sha256//" + s.cfg.PublicKeyPin + "' "
+	}
+	return ""
 }
 
 // ---- helpers ----

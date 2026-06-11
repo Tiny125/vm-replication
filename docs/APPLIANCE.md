@@ -15,7 +15,7 @@ For the manual/CLI workflow instead, see [`GETTING_STARTED.md`](GETTING_STARTED.
  ┌─ Replication server (a Linode) ──────────────────────────────┐
  │  one command installs everything → prints a password          │
  │  ┌────────────────────────────────────────────────────────┐  │
- │  │  Web console (http://<ip>:8080)  ← log in with password │  │
+ │  │  Web console (https://<ip>:8080) ← log in with password │  │
  │  │   • enter source details → get a copy-paste command     │  │
  │  │   • watch replication status + validation checks        │  │
  │  │   • click "Start migration" → produces a Linode Image   │  │
@@ -46,24 +46,33 @@ installs a systemd service (`applianced`), and prints:
 
 ```
 ================ REPLICATION SERVER READY ================
- Console:   http://203.0.113.10:8080
+ Console:   https://203.0.113.10:8080
  Password:  681af4b11221bacb88e34080
+ Cert SHA-256 (verify this in your browser's certificate dialog):
+   AB:CD:...:EF
 ...
 ```
 
 Options: `--public-host <ip>` (if auto-detect is wrong), `--region us-ord`,
 `--port 8080`.
 
-> The console is HTTP. Restrict the port to trusted networks (firewall) or reach
-> it over an SSH tunnel/VPN. The replication **data plane is always mutual TLS**.
-> The Linode token (step 3) is stored **encrypted at rest**.
+> The console is served over **HTTPS** with a self-signed certificate generated
+> at install, so the password and Linode token are encrypted in transit. The
+> replication **data plane is always mutual TLS**, and the Linode token (step 3)
+> is stored **encrypted at rest**. Restrict the console port to trusted networks
+> where you can. (Advanced: pass `--insecure-http` to serve plain HTTP behind
+> your own TLS-terminating proxy.)
 
 ---
 
 ## 2. Open the console and sign in
 
-Browse to `http://<replication-server-ip>:8080` and enter the generated
-password. (It's also saved at `/var/lib/vm-repl/initial-admin-password.txt`.)
+Browse to `https://<replication-server-ip>:8080`. Because the certificate is
+self-signed, your browser warns on first visit — that's expected. Before
+entering the password, open the browser's **certificate dialog** and confirm the
+**SHA-256 fingerprint matches** the one the installer printed (also in
+`journalctl -u applianced`). Then sign in with the generated password (also saved
+at `/var/lib/vm-repl/initial-admin-password.txt`).
 
 ---
 
@@ -125,8 +134,12 @@ Click **New migration** and enter your source server's:
 The console immediately shows a **one-line command**, e.g.:
 
 ```bash
-curl -fsSL 'http://203.0.113.10:8080/install/agent.sh?token=…' | sudo bash
+curl -fsSL -k --pinnedpubkey 'sha256//…' 'https://203.0.113.10:8080/install/agent.sh?token=…' | sudo bash
 ```
+
+The `--pinnedpubkey` flag pins this server's public key, so the agent download is
+authenticated and tamper-proof even though the certificate is self-signed (`-k`
+skips public-CA checking; the pin is what provides the security).
 
 ---
 
@@ -191,8 +204,10 @@ the migration to `image_ready`.
 
 ## Notes & limitations
 
-- **HTTP console** for the MVP — put it behind a firewall/tunnel; HTTPS is a
-  roadmap item.
+- **HTTPS console** with a self-signed certificate (auto-generated at install);
+  the browser warns on first visit — verify the printed fingerprint and click
+  through. For a CA-signed cert, pass `--tls-cert`/`--tls-key` to `applianced`,
+  or run behind a TLS-terminating proxy with `--insecure-http`.
 - The **Linode finalize** (volume clone → image → launch) requires a real token
   and is exercised against the live API, not in CI.
 - **Block Storage volume** sizing rounds the source disk up to whole GiB (min

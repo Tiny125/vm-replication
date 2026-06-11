@@ -44,6 +44,9 @@ func main() {
 		agentBinary   = flag.String("agent-binary", "", "path to the agent binary served to sources")
 		convertScript = flag.String("convert-script", "", "path to machine-convert.sh (enables disk conversion)")
 		rpoTarget     = flag.Int("rpo-target", 120, "max lag (seconds) for the 'ready to migrate' gate")
+		tlsCert       = flag.String("tls-cert", "", "console TLS certificate (self-signed auto-generated if empty)")
+		tlsKey        = flag.String("tls-key", "", "console TLS key")
+		insecureHTTP  = flag.Bool("insecure-http", false, "serve the console over plain HTTP (NOT recommended; testing/behind-proxy only)")
 	)
 	flag.Parse()
 
@@ -85,11 +88,34 @@ func main() {
 
 	_, consolePort := splitHostPort(*listen)
 
+	// Console transport: HTTPS by default. Generate a self-signed cert if none
+	// is supplied, and compute the public-key pin so the enrollment command can
+	// authenticate the server without a public CA (trust on first use).
+	scheme := "https"
+	consoleCert, consoleKey := *tlsCert, *tlsKey
+	var pin string
+	if *insecureHTTP {
+		scheme = "http"
+		log.Printf("applianced: WARNING serving console over plain HTTP (-insecure-http); password/token are exposed in transit")
+	} else {
+		if consoleCert == "" || consoleKey == "" {
+			consoleCert, consoleKey, err = loadOrCreateConsoleCert(*dataDir, host)
+			if err != nil {
+				log.Fatalf("applianced: console TLS cert: %v", err)
+			}
+		}
+		if pin, err = publicKeyPin(consoleCert); err != nil {
+			log.Fatalf("applianced: compute key pin: %v", err)
+		}
+	}
+
 	srv := appliance.New(ctx, appliance.Config{
 		Store:             st,
 		DataDir:           *dataDir,
 		PublicHost:        host,
 		ConsolePort:       consolePort,
+		Scheme:            scheme,
+		PublicKeyPin:      pin,
 		BaseReceiverPort:  *baseRecvPort,
 		Region:            *region,
 		TLS:               transport.Files{CertFile: *certFile, KeyFile: *keyFile, CAFile: *caFile},
@@ -105,9 +131,19 @@ func main() {
 
 	httpSrv := &http.Server{Addr: *listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
-		log.Printf("applianced: console on http://%s:%d  (data dir %s)", host, consolePort, *dataDir)
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("applianced: serve: %v", err)
+		log.Printf("applianced: console on %s://%s:%d  (data dir %s)", scheme, host, consolePort, *dataDir)
+		var serveErr error
+		if scheme == "https" {
+			if fp, ferr := certFingerprint(consoleCert); ferr == nil {
+				log.Printf("applianced: console cert SHA-256 fingerprint (verify in browser): %s", fp)
+			}
+			log.Printf("applianced: enrollment key pin: sha256//%s", pin)
+			serveErr = httpSrv.ListenAndServeTLS(consoleCert, consoleKey)
+		} else {
+			serveErr = httpSrv.ListenAndServe()
+		}
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			log.Fatalf("applianced: serve: %v", serveErr)
 		}
 	}()
 

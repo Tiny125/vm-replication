@@ -34,7 +34,7 @@ func (s *Server) handleAgentInstaller(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := r.URL.Query().Get("token")
-	base := fmt.Sprintf("http://%s:%d", s.cfg.PublicHost, s.cfg.ConsolePort)
+	base := fmt.Sprintf("%s://%s:%d", s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort)
 	target := fmt.Sprintf("%s:%d", s.cfg.PublicHost, m.ReceiverPort)
 
 	// Note: callers should already have validated the source device exists.
@@ -46,6 +46,7 @@ TOKEN=%q
 DEVICE=%q
 TARGET=%q
 SERVER_NAME=%q
+PIN=%q
 BIN=/usr/local/bin/vmrepl-agent
 ETC=/etc/vm-repl
 
@@ -53,14 +54,20 @@ ETC=/etc/vm-repl
 command -v curl >/dev/null || { echo "curl is required"; exit 1; }
 [ -e "$DEVICE" ] || { echo "source device $DEVICE not found — re-check the device in the console"; exit 1; }
 
+# Pin the appliance's public key so downloads are authenticated even with a
+# self-signed console certificate (trust on first use). -k skips CA-chain checks
+# (no public CA), while --pinnedpubkey still requires the exact server key.
+CURL="curl -fsSL"
+[ -n "$PIN" ] && CURL="$CURL -k --pinnedpubkey sha256//$PIN"
+
 echo ">> Downloading agent"
-curl -fsSL "$BASE/download/agent?token=$TOKEN" -o "$BIN"
+$CURL "$BASE/download/agent?token=$TOKEN" -o "$BIN"
 chmod +x "$BIN"
 
 echo ">> Installing TLS material"
 mkdir -p "$ETC"
 for f in ca.crt agent.crt agent.key; do
-  curl -fsSL "$BASE/enroll/file?token=$TOKEN&name=$f" -o "$ETC/$f"
+  $CURL "$BASE/enroll/file?token=$TOKEN&name=$f" -o "$ETC/$f"
 done
 chmod 600 "$ETC/agent.key"
 
@@ -98,7 +105,7 @@ else
   echo "  $BIN -device $DEVICE -target $TARGET -server-name $SERVER_NAME \\"
   echo "      -cert $ETC/agent.crt -key $ETC/agent.key -ca $ETC/ca.crt"
 fi
-`, m.Name, base, token, m.SourceDevice, target, s.cfg.PublicHost)
+`, m.Name, base, token, m.SourceDevice, target, s.cfg.PublicHost, s.cfg.PublicKeyPin)
 
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
 	_, _ = w.Write([]byte(script))
