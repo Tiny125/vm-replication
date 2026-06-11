@@ -53,8 +53,19 @@ type Server struct {
 	sessions sync.Map // sessionID -> expiry (time.Time)
 
 	recMu     sync.Mutex
-	receivers map[int64]context.CancelFunc // migrationID -> stop
+	receivers map[int64]context.CancelFunc // migrationID -> stop receiver
+	finalizes map[int64]context.CancelFunc // migrationID -> cancel finalize run
+	progress  sync.Map                     // migrationID -> *syncProgress
 	ctx       context.Context
+}
+
+// syncProgress is live block-apply progress for the console (percent + ETA).
+type syncProgress struct {
+	mu       sync.Mutex
+	written  int64
+	total    int64
+	fullSync bool
+	started  time.Time
 }
 
 // New builds the appliance server. ctx governs the lifetime of embedded
@@ -66,7 +77,12 @@ func New(ctx context.Context, cfg Config) *Server {
 	if cfg.RPOTargetSec == 0 {
 		cfg.RPOTargetSec = 120
 	}
-	s := &Server{cfg: cfg, st: cfg.Store, mux: http.NewServeMux(), receivers: map[int64]context.CancelFunc{}, ctx: ctx}
+	s := &Server{
+		cfg: cfg, st: cfg.Store, mux: http.NewServeMux(),
+		receivers: map[int64]context.CancelFunc{},
+		finalizes: map[int64]context.CancelFunc{},
+		ctx:       ctx,
+	}
 	s.routes()
 	return s
 }
@@ -88,9 +104,13 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/migrations", s.auth(s.handleListMigrations))
 	s.mux.Handle("POST /api/v1/migrations", s.auth(s.handleCreateMigration))
 	s.mux.Handle("GET /api/v1/migrations/{id}", s.auth(s.handleGetMigration))
+	s.mux.Handle("DELETE /api/v1/migrations/{id}", s.auth(s.handleDeleteMigration))
+	s.mux.Handle("POST /api/v1/migrations/{id}/assess", s.auth(s.handleAssessMigration))
 	s.mux.Handle("POST /api/v1/migrations/{id}/start", s.auth(s.handleStartMigration))
+	s.mux.Handle("POST /api/v1/migrations/{id}/stop", s.auth(s.handleStopMigration))
 	s.mux.Handle("GET /api/v1/settings", s.auth(s.handleGetSettings))
 	s.mux.Handle("POST /api/v1/settings/linode-token", s.auth(s.handleSetLinodeToken))
+	s.mux.Handle("DELETE /api/v1/settings/linode-token", s.auth(s.handleDeleteLinodeToken))
 }
 
 // Handler returns the root HTTP handler.
@@ -192,6 +212,15 @@ func (s *Server) handleSetLinodeToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.st.SetLinodeToken(r.Context(), req.Token); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleDeleteLinodeToken removes the stored token (e.g. expired/rotated).
+func (s *Server) handleDeleteLinodeToken(w http.ResponseWriter, r *http.Request) {
+	if err := s.st.DeleteLinodeToken(r.Context()); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}

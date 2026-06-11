@@ -46,6 +46,17 @@ func (s *Server) ensureReceiver(m api.Migration) error {
 	migID := m.ID
 	log.Printf("appliance: receiver for migration %d listening on :%d -> %s", migID, m.ReceiverPort, device)
 
+	onProgress := func(written, total int64, fullSync bool) {
+		v, _ := s.progress.LoadOrStore(migID, &syncProgress{started: time.Now()})
+		p := v.(*syncProgress)
+		p.mu.Lock()
+		if written == 0 {
+			p.started = time.Now()
+		}
+		p.written, p.total, p.fullSync = written, total, fullSync
+		p.mu.Unlock()
+	}
+
 	go func() {
 		err := receiver.Serve(ctx, ln, device, manifest, false, func(st receiver.Stats) {
 			total := blockdiff.NumBlocks(st.Hello.DeviceSize, st.Hello.BlockSize)
@@ -53,7 +64,7 @@ func (s *Server) ensureReceiver(m api.Migration) error {
 			if err := s.st.RecordMigrationSync(s.ctx, migID, st.Hello.FullSync, total, st.ChangedBlocks, bytes); err != nil {
 				log.Printf("appliance: record sync for migration %d: %v", migID, err)
 			}
-		})
+		}, onProgress)
 		if err != nil && ctx.Err() == nil {
 			log.Printf("appliance: receiver for migration %d stopped: %v", migID, err)
 		}
@@ -164,6 +175,30 @@ func (s *Server) handleGetMigration(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.view(ctx, m, ""))
 }
 
+// handleAssessMigration runs the pre-migration assessment: it re-evaluates all
+// validation checks and records a pass (gating the Start button). A failed
+// assessment clears any earlier pass and returns the failing checks.
+func (s *Server) handleAssessMigration(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	m, err := s.st.Migration(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	view := s.view(ctx, m, "")
+	passed := allOK(view.Validations)
+	if err := s.st.SetAssessed(ctx, id, passed); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	m, _ = s.st.Migration(ctx, id)
+	writeJSON(w, http.StatusOK, s.view(ctx, m, ""))
+}
+
 func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
@@ -179,6 +214,10 @@ func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view := s.view(ctx, m, "")
+	if !view.Assessed {
+		writeErr(w, http.StatusConflict, "run the pre-migration assessment first")
+		return
+	}
 	if !view.CanMigrate {
 		writeErr(w, http.StatusConflict, "validation checks not satisfied; see migration validations")
 		return
@@ -187,22 +226,125 @@ func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	_ = s.st.SetMigrateStarted(ctx, id)
 	s.stopReceiver(id) // quiesce: stop accepting blocks during finalize
-	go s.finalize(m, req)
+
+	finCtx, cancel := context.WithCancel(s.ctx)
+	s.recMu.Lock()
+	s.finalizes[id] = cancel
+	s.recMu.Unlock()
+	go s.finalize(finCtx, m, req)
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "migrating"})
 }
 
+// handleStopMigration cancels an in-flight finalize and returns the migration
+// to replicating (the receiver restarts; the assessment must be re-run).
+func (s *Server) handleStopMigration(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	m, err := s.st.Migration(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	if m.State != api.MigMigrating {
+		writeErr(w, http.StatusConflict, "migration is not running")
+		return
+	}
+	s.recMu.Lock()
+	cancel := s.finalizes[id]
+	delete(s.finalizes, id)
+	s.recMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	_ = s.st.SetAssessed(ctx, id, false) // require a fresh assessment before retry
+	_ = s.st.SetMigrationState(ctx, id, api.MigReplicating, "stopped by operator")
+	if m2, err := s.st.Migration(ctx, id); err == nil {
+		_ = s.ensureReceiver(m2)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
+}
+
+// handleDeleteMigration removes a migration: stops its receiver, cancels any
+// finalize, best-effort detaches and deletes its replication volume (the cloned
+// artifact, if one was produced, is kept), and deletes the record.
+func (s *Server) handleDeleteMigration(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	m, err := s.st.Migration(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	s.recMu.Lock()
+	if cancel := s.finalizes[id]; cancel != nil {
+		cancel()
+		delete(s.finalizes, id)
+	}
+	s.recMu.Unlock()
+	s.stopReceiver(id)
+	s.progress.Delete(id)
+
+	if m.VolumeID != 0 {
+		if cl, ok := s.linodeClient(ctx); ok {
+			if err := cl.DetachVolume(ctx, m.VolumeID); err != nil {
+				log.Printf("appliance: detach volume %d: %v", m.VolumeID, err)
+			}
+			// Detach is async; retry the delete briefly.
+			var derr error
+			for i := 0; i < 10; i++ {
+				if derr = cl.DeleteVolume(ctx, m.VolumeID); derr == nil {
+					break
+				}
+				time.Sleep(2 * time.Second)
+			}
+			if derr != nil {
+				log.Printf("appliance: delete volume %d failed (remove it in Cloud Manager): %v", m.VolumeID, derr)
+			}
+		}
+	} else {
+		_ = os.Remove(s.dataDevicePath(m)) // file-fallback image
+	}
+	_ = os.Remove(s.manifestPath(m))
+
+	if err := s.st.DeleteMigration(ctx, id); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 // finalize converts the replicated disk to boot on Linode and produces the
-// artifact (a cloned volume) plus an optional launched instance. Runs async;
-// state/last_error reflect progress. Linode steps require a configured token.
-func (s *Server) finalize(m api.Migration, req api.FinalizeRequest) {
-	ctx := context.Background()
+// artifact (a cloned volume) plus an optional launched instance. Runs async
+// under a cancellable ctx (the console Stop button); state/last_error reflect
+// progress. Linode steps require a configured token.
+func (s *Server) finalize(ctx context.Context, m api.Migration, req api.FinalizeRequest) {
+	defer func() {
+		s.recMu.Lock()
+		delete(s.finalizes, m.ID)
+		s.recMu.Unlock()
+	}()
+	canceled := func() bool { return ctx.Err() != nil }
 	device := s.dataDevicePath(m)
+
+	// Store writes use the server context: ctx is canceled by the Stop button,
+	// and the Stop handler owns the state transition in that case.
+	sctx := s.ctx
 
 	// 1) Make the replicated disk bootable on Linode (virtio/GRUB/fstab/etc).
 	if s.cfg.ConvertScript != "" && isBlockDevice(device) {
 		log.Printf("appliance: migration %d: running machine conversion on %s", m.ID, device)
 		out, err := exec.CommandContext(ctx, "/bin/sh", s.cfg.ConvertScript, device).CombinedOutput()
+		if canceled() {
+			return
+		}
 		if err != nil {
 			s.fail(m.ID, fmt.Sprintf("machine-convert: %v: %s", err, trimOut(out)))
 			return
@@ -211,11 +353,12 @@ func (s *Server) finalize(m api.Migration, req api.FinalizeRequest) {
 		log.Printf("appliance: migration %d: skipping machine-convert (no script or non-block device)", m.ID)
 	}
 
-	cl, ok := s.linodeClient(ctx)
+	cl, ok := s.linodeClient(sctx)
 	if !ok || m.VolumeID == 0 {
 		// No Linode automation: the converted data sits on the device; done.
-		_ = s.st.SetMigrationState(ctx, m.ID, api.MigImageReady,
+		_ = s.st.SetMigrationState(sctx, m.ID, api.MigImageReady,
 			"Linode automation not configured; migrated data is on "+device)
+		_ = s.st.SetMigrateFinished(sctx, m.ID)
 		return
 	}
 
@@ -223,45 +366,74 @@ func (s *Server) finalize(m api.Migration, req api.FinalizeRequest) {
 	artifactLabel := fmt.Sprintf("vmrepl-img-%d", m.ID)
 	log.Printf("appliance: migration %d: cloning volume %d -> %s", m.ID, m.VolumeID, artifactLabel)
 	clone, err := cl.CloneVolume(ctx, m.VolumeID, artifactLabel)
+	if canceled() {
+		return
+	}
 	if err != nil {
 		s.fail(m.ID, "clone volume: "+err.Error())
 		return
 	}
-	if _, err := cl.WaitVolumeActive(ctx, clone.ID, 5*time.Minute); err != nil {
+	if _, err := cl.WaitVolumeActive(ctx, clone.ID, 10*time.Minute); err != nil {
+		if canceled() {
+			return
+		}
 		s.fail(m.ID, "wait clone active: "+err.Error())
 		return
 	}
-	_ = s.st.SetMigrationImage(ctx, m.ID, fmt.Sprintf("volume:%d", clone.ID), 0)
+	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", clone.ID), 0)
 
 	// 3) Optionally launch a new instance booting from the cloned volume.
 	if req.LaunchInstance {
-		region := orDefault(req.Region, s.cfg.Region)
+		// The cloned volume lives in the appliance's region, so the instance must
+		// too; resolve it from the appliance rather than trusting a flag.
+		region := req.Region
+		if region == "" {
+			if inst, err := cl.GetInstance(ctx, s.cfg.ApplianceLinodeID); err == nil && inst.Region != "" {
+				region = inst.Region
+			} else {
+				region = s.cfg.Region
+			}
+		}
 		typ := orDefault(req.Type, "g6-standard-2")
 		label := orDefault(req.Label, m.Name)
 		inst, err := cl.CreateInstance(ctx, label, region, typ)
+		if canceled() {
+			return
+		}
 		if err != nil {
 			s.fail(m.ID, "create instance: "+err.Error())
 			return
 		}
 		if err := cl.AttachVolume(ctx, clone.ID, inst.ID); err != nil {
+			if canceled() {
+				return
+			}
 			s.fail(m.ID, "attach artifact: "+err.Error())
 			return
 		}
 		cfgID, err := cl.CreateConfigBootingVolume(ctx, inst.ID, clone.ID, "boot-migrated")
 		if err != nil {
+			if canceled() {
+				return
+			}
 			s.fail(m.ID, "create boot config: "+err.Error())
 			return
 		}
 		if err := cl.Boot(ctx, inst.ID, cfgID); err != nil {
+			if canceled() {
+				return
+			}
 			s.fail(m.ID, "boot instance: "+err.Error())
 			return
 		}
-		_ = s.st.SetMigrationImage(ctx, m.ID, fmt.Sprintf("volume:%d", clone.ID), inst.ID)
-		_ = s.st.SetMigrationState(ctx, m.ID, api.MigLaunched, "")
+		_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", clone.ID), inst.ID)
+		_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
+		_ = s.st.SetMigrateFinished(sctx, m.ID)
 		return
 	}
 
-	_ = s.st.SetMigrationState(ctx, m.ID, api.MigImageReady, "")
+	_ = s.st.SetMigrationState(sctx, m.ID, api.MigImageReady, "")
+	_ = s.st.SetMigrateFinished(sctx, m.ID)
 }
 
 func (s *Server) fail(id int64, msg string) {
@@ -272,13 +444,52 @@ func (s *Server) fail(id int64, msg string) {
 // ---- view + validations ----
 
 func (s *Server) view(ctx context.Context, m api.Migration, token string) api.MigrationView {
-	v := api.MigrationView{Migration: m}
+	v := api.MigrationView{Migration: m, PercentDone: -1, ETASeconds: -1}
 	if !m.LastSyncAt.IsZero() {
 		v.RPOSeconds = time.Since(m.LastSyncAt).Seconds()
 	}
 	v.Validations = s.validations(m, v.RPOSeconds)
 	v.CanMigrate = allOK(v.Validations) &&
 		(m.State == api.MigReplicating || m.State == api.MigReady || m.State == api.MigAwaitingAgent)
+	v.Assessed = !m.AssessedAt.IsZero() && v.CanMigrate // a pass goes stale if checks regress
+
+	// Live phase / percent / ETA for the console (auto-refreshed by polling).
+	switch m.State {
+	case api.MigCreated, api.MigAwaitingAgent:
+		v.Phase = "waiting for agent"
+	case api.MigReplicating, api.MigReady:
+		v.Phase = "replicating"
+		if p, ok := s.progress.Load(m.ID); ok {
+			sp := p.(*syncProgress)
+			sp.mu.Lock()
+			written, total, full, started := sp.written, sp.total, sp.fullSync, sp.started
+			sp.mu.Unlock()
+			// Percent + ETA are meaningful during the initial full sync, where the
+			// expected block count is known up front.
+			if full && !m.FullSyncDone && total > 0 && written < total {
+				v.Phase = "initial sync"
+				v.PercentDone = float64(written) / float64(total) * 100
+				if elapsed := time.Since(started); written > 0 && elapsed > 0 {
+					remain := float64(elapsed) * float64(total-written) / float64(written)
+					v.ETASeconds = int64(time.Duration(remain).Seconds())
+				}
+				v.ElapsedSeconds = int64(time.Since(started).Seconds())
+			}
+		}
+	case api.MigMigrating:
+		v.Phase = "finalizing (convert + clone)"
+		if !m.MigrateStarted.IsZero() {
+			v.ElapsedSeconds = int64(time.Since(m.MigrateStarted).Seconds())
+		}
+	case api.MigImageReady, api.MigLaunched:
+		v.Phase = "completed"
+		v.PercentDone = 100
+		if !m.MigrateStarted.IsZero() && !m.MigrateFinished.IsZero() {
+			v.ElapsedSeconds = int64(m.MigrateFinished.Sub(m.MigrateStarted).Seconds())
+		}
+	case api.MigFailed:
+		v.Phase = "failed"
+	}
 
 	if token == "" {
 		// Look up the enrollment token so the console can show the command.

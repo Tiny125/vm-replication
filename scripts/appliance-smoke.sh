@@ -82,6 +82,17 @@ echo "$V" | jq -e '.migration.full_sync_done==true' >/dev/null || { echo "FAIL: 
 echo "$V" | jq -e '.can_migrate==true' >/dev/null || { echo "FAIL: validations not satisfied: $(echo "$V" | jq -c '.validations')"; exit 1; }
 echo "   OK: full_sync_done=true, can_migrate=true"
 
+echo "== Start without assessment must be rejected =="
+if api -X POST "$BASE/api/v1/migrations/$MID/start" -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1; then
+  echo "FAIL: start succeeded without assessment"; exit 1
+fi
+echo "   OK: start gated on assessment"
+
+echo "== Pre-migration assessment =="
+A=$(api -X POST "$BASE/api/v1/migrations/$MID/assess")
+echo "$A" | jq -e '.assessed==true' >/dev/null || { echo "FAIL: assessment did not pass: $(echo "$A" | jq -c '.validations')"; exit 1; }
+echo "   OK: assessment successful"
+
 echo "== Start migration (file-fallback finalize) =="
 api -X POST "$BASE/api/v1/migrations/$MID/start" -H 'Content-Type: application/json' -d '{}' >/dev/null
 for _ in $(seq 1 50); do
@@ -91,7 +102,18 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 [ "$STATE" = "image_ready" ] || { echo "FAIL: state=$STATE, want image_ready"; exit 1; }
-echo "   OK: migration reached image_ready"
+api "$BASE/api/v1/migrations/$MID" | jq -e '.phase=="completed"' >/dev/null || { echo "FAIL: phase not completed"; exit 1; }
+echo "   OK: migration reached image_ready (phase=completed)"
+
+echo "== Delete a migration =="
+M2=$(api -X POST "$BASE/api/v1/migrations" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"throwaway\",\"source_hostname\":\"x\",\"source_device\":\"$WORK/source.img\",\"source_disk_size\":$SIZE}")
+M2ID=$(echo "$M2" | jq -r '.migration.id')
+api -X DELETE "$BASE/api/v1/migrations/$M2ID" >/dev/null
+COUNT=$(api "$BASE/api/v1/migrations" | jq '[.[] | select(.migration.id=='"$M2ID"')] | length')
+[ "$COUNT" = "0" ] || { echo "FAIL: migration $M2ID still present after delete"; exit 1; }
+[ ! -f "$WORK/data/migration-$M2ID.img" ] || { echo "FAIL: file-fallback image not cleaned up"; exit 1; }
+echo "   OK: migration deleted (record + data file)"
 
 echo
 echo "APPLIANCE SMOKE PASSED"

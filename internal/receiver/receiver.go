@@ -32,11 +32,16 @@ type Stats struct {
 	Duration      time.Duration
 }
 
+// Progress reports live apply progress during a session: written blocks so far
+// out of the expected changed total (totalChanged is the session's full block
+// count for a full sync; for deltas it is unknown until Done and reported as 0).
+type Progress func(writtenBlocks, totalBlocks int64, fullSync bool)
+
 // Serve accepts connections on ln and applies each to devicePath until ctx is
 // cancelled or the listener closes. onComplete (if non-nil) is called after each
-// successful session. If once is true, Serve returns after the first successful
-// session.
-func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats)) error {
+// successful session; onProgress (if non-nil) is called periodically during a
+// session. If once is true, Serve returns after the first successful session.
+func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress) error {
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
@@ -49,7 +54,7 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 			}
 			return err
 		}
-		stats, herr := Handle(conn, devicePath, manifestPath)
+		stats, herr := Handle(conn, devicePath, manifestPath, onProgress)
 		if herr != nil {
 			log.Printf("receiver: session from %s ended with error: %v", conn.RemoteAddr(), herr)
 		} else if onComplete != nil {
@@ -63,7 +68,9 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 
 // Handle processes a single accepted connection: negotiates the Hello, applies
 // every block to devicePath, fsyncs, and writes the applied manifest.
-func Handle(conn net.Conn, devicePath, manifestPath string) (Stats, error) {
+// onProgress (optional) is invoked at session start and every progressEvery
+// applied blocks.
+func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress) (Stats, error) {
 	defer conn.Close()
 	r := bufio.NewReaderSize(conn, 1<<20)
 	w := bufio.NewWriterSize(conn, 1<<16)
@@ -108,6 +115,14 @@ func Handle(conn net.Conn, devicePath, manifestPath string) (Stats, error) {
 	start := time.Now()
 	var written int64
 
+	// Live progress: a full sync sends every block, so totalBlocks is the
+	// expected count and lets the console compute percent + ETA.
+	const progressEvery = 16 // every 64 MiB at the 4 MiB default block size
+	totalBlocks := blockdiff.NumBlocks(hello.DeviceSize, hello.BlockSize)
+	if onProgress != nil {
+		onProgress(0, totalBlocks, hello.FullSync)
+	}
+
 	for {
 		t, payload, err := protocol.ReadFrame(r)
 		if err != nil {
@@ -124,6 +139,9 @@ func Handle(conn net.Conn, devicePath, manifestPath string) (Stats, error) {
 				return Stats{}, err
 			}
 			written++
+			if onProgress != nil && written%progressEvery == 0 {
+				onProgress(written, totalBlocks, hello.FullSync)
+			}
 
 		case protocol.MsgDone:
 			var done protocol.Done
@@ -145,6 +163,9 @@ func Handle(conn net.Conn, devicePath, manifestPath string) (Stats, error) {
 			}
 			if err := w.Flush(); err != nil {
 				return Stats{}, err
+			}
+			if onProgress != nil {
+				onProgress(totalBlocks, totalBlocks, hello.FullSync) // session complete
 			}
 			stats := Stats{Hello: hello, BlocksWritten: written, ChangedBlocks: done.ChangedBlocks, Duration: time.Since(start)}
 			log.Printf("receiver: applied %d blocks (%d expected) in %s", written, done.ChangedBlocks, stats.Duration.Round(time.Millisecond))

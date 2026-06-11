@@ -166,23 +166,26 @@ func (s *Store) LinodeTokenSet(ctx context.Context) (bool, error) {
 const migCols = `id, name, state, source_hostname, source_device, source_disk_size,
  enroll_token, receiver_port, volume_id, volume_device, image_id, launched_id,
  agent_last_seen, full_sync_done, total_blocks, changed_blocks, bytes_on_wire,
- last_sync_at, last_error, created_at`
+ last_sync_at, last_error, assessed_at, migrate_started, migrate_finished, created_at`
 
 func scanMigration(row interface{ Scan(...any) error }) (api.Migration, error) {
 	var m api.Migration
 	var state, enrollToken string // token is kept out of the JSON DTO
 	var fullDone int
-	var agentSeen, lastSync, created int64
+	var agentSeen, lastSync, assessed, migStart, migFinish, created int64
 	if err := row.Scan(&m.ID, &m.Name, &state, &m.SourceHostname, &m.SourceDevice, &m.SourceDiskSize,
 		&enrollToken, &m.ReceiverPort, &m.VolumeID, &m.VolumeDevice, &m.ImageID, &m.LaunchedID,
 		&agentSeen, &fullDone, &m.TotalBlocks, &m.ChangedBlocks, &m.BytesOnWire,
-		&lastSync, &m.LastError, &created); err != nil {
+		&lastSync, &m.LastError, &assessed, &migStart, &migFinish, &created); err != nil {
 		return api.Migration{}, err
 	}
 	m.State = api.MigrationState(state)
 	m.FullSyncDone = fullDone != 0
 	m.AgentLastSeen = fromUnix(agentSeen)
 	m.LastSyncAt = fromUnix(lastSync)
+	m.AssessedAt = fromUnix(assessed)
+	m.MigrateStarted = fromUnix(migStart)
+	m.MigrateFinished = fromUnix(migFinish)
 	m.CreatedAt = fromUnix(created)
 	return m, nil
 }
@@ -315,6 +318,53 @@ WHERE id=?`,
 func (s *Store) TouchAgent(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE migrations SET agent_last_seen=? WHERE id=?`, unix(time.Now()), id)
 	return err
+}
+
+// DeleteMigration removes a migration record.
+func (s *Store) DeleteMigration(ctx context.Context, id int64) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM migrations WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetAssessed records (or clears, with assessed=false) a passed pre-migration
+// assessment.
+func (s *Store) SetAssessed(ctx context.Context, id int64, assessed bool) error {
+	ts := int64(0)
+	if assessed {
+		ts = unix(time.Now())
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE migrations SET assessed_at=? WHERE id=?`, ts, id)
+	return err
+}
+
+// SetMigrateStarted stamps the start of a migration run (and clears any
+// previous finish time).
+func (s *Store) SetMigrateStarted(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE migrations SET migrate_started=?, migrate_finished=0 WHERE id=?`, unix(time.Now()), id)
+	return err
+}
+
+// SetMigrateFinished stamps the end of a migration run.
+func (s *Store) SetMigrateFinished(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE migrations SET migrate_finished=? WHERE id=?`, unix(time.Now()), id)
+	return err
+}
+
+// DeleteSetting removes a settings row (e.g. the stored Linode token).
+func (s *Store) DeleteSetting(ctx context.Context, key string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM settings WHERE key=?`, key)
+	return err
+}
+
+// DeleteLinodeToken removes the stored Linode API token.
+func (s *Store) DeleteLinodeToken(ctx context.Context) error {
+	return s.DeleteSetting(ctx, keyLinodeTok)
 }
 
 func boolToInt(b bool) int {

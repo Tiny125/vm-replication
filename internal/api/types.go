@@ -191,6 +191,11 @@ type Migration struct {
 	LastSyncAt    time.Time `json:"last_sync_at"`
 	LastError     string    `json:"last_error,omitempty"`
 
+	// Pre-migration assessment + migration run timestamps.
+	AssessedAt      time.Time `json:"assessed_at"`
+	MigrateStarted  time.Time `json:"migrate_started"`
+	MigrateFinished time.Time `json:"migrate_finished"`
+
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -217,7 +222,15 @@ type MigrationView struct {
 	RPOSeconds  float64           `json:"rpo_seconds"`
 	Validations []ValidationCheck `json:"validations"`
 	CanMigrate  bool              `json:"can_migrate"`
+	Assessed    bool              `json:"assessed"` // pre-migration assessment passed
 	EnrollCmd   string            `json:"enroll_cmd,omitempty"`
+
+	// Live progress for the console: Phase is a human label ("initial sync",
+	// "finalizing", …); PercentDone/ETASeconds are -1 when unknown.
+	Phase          string  `json:"phase"`
+	PercentDone    float64 `json:"percent_done"`
+	ETASeconds     int64   `json:"eta_seconds"`
+	ElapsedSeconds int64   `json:"elapsed_seconds"`
 }
 
 // LoginRequest authenticates to the console.
