@@ -34,12 +34,19 @@ For the manual/CLI workflow instead, see [`GETTING_STARTED.md`](GETTING_STARTED.
 
 ## 1. Stand up the replication server
 
-Create a Linode (Ubuntu/Debian, sized with enough disk for the appliance and
-room to attach volumes), SSH in as root, clone this repo, and run:
+Create a Linode (Ubuntu/Debian/RHEL-family, sized with enough disk for the
+appliance and room to attach volumes), SSH in as root, and run:
 
 ```bash
+git clone https://github.com/Tiny125/vm-replication.git
+cd vm-replication
 sudo scripts/install-replication-server.sh
 ```
+
+The installer **bootstraps its own dependencies** — it installs `git`, `make`,
+`gcc`, `curl`, `openssl`, `jq`, `tar`, and a recent **Go** toolchain via the
+system package manager (apt/dnf/yum/zypper), then builds the binaries. A bare
+server with internet access is all you need.
 
 It builds the binaries, generates certificates and an **admin password**,
 installs a systemd service (`applianced`), and prints:

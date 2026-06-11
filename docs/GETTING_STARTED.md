@@ -47,7 +47,9 @@ three roles. One physical machine can play more than one role.
 ## 1. What you need to prepare
 
 ### 1.1 On your workstation (where you build and orchestrate)
-- **Go 1.25+** (to build the binaries) — or get prebuilt binaries another way.
+- **Go 1.21+** (to build the binaries; the module fetches the exact toolchain it
+  needs). For the **turnkey appliance**, you don't even need this — its installer
+  auto-installs Go and the rest (see [`APPLIANCE.md`](APPLIANCE.md)).
 - **bash, openssl** (certificates), **curl + jq** (Linode provisioning script).
 - This repository checked out.
 
