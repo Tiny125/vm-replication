@@ -30,6 +30,8 @@ type Config struct {
 	DataDir           string          // file-fallback volumes + manifests live here
 	PublicHost        string          // IP/DNS that source agents reach this server at
 	ConsolePort       int             // for building enrollment URLs
+	Scheme            string          // "https" (default) or "http" for enrollment URLs
+	PublicKeyPin      string          // base64 SPKI SHA-256 for curl --pinnedpubkey (empty = no pin)
 	BaseReceiverPort  int             // first port for per-migration receivers
 	Region            string          // default Linode region for volumes/instances
 	TLS               transport.Files // appliance data-plane (receiver) cert/key/ca

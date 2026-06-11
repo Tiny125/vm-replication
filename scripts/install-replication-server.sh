@@ -101,11 +101,23 @@ fi
 PWFILE="$LIB/initial-admin-password.txt"
 for _ in $(seq 1 30); do [ -f "$PWFILE" ] && break; sleep 0.5; done
 
+# --- console cert fingerprint (printed so you can verify it in the browser) ---
+FPR=""
+if [ -f "$LIB/console.crt" ] && command -v openssl >/dev/null 2>&1; then
+  FPR="$(openssl x509 -in "$LIB/console.crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//')"
+fi
+
 cat <<EOF
 
 ================ REPLICATION SERVER READY ================
- Console:   http://$PUBLIC_HOST:$PORT
+ Console:   https://$PUBLIC_HOST:$PORT
  Password:  $( [ -f "$PWFILE" ] && cat "$PWFILE" || echo "see: journalctl -u applianced" )
+ Cert SHA-256 (verify this in your browser's certificate dialog):
+   ${FPR:-see: journalctl -u applianced}
+
+ The console uses a self-signed certificate, so your browser will warn on first
+ visit — that's expected. Click through, then confirm the certificate's SHA-256
+ fingerprint matches the value above before entering the password.
 
  Open the console in your browser, sign in with the password above, then:
    1. (optional) paste your Linode API token to enable volume provisioning
@@ -113,12 +125,12 @@ cat <<EOF
    2. Create a migration: enter your source server's hostname, disk device
       (e.g. /dev/sda), and disk size.
    3. Copy the generated one-line command and run it on your SOURCE server.
+      (It pins this server's key, so the agent download is MITM-proof.)
    4. Watch replication status; when checks pass, click "Start migration".
    5. The migrated image (a cloned volume) can launch new Linode instances.
 
- NOTE: the console is HTTP. Restrict port $PORT to trusted networks (firewall)
- or access it over an SSH tunnel / VPN. The replication data plane is always
- mutually-authenticated TLS regardless.
+ The console (HTTPS) and the replication data plane (mutual TLS) are both
+ encrypted. Still, restrict port $PORT to trusted networks where you can.
  Logs: journalctl -u applianced -f
 ==========================================================
 EOF
