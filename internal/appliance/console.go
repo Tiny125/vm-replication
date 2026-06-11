@@ -64,6 +64,17 @@ const consoleHTML = `<!DOCTYPE html>
 
    <div class="card">
      <h2>New migration</h2>
+     <div class="muted" style="font-size:12px;margin-bottom:8px">
+       Not sure what to enter? Run this on your <b>source server</b> — it prints all four values:
+     </div>
+     <div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px">
+       <pre id="srcCmd" style="flex:1;margin:0">echo "Hostname : $(hostname)"; lsblk -b -d -n -o NAME,SIZE,TYPE | awk '$3=="disk"{printf "Device   : /dev/%s\nSize(GB) : %d\n", $1, ($2+1073741823)/1073741824}'</pre>
+       <button onclick="copyText(document.getElementById('srcCmd').textContent,this)">Copy</button>
+     </div>
+     <div class="muted" style="font-size:11px;margin-bottom:12px">
+       Enter the <b>whole disk</b> (e.g. <code style="display:inline;padding:1px 4px">/dev/sda</code>), not a partition — pick the
+       disk whose partitions include the root filesystem (<code style="display:inline;padding:1px 4px">/</code>). Always round the size <b>up</b>.
+     </div>
      <div class="row">
        <div><label>Name</label><input id="m_name" placeholder="web01"></div>
        <div><label>Source hostname</label><input id="m_host" placeholder="web01.prod"></div>
@@ -83,6 +94,12 @@ const consoleHTML = `<!DOCTYPE html>
 <script>
 const $=id=>document.getElementById(id);
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function copyText(t,btn){
+  const done=()=>{if(btn){const o=btn.textContent;btn.textContent='Copied!';setTimeout(()=>{btn.textContent=o},1200)}};
+  if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(done).catch(()=>legacyCopy(t,done))}
+  else legacyCopy(t,done);
+}
+function legacyCopy(t,done){const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.focus();ta.select();try{document.execCommand('copy');done&&done()}catch(e){}document.body.removeChild(ta)}
 async function api(method,path,body){
   const o={method,headers:{},credentials:'same-origin'};
   if(body!==undefined){o.headers['Content-Type']='application/json';o.body=JSON.stringify(body)}
@@ -163,7 +180,9 @@ function migCard(v){
   h+='</div>';
   // enroll command
   if(v.enroll_cmd && !m.full_sync_done && m.state!=='migrating'){
-    h+='<label>Run this on the source server ('+esc(m.source_hostname||m.source_device)+')</label><pre>'+esc(v.enroll_cmd)+'</pre>';
+    h+='<label>Run this on the source server ('+esc(m.source_hostname||m.source_device)+')</label>'+
+       '<div style="display:flex;gap:8px;align-items:flex-start"><pre id="enroll'+m.id+'" style="flex:1;margin:0">'+esc(v.enroll_cmd)+'</pre>'+
+       '<button onclick="copyText(document.getElementById(\'enroll'+m.id+'\').textContent,this)">Copy</button></div>';
   }
   // actions
   if(v.can_migrate){h+='<button class="primary" onclick="startMig('+m.id+')">Start migration</button>';}

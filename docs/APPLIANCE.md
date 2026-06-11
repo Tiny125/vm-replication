@@ -138,6 +138,18 @@ Click **New migration** and enter your source server's:
 - **disk device** (e.g. `/dev/sda` — the whole disk, not a partition),
 - **disk size (GB)**.
 
+Not sure of the device or size? The form has a **Copy** button for a discovery
+command — run it on your source server and it prints all four values:
+
+```bash
+echo "Hostname : $(hostname)"; lsblk -b -d -n -o NAME,SIZE,TYPE | \
+  awk '$3=="disk"{printf "Device   : /dev/%s\nSize(GB) : %d\n", $1, ($2+1073741823)/1073741824}'
+```
+
+Enter the **whole disk** (the one whose partitions include the root filesystem
+`/`), not a partition, and the size **rounded up** (the command already rounds up
+for you).
+
 The console immediately shows a **one-line command**, e.g.:
 
 ```bash
