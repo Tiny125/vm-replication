@@ -612,6 +612,7 @@ func (s *Server) enrollCmd(token string, m api.Migration) string {
 		s.curlPinFlag(), s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort, token)
 }
 
+// uninstallCmd is the one-liner that removes the agent from a source server.
 func (s *Server) uninstallCmd() string {
 	return fmt.Sprintf("curl -fsSL %s'%s://%s:%d/install/uninstall.sh' | sudo bash",
 		s.curlPinFlag(), s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort)
