@@ -69,13 +69,49 @@ password. (It's also saved at `/var/lib/vm-repl/initial-admin-password.txt`.)
 
 ## 3. (Optional but recommended) Add your Linode API token
 
-In the console, paste a Linode API token. This enables the appliance to:
-- provision a **Block Storage volume** per migration (sized to the source),
-- run the disk conversion and **create the launchable image** on "Start migration".
+The Linode API token (Linode calls it a **Personal Access Token**) lets the
+appliance act on your Linode account on your behalf, so it can do the cloud-side
+work automatically. It enables the appliance to:
+- provision a **Block Storage volume** per migration (sized to the source) and
+  attach it to the replication server,
+- after replication, **clone that volume** into the launchable artifact,
+- optionally **create and boot a new Linode instance** from the artifact.
 
 Without a token, the appliance still replicates (into a file on the server) so
 you can evaluate the flow; the finalize step then just reports where the data
 landed.
+
+The token is stored **encrypted at rest** (AES-256-GCM) on your replication
+server and is only ever sent to `api.linode.com`.
+
+### How to get the token
+
+1. Sign in to **Linode Cloud Manager** → <https://cloud.linode.com>.
+2. Go to **API Tokens** (username menu → *API Tokens*, or
+   <https://cloud.linode.com/profile/tokens>).
+3. Click **Create a Personal Access Token**.
+4. Give it a **label** (e.g. `vm-replication-appliance`) and an **expiry**.
+5. **Set the permissions (scopes).** For least privilege, set everything to
+   **None** except:
+
+   | Scope | Access | Why |
+   |---|---|---|
+   | **Linodes** | **Read/Write** | create the migrated instance, its boot config, and boot it |
+   | **Volumes** | **Read/Write** | create, attach, and clone the replication volume |
+
+   (Leave Account, Images, NodeBalancers, Domains, etc. at **None** — they aren't
+   used. If you later want the appliance to build a Linode *Image* rather than a
+   cloned volume, add **Images: Read/Write**.)
+6. Click **Create Token** and **copy it immediately** — Linode shows the value
+   only once.
+7. Paste it into the console's token field and **Save**. The console will show
+   "✔ Linode API token stored".
+
+> Create the token on the **same account** that owns the replication server, and
+> make sure that account can create volumes in the server's region. Treat the
+> token like a password — anyone holding it can create/delete resources (and
+> incur charges) on your account. You can revoke it anytime from the same API
+> Tokens page; provisioning/finalize will then fail until you save a new one.
 
 ---
 
