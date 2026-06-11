@@ -84,14 +84,32 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 		p.mu.Unlock()
 	}
 
+	diskIdx := d.Index
+	dev0 := d.SourceDevice
 	go func() {
 		err := receiver.Serve(ctx, ln, device, manifest, false, func(st receiver.Stats) {
 			total := blockdiff.NumBlocks(st.Hello.DeviceSize, st.Hello.BlockSize)
 			bytes := st.BlocksWritten * int64(st.Hello.BlockSize)
+			wasBaselined := false
+			if d0, derr := s.st.Migration(s.ctx, migID); derr == nil {
+				for _, dk := range d0.Disks {
+					if dk.ID == diskID {
+						wasBaselined = dk.FullSyncDone
+					}
+				}
+			}
 			if err := s.st.RecordDiskSync(s.ctx, migID, diskID, st.Hello.FullSync, total, st.ChangedBlocks, bytes); err != nil {
 				log.Printf("appliance: record sync (migration %d disk %d): %v", migID, diskID, err)
 			}
-		}, onProgress)
+			if st.Hello.FullSync && !wasBaselined {
+				_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("disk %d (%s): initial full sync complete (%s)", diskIdx, st.Hello.DevicePath, humanBytes(st.BlocksWritten*int64(st.Hello.BlockSize))))
+			} else if !wasBaselined {
+				_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("disk %d: agent connected, replicating", diskIdx))
+			}
+		}, onProgress, func(serr error) {
+			_ = s.st.RecordDiskError(s.ctx, diskID, serr.Error())
+			_ = s.st.AddEvent(s.ctx, migID, "error", fmt.Sprintf("disk %d (%s): replication attempt failed: %s", diskIdx, dev0, serr.Error()))
+		})
 		if err != nil && ctx.Err() == nil {
 			log.Printf("appliance: receiver (migration %d disk %d) stopped: %v", migID, diskID, err)
 		}
@@ -159,6 +177,7 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("migration created with %d disk(s); waiting for the source agent", len(m.Disks)))
 	_ = s.st.SetMigrationState(ctx, m.ID, api.MigAwaitingAgent, "")
 	m, _ = s.st.Migration(ctx, m.ID)
 	if err := s.ensureReceivers(m); err != nil {
@@ -174,11 +193,15 @@ func (s *Server) provisionDiskStorage(ctx context.Context, m api.Migration, d ap
 	if !ok || s.cfg.ApplianceLinodeID == 0 {
 		return nil // file fallback
 	}
-	sizeGiB := int((d.SizeBytes + (1 << 30) - 1) / (1 << 30))
+	// Size the volume with headroom so the agent's exact device size (in bytes)
+	// is always <= the volume, regardless of GB/GiB rounding. We round the source
+	// up to whole GiB and add 1 GiB of slack; the receiver requires the target be
+	// at least the source size, so undersizing would reject the session.
+	sizeGiB := int((d.SizeBytes+(1<<30)-1)/(1<<30)) + 1
 	if sizeGiB < 10 {
 		sizeGiB = 10 // Linode minimum volume size
 	}
-	label := fmt.Sprintf("vmrepl-%d-%d", m.ID, d.Index)
+	label := volumeLabel(m.Name, d.Index, len(m.Disks))
 	vol, err := cl.CreateVolume(ctx, label, s.cfg.Region, sizeGiB, s.cfg.ApplianceLinodeID)
 	if err != nil {
 		return err
@@ -190,7 +213,34 @@ func (s *Server) provisionDiskStorage(ctx context.Context, m api.Migration, d ap
 	if device == "" {
 		device = "/dev/disk/by-id/scsi-0Linode_Volume_" + label
 	}
-	return s.st.SetDiskVolume(ctx, d.ID, vol.ID, device)
+	if err := s.st.SetDiskVolume(ctx, d.ID, vol.ID, device); err != nil {
+		return err
+	}
+	_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("disk %d (%s): provisioned %dGiB volume %q (id %d)", d.Index, d.SourceDevice, sizeGiB, label, vol.ID))
+	return nil
+}
+
+// volumeLabel builds a Linode-safe volume label "vmrep-<name>" (with a disk
+// suffix for multi-disk). Linode labels are 1–32 chars, [A-Za-z0-9_-].
+func volumeLabel(name string, idx, total int) string {
+	clean := make([]rune, 0, len(name))
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			clean = append(clean, r)
+		} else {
+			clean = append(clean, '-')
+		}
+	}
+	base := "vmrep-" + string(clean)
+	suffix := ""
+	if total > 1 {
+		suffix = fmt.Sprintf("-d%d", idx)
+	}
+	max := 32 - len(suffix)
+	if len(base) > max {
+		base = base[:max]
+	}
+	return base + suffix
 }
 
 func (s *Server) handleListMigrations(w http.ResponseWriter, r *http.Request) {
@@ -219,6 +269,23 @@ func (s *Server) handleGetMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.view(ctx, m, ""))
+}
+
+// handleMigrationEvents returns a migration's activity log (newest first).
+func (s *Server) handleMigrationEvents(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	events, err := s.st.Events(r.Context(), id, 200)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if events == nil {
+		events = []api.Event{}
+	}
+	writeJSON(w, http.StatusOK, events)
 }
 
 // handleAssessMigration runs the pre-migration assessment: re-evaluates all
@@ -308,6 +375,7 @@ func (s *Server) handleStopMigration(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.st.SetAssessed(ctx, id, false)
 	_ = s.st.SetMigrationState(ctx, id, api.MigReplicating, "stopped by operator")
+	_ = s.st.AddEvent(ctx, id, "warn", "cutover stopped by operator; replication resumed")
 	if m2, err := s.st.Migration(ctx, id); err == nil {
 		_ = s.ensureReceivers(m2)
 	}
@@ -402,10 +470,15 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		return
 	}
 
+	_ = s.st.AddEvent(sctx, m.ID, "info", "cutover started: converting boot disk and cloning volumes")
+
 	// 2) Clone every disk's volume into an immutable artifact, in disk order.
 	cloneIDs := make([]int64, len(m.Disks))
 	for i, d := range m.Disks {
-		label := fmt.Sprintf("vmrepl-img-%d-%d", m.ID, d.Index)
+		label := volumeLabel(m.Name, d.Index, len(m.Disks)) + "-img"
+		if len(label) > 32 {
+			label = label[:32]
+		}
 		log.Printf("appliance: migration %d: cloning disk %d volume %d -> %s", m.ID, d.Index, d.VolumeID, label)
 		clone, err := cl.CloneVolume(ctx, d.VolumeID, label)
 		if canceled() {
@@ -476,16 +549,19 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", cloneIDs[0]), inst.ID)
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
 		_ = s.st.SetMigrateFinished(sctx, m.ID)
+		_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: launched Linode %d from the image volumes", inst.ID))
 		return
 	}
 
 	_ = s.st.SetMigrationState(sctx, m.ID, api.MigImageReady, "")
 	_ = s.st.SetMigrateFinished(sctx, m.ID)
+	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %d image volume(s) ready to launch", len(m.Disks)))
 }
 
 func (s *Server) fail(id int64, msg string) {
 	log.Printf("appliance: migration %d failed: %s", id, msg)
 	_ = s.st.SetMigrationState(context.Background(), id, api.MigFailed, msg)
+	_ = s.st.AddEvent(context.Background(), id, "error", "cutover failed: "+msg)
 }
 
 // ---- view + validations (aggregate across disks) ----
@@ -669,6 +745,19 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+func humanBytes(n int64) string {
+	const u = 1 << 10
+	if n < u {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(u), 0
+	for x := n / u; x >= u; x /= u {
+		div *= u
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 func lagDetail2(anySync bool, rpoSec float64) string {

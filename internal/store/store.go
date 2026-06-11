@@ -142,9 +142,20 @@ CREATE TABLE IF NOT EXISTS migration_disks (
   changed_blocks  INTEGER NOT NULL DEFAULT 0,
   bytes_on_wire   INTEGER NOT NULL DEFAULT 0,
   last_sync_at    INTEGER NOT NULL DEFAULT 0,
-  agent_last_seen INTEGER NOT NULL DEFAULT 0
+  agent_last_seen INTEGER NOT NULL DEFAULT 0,
+  last_error      TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_disks_migration ON migration_disks(migration_id, idx);
+
+-- Per-migration activity log shown in the console.
+CREATE TABLE IF NOT EXISTS migration_events (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  migration_id INTEGER NOT NULL REFERENCES migrations(id) ON DELETE CASCADE,
+  at           INTEGER NOT NULL,
+  level        TEXT NOT NULL DEFAULT 'info',
+  message      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_migration ON migration_events(migration_id, id DESC);
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return err
@@ -156,6 +167,7 @@ CREATE INDEX IF NOT EXISTS idx_disks_migration ON migration_disks(migration_id, 
 		`ALTER TABLE migrations ADD COLUMN assessed_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE migrations ADD COLUMN migrate_started INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE migrations ADD COLUMN migrate_finished INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE migration_disks ADD COLUMN last_error TEXT NOT NULL DEFAULT ''`,
 	} {
 		_, _ = s.db.Exec(stmt)
 	}

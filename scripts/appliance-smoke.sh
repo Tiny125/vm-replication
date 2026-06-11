@@ -62,6 +62,12 @@ echo "$ENROLL" | grep -q 'https://' && echo "$ENROLL" | grep -q 'pinnedpubkey' \
   || { echo "FAIL: enrollment command not hardened: $ENROLL"; exit 1; }
 echo "   OK: 2 disks, distinct ports, hardened enroll cmd"
 
+echo "== Activity log records the creation event =="
+EVENTS=$(api "$BASE/api/v1/migrations/$MID/events")
+echo "$EVENTS" | jq -e 'type=="array" and length>=1' >/dev/null || { echo "FAIL: events endpoint empty: $EVENTS"; exit 1; }
+echo "$EVENTS" | jq -e 'any(.[]; .message | contains("migration created"))' >/dev/null || { echo "FAIL: no creation event: $EVENTS"; exit 1; }
+echo "   OK: /events returns the creation entry"
+
 echo "== Verify the installer drives BOTH disks =="
 TOKEN=$(echo "$ENROLL" | grep -o 'token=[a-f0-9]*' | cut -d= -f2)
 SH=$(curl -fsS --cacert "$CACERT" "$BASE/install/agent.sh?token=$TOKEN")

@@ -184,6 +184,15 @@ type Disk struct {
 	BytesOnWire   int64     `json:"bytes_on_wire"`
 	LastSyncAt    time.Time `json:"last_sync_at"`
 	AgentLastSeen time.Time `json:"agent_last_seen"`
+	LastError     string    `json:"last_error,omitempty"` // last receiver-side session error
+}
+
+// Event is one entry in a migration's activity log.
+type Event struct {
+	ID      int64     `json:"id"`
+	At      time.Time `json:"at"`
+	Level   string    `json:"level"` // info | warn | error
+	Message string    `json:"message"`
 }
 
 // Migration is one source→Linode migration managed by the appliance console.
