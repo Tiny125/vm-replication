@@ -110,8 +110,35 @@ const consoleHTML = `<!DOCTYPE html>
  .spinner{width:26px;height:26px;border:3px solid var(--surface2);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
  .login-card{max-width:380px;margin:8vh auto 0}
+ .modal-overlay{position:fixed;inset:0;background:rgba(20,20,22,.32);backdrop-filter:saturate(120%) blur(2px);
+   display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;animation:fadein .15s ease}
+ .modal-overlay.closing{animation:fadeout .15s ease forwards}
+ @keyframes fadein{from{opacity:0}to{opacity:1}}
+ @keyframes fadeout{to{opacity:0}}
+ .modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:0 24px 70px rgba(0,0,0,.28);
+   max-width:460px;width:100%;padding:24px 24px 20px;animation:pop .18s cubic-bezier(.2,.8,.3,1)}
+ @keyframes pop{from{transform:scale(.94);opacity:.5}to{transform:scale(1);opacity:1}}
+ .modal h3{font-size:17px;font-weight:600;letter-spacing:-.01em;margin:0 0 10px}
+ .modal-body{font-size:14px;color:var(--text);line-height:1.55}
+ .modal-body b{font-weight:600}
+ .modal-body .warn{color:var(--red);font-weight:500}
+ .modal-check{display:flex;align-items:flex-start;gap:9px;margin-top:16px;font-size:13.5px;color:var(--text);
+   cursor:pointer;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:11px 13px}
+ .modal-check input{width:auto;margin-top:2px;cursor:pointer;accent-color:var(--accent)}
+ .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
+ .toast-wrap{position:fixed;top:18px;right:18px;z-index:200;display:flex;flex-direction:column;gap:10px;max-width:360px}
+ .toast{display:flex;align-items:flex-start;gap:9px;background:var(--surface);border:1px solid var(--border);
+   border-left:4px solid var(--muted);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.16);
+   padding:12px 14px;font-size:13.5px;color:var(--text);animation:toastin .22s cubic-bezier(.2,.8,.3,1)}
+ .toast.ok{border-left-color:var(--green)} .toast.ok .ic{color:var(--green)}
+ .toast.bad{border-left-color:var(--red)} .toast.bad .ic{color:var(--red)}
+ .toast .ic{font-weight:700;line-height:1.4}
+ .toast.closing{animation:toastout .2s ease forwards}
+ @keyframes toastin{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
+ @keyframes toastout{to{transform:translateX(20px);opacity:0}}
 </style></head>
 <body>
+<div id="toasts" class="toast-wrap"></div>
 <div class="wrap">
   <h1>vm-<span class="dot">replication</span></h1>
   <div class="sub">Migrate Linux servers to Akamai Cloud (Linode).</div>
@@ -224,6 +251,43 @@ function fmtBytes(n){if(!n)return '0 B';const u=['B','KiB','MiB','GiB','TiB'];le
 function fmtDur(s){if(s==null||s<0)return '—';s=Math.round(s);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
 function fmtTime(t){try{return new Date(t).toLocaleTimeString()}catch(e){return ''}}
 
+// uiDialog renders a themed modal in place of the browser's native confirm()/
+// alert() boxes. Resolves to false on cancel/Escape/backdrop; on confirm it
+// resolves to true, or to {checked:bool} when opts.checkbox is set.
+function uiDialog(opts){
+  return new Promise(resolve=>{
+    const ov=document.createElement('div');ov.className='modal-overlay';
+    const check=opts.checkbox?'<label class="modal-check"><input type="checkbox" id="__mck"'+(opts.checkbox.checked?' checked':'')+'><span>'+esc(opts.checkbox.label)+'</span></label>':'';
+    const cancelBtn=opts.cancel===false?'':'<button class="modal-cancel">'+esc(opts.cancelText||'Cancel')+'</button>';
+    ov.innerHTML='<div class="modal" role="dialog" aria-modal="true">'+
+      '<h3>'+esc(opts.title||'')+'</h3>'+
+      '<div class="modal-body">'+(opts.html||'')+'</div>'+check+
+      '<div class="modal-actions">'+cancelBtn+
+      '<button class="modal-ok '+(opts.okDanger?'danger':'primary')+'">'+esc(opts.okText||'OK')+'</button></div></div>';
+    document.body.appendChild(ov);
+    const ok=ov.querySelector('.modal-ok'),cancel=ov.querySelector('.modal-cancel');
+    let done=false;
+    const close=val=>{if(done)return;done=true;document.removeEventListener('keydown',onKey);ov.classList.add('closing');setTimeout(()=>ov.remove(),150);resolve(val)};
+    const confirm=()=>close(opts.checkbox?{checked:ov.querySelector('#__mck').checked}:true);
+    function onKey(e){if(e.key==='Escape')close(false);else if(e.key==='Enter'){e.preventDefault();confirm()}}
+    ok.onclick=confirm;
+    if(cancel)cancel.onclick=()=>close(false);
+    ov.onclick=e=>{if(e.target===ov)close(false)};
+    document.addEventListener('keydown',onKey);
+    setTimeout(()=>ok.focus(),0);
+  });
+}
+function confirmModal(opts){return uiDialog(opts)}
+function alertModal(opts){return uiDialog({title:opts.title,html:opts.html,okText:opts.okText||'OK',okDanger:opts.danger,cancel:false})}
+
+// toast shows a small auto-dismissing notification (kind: 'ok' | 'bad').
+function toast(msg,kind){
+  const el=document.createElement('div');el.className='toast '+(kind||'');
+  el.innerHTML='<span class="ic">'+(kind==='bad'?'✕':'✓')+'</span><span>'+esc(msg)+'</span>';
+  $('toasts').appendChild(el);
+  setTimeout(()=>{el.classList.add('closing');setTimeout(()=>el.remove(),200)},3800);
+}
+
 async function login(btn){
   $('loginErr').textContent=''; busy(btn,true);
   try{await api('POST','/login',{password:$('pw').value});$('pw').value='';start()}
@@ -278,8 +342,10 @@ async function loadSettings(){
   }
   $('settings').innerHTML=h;
 }
-async function saveToken(btn){busy(btn,true);try{await api('POST','/api/v1/settings/linode-token',{token:$('ltok').value});loadSettings()}catch(e){alert('Error: '+e.message)}finally{busy(btn,false)}}
-async function removeToken(btn){if(!confirm('Remove the stored Linode API token? Provisioning/finalize will stop working until you add a new one.'))return;busy(btn,true);try{await api('DELETE','/api/v1/settings/linode-token');loadSettings()}catch(e){alert('Error: '+e.message)}finally{busy(btn,false)}}
+async function saveToken(btn){busy(btn,true);try{await api('POST','/api/v1/settings/linode-token',{token:$('ltok').value});loadSettings()}catch(e){alertModal({title:'Could not save token',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
+async function removeToken(btn){
+  if(!await confirmModal({title:'Remove Linode API token?',html:'Provisioning and finalize will stop working until you add a new one.',okText:'Remove token',okDanger:true}))return;
+  busy(btn,true);try{await api('DELETE','/api/v1/settings/linode-token');loadSettings()}catch(e){alertModal({title:'Error',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
 
 let diskSeq=0;
 function addDisk(dev,gb){
@@ -300,11 +366,13 @@ async function createMig(btn){
   busy(btn,true);
   // Show a loading placeholder in the migrations list while provisioning runs.
   $('migs').insertAdjacentHTML('afterbegin','<div id="creating" class="mig"><div class="center"><div class="spinner"></div><div>Creating migration & provisioning volume(s)…</div></div></div>');
+  const name=$('m_name').value;
   try{
-    await api('POST','/api/v1/migrations',{name:$('m_name').value,source_hostname:$('m_host').value,devices:devices});
+    await api('POST','/api/v1/migrations',{name:name,source_hostname:$('m_host').value,devices:devices});
     $('m_name').value=$('m_host').value='';$('disks').innerHTML='';diskSeq=0;addDisk();
     await refresh(true);
-  }catch(e){$('createErr').textContent='Error: '+e.message;const c=$('creating');if(c)c.remove();}
+    toast('Migration '+(name?'"'+name+'" ':'')+'created — enroll the source agent to start replicating','ok');
+  }catch(e){$('createErr').textContent='Error: '+e.message;const c=$('creating');if(c)c.remove();toast('Create failed: '+e.message,'bad');}
   finally{busy(btn,false)}
 }
 
@@ -315,26 +383,37 @@ function bytesTotal(m){return disks(m).reduce((a,d)=>a+(d.bytes_on_wire||0),0)}
 function anyDiskError(m){return disks(m).map(d=>d.last_error).filter(Boolean)[0]||''}
 
 async function startMig(id,btn){
-  if(!confirm('Cut over migration #'+id+'?\n\nThis stops replication, converts the boot disk, and clones every disk into launchable image volumes.'))return;
-  const launch=confirm('Also launch a new Linode instance now?\nOK = launch with all disks attached · Cancel = just create the image volumes');
+  const r=await confirmModal({
+    title:'Cut over migration #'+id+'?',
+    html:'This stops replication, converts the boot disk, and clones every disk into launchable image volumes. This is the final step.',
+    okText:'Cut over',
+    checkbox:{label:'Also launch a new Linode instance now (all disks attached). Leave unchecked to just create the image volumes.',checked:false}
+  });
+  if(!r)return;
   busy(btn,true);
-  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:launch});await refresh(true)}
-  catch(e){alert('Cannot cut over: '+e.message)}finally{busy(btn,false)}
+  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:r.checked});await refresh(true)}
+  catch(e){alertModal({title:'Cannot cut over',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function assessMig(id,btn){
   busy(btn,true);
   try{const v=await api('POST','/api/v1/migrations/'+id+'/assess');
-    if(!v.assessed){const fails=(v.validations||[]).filter(c=>!c.ok).map(c=>'✘ '+c.name+' — '+c.detail).join('\n');alert('Assessment failed:\n\n'+fails);}
+    if(!v.assessed){const fails=(v.validations||[]).filter(c=>!c.ok).map(c=>'<div style="margin:4px 0"><span class="x">✘</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>').join('');
+      await alertModal({title:'Assessment failed',html:'<div class="muted" style="margin-bottom:6px">These checks must pass before cutover:</div>'+fails,danger:true});}
     await refresh(true);
-  }catch(e){alert('Assessment error: '+e.message)}finally{busy(btn,false)}
+  }catch(e){alertModal({title:'Assessment error',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function stopMig(id,btn){
-  if(!confirm('Stop cutover #'+id+'? The finalize run is cancelled and replication resumes; you will re-run the assessment.'))return;
-  busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/stop');await refresh(true)}catch(e){alert('Cannot stop: '+e.message)}finally{busy(btn,false)}
+  if(!await confirmModal({title:'Stop cutover #'+id+'?',html:'The finalize run is cancelled and replication resumes; you will need to re-run the assessment.',okText:'Stop cutover',okDanger:true}))return;
+  busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/stop');await refresh(true)}catch(e){alertModal({title:'Cannot stop',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function deleteMig(id,name,btn){
-  if(!confirm('Delete migration #'+id+' ('+name+')?\n\nWARNING: deletes the replication volume(s) and ALL replicated data. Completed image volumes are kept. Remove the agent on the source separately (uninstall command shown on completed migrations).\n\nThis cannot be undone.'))return;
-  busy(btn,true);try{await api('DELETE','/api/v1/migrations/'+id);await refresh(true)}catch(e){alert('Cannot delete: '+e.message)}finally{busy(btn,false)}
+  if(!await confirmModal({title:'Delete migration #'+id+'?',
+    html:'<b>'+esc(name)+'</b><div style="margin-top:8px" class="warn">This deletes the replication volume(s) and ALL replicated data, and cannot be undone.</div>'+
+      '<div class="muted" style="margin-top:8px;font-size:13px">Completed image volumes are kept. Remove the agent from the source separately (the uninstall command is shown on completed migrations).</div>',
+    okText:'Delete',okDanger:true}))return;
+  busy(btn,true);
+  try{await api('DELETE','/api/v1/migrations/'+id);await refresh(true);toast('Migration #'+id+' ('+name+') deleted','ok')}
+  catch(e){toast('Delete failed: '+e.message,'bad')}finally{busy(btn,false)}
 }
 // "Check status" re-fetches and shows the latest agent connection result in a box.
 async function checkStatus(id,btn){
