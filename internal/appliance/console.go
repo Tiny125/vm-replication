@@ -34,6 +34,10 @@ const consoleHTML = `<!DOCTYPE html>
  .card{background:var(--surface);border:1px solid var(--border);border-radius:16px;
    padding:22px;margin-bottom:18px;box-shadow:var(--shadow)}
  .mig{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:14px;box-shadow:var(--shadow)}
+ .mighead{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+ .chev{padding:3px 9px;font-size:13px;line-height:1;min-width:32px}
+ .mig.collapsed .migbody{display:none}
+ .migdivider{border:none;border-top:1px solid var(--border);margin:14px 0}
  label{display:block;font-size:12px;font-weight:500;color:var(--muted);margin:10px 0 5px}
  input,select{font:inherit;font-size:14px;background:var(--surface);color:var(--text);
    border:1px solid var(--border);border-radius:10px;padding:9px 12px;width:100%;transition:border-color .15s,box-shadow .15s}
@@ -222,7 +226,6 @@ const consoleHTML = `<!DOCTYPE html>
 
     <div style="display:flex;align-items:center;gap:12px;margin:6px 0 12px">
       <h2 style="margin:0">Migrations</h2>
-      <button id="refreshBtn" onclick="refresh(true)">Refresh</button>
       <span class="muted" id="updated" style="font-size:12px"></span>
     </div>
     <div id="migs"></div>
@@ -367,13 +370,16 @@ async function createMig(btn){
     devices.push({device:dev,size_bytes:gb*1073741824});}
   if(!devices.length){$('createErr').textContent='Add at least one disk';return}
   busy(btn,true);
-  // Show a loading placeholder in the migrations list while provisioning runs.
-  $('migs').insertAdjacentHTML('afterbegin','<div id="creating" class="mig"><div class="center"><div class="spinner"></div><div>Creating migration & provisioning volume(s)…</div></div></div>');
+  // Show a loading placeholder at the BOTTOM of the list while provisioning runs
+  // (new migrations are appended, newest last).
+  $('migs').insertAdjacentHTML('beforeend','<div id="creating" class="mig"><div class="center"><div class="spinner"></div><div>Creating migration & provisioning volume(s)…</div></div></div>');
+  $('creating').scrollIntoView({behavior:'smooth',block:'center'});
   const name=$('m_name').value;
   try{
     await api('POST','/api/v1/migrations',{name:name,source_hostname:$('m_host').value,devices:devices});
     $('m_name').value=$('m_host').value='';$('disks').innerHTML='';diskSeq=0;addDisk();
     await refresh(true);
+    const last=$('migs').lastElementChild;if(last)last.scrollIntoView({behavior:'smooth',block:'center'});
     toast('Migration '+(name?'"'+name+'" ':'')+'created — enroll the source agent to start replicating','ok');
   }catch(e){$('createErr').textContent='Error: '+e.message;const c=$('creating');if(c)c.remove();toast('Create failed: '+e.message,'bad');}
   finally{busy(btn,false)}
@@ -394,7 +400,7 @@ async function startMig(id,btn){
   });
   if(!r)return;
   busy(btn,true);
-  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:r.checked});await refresh(true)}
+  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:r.checked});await refreshMig(id)}
   catch(e){alertModal({title:'Cannot cut over',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function assessMig(id,btn){
@@ -402,12 +408,12 @@ async function assessMig(id,btn){
   try{const v=await api('POST','/api/v1/migrations/'+id+'/assess');
     if(!v.assessed){const fails=(v.validations||[]).filter(c=>!c.ok).map(c=>'<div style="margin:4px 0"><span class="x">✘</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>').join('');
       await alertModal({title:'Assessment failed',html:'<div class="muted" style="margin-bottom:6px">These checks must pass before cutover:</div>'+fails,danger:true});}
-    await refresh(true);
+    flash(replaceCard(id,v));
   }catch(e){alertModal({title:'Assessment error',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function stopMig(id,btn){
   if(!await confirmModal({title:'Stop cutover #'+id+'?',html:'The finalize run is cancelled and replication resumes; you will need to re-run the assessment.',okText:'Stop cutover',okDanger:true}))return;
-  busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/stop');await refresh(true)}catch(e){alertModal({title:'Cannot stop',html:esc(e.message),danger:true})}finally{busy(btn,false)}
+  busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/stop');await refreshMig(id)}catch(e){alertModal({title:'Cannot stop',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function deleteMig(id,name,btn){
   if(!await confirmModal({title:'Delete migration #'+id+'?',
@@ -418,18 +424,20 @@ async function deleteMig(id,name,btn){
   try{await api('DELETE','/api/v1/migrations/'+id);await refresh(true);toast('Migration #'+id+' ('+name+') deleted','ok')}
   catch(e){toast('Delete failed: '+e.message,'bad')}finally{busy(btn,false)}
 }
-// "Check status" re-fetches and shows the latest agent connection result in a box.
+// "Check status" re-fetches THIS migration and shows the latest result in a box.
 async function checkStatus(id,btn){
   busy(btn,true);
   try{
-    const list=await api('GET','/api/v1/migrations');const v=(list||[]).find(x=>x.migration.id===id);
-    const box=$('status'+id);
-    if(v){const m=v.migration;const err=anyDiskError(m);
-      if(allDone(m)){box.className='resultbox ok';box.textContent='✔ All disks baselined and replicating. Last activity '+(disks(m).map(d=>d.last_sync_at).filter(Boolean).sort().pop()||'recently');}
+    const v=await api('GET','/api/v1/migrations/'+id);
+    const card=replaceCard(id,v);
+    const m=v.migration;const err=anyDiskError(m);const box=card.querySelector('#status'+id)||$('status'+id);
+    if(box){
+      box.classList.remove('hide');
+      if(allDone(m)){box.className='resultbox ok';box.textContent='✔ All disks baselined and replicating.';}
       else if(err){box.className='resultbox bad';box.textContent='✘ Last replication attempt failed: '+err;}
       else{box.className='resultbox';box.textContent='No completed sync yet. The agent retries every 60s — run the force-retry command on the source if needed.';}
     }
-    await refresh(true);
+    flash(card);
   }catch(e){const box=$('status'+id);if(box){box.className='resultbox bad';box.textContent='Error: '+e.message}}
   finally{busy(btn,false)}
 }
@@ -452,16 +460,36 @@ async function loadLog(id,doFlash){
   }catch(e){box.innerHTML='<div class="err">'+esc(e.message)+'</div>'}
 }
 
+// syncPct estimates initial-full-sync completion (0–100). Prefers the live
+// block-level percentage reported by the receiver; falls back to bytes received
+// vs total source size when no session is active.
+function syncPct(v,m){
+  const ds=disks(m);
+  if(ds.length&&ds.every(d=>d.full_sync_done))return 100;
+  if(v.percent_done>=0)return Math.max(0,Math.min(99.9,v.percent_done));
+  const tot=ds.reduce((a,d)=>a+(d.size_bytes||0),0);
+  if(tot>0)return Math.max(0,Math.min(99,bytesTotal(m)/tot*100));
+  return 0;
+}
+function progBar(width,indet){
+  return '<div class="prog'+(indet?' indet':'')+'"><div style="width:'+(indet?35:Math.round(width))+'%"></div></div>';
+}
 function progressLine(v,m){
-  let line='<span class="muted">'+esc(v.phase||'')+'</span>';let width=0,indet=false;
-  if(v.percent_done>=0){width=Math.max(2,Math.round(v.percent_done));line+=' · '+v.percent_done.toFixed(1)+'%';}
-  // No concrete percent but work is ongoing (steady-state replication, finalizing,
-  // waiting/provisioning): show a moving indeterminate bar so it's clearly alive.
-  else if(['created','awaiting_agent','replicating','ready','migrating'].includes(m.state)){indet=true;}
-  if(v.eta_seconds>=0){line+=' · ~'+fmtDur(v.eta_seconds)+' left';}
-  else if(m.state==='migrating'){line+=' · running '+fmtDur(v.elapsed_seconds);}
-  if(['image_ready','launched'].includes(m.state)){width=100;indet=false;line+=' in '+fmtDur(v.elapsed_seconds);}
-  return line+'<div class="prog'+(indet?' indet':'')+'"><div style="width:'+(indet?35:width)+'%"></div></div>'+
+  const st=m.state;let label,bar;
+  if(st==='image_ready'||st==='launched'){label='completed in '+fmtDur(v.elapsed_seconds);bar=progBar(100,false);}
+  else if(st==='failed'){label='failed';bar=progBar(0,false);}
+  else if(st==='migrating'){label='finalizing · running '+fmtDur(v.elapsed_seconds);bar=progBar(0,true);}
+  else{
+    const allBase=disks(m).length>0&&disks(m).every(d=>d.full_sync_done);
+    if(allBase){label='initial sync completed · 100%';bar=progBar(100,false);}
+    else{
+      const pct=syncPct(v,m);
+      label=(st==='created'||st==='awaiting_agent'?'waiting for agent':'initial sync')+' · '+pct.toFixed(1)+'%';
+      if(v.eta_seconds>=0)label+=' · ~'+fmtDur(v.eta_seconds)+' left';
+      bar=progBar(pct,false);
+    }
+  }
+  return '<span class="muted">'+esc(label)+'</span>'+bar+
     '<div class="muted" style="font-size:12px;margin-top:3px">'+fmtBytes(bytesTotal(m))+' received</div>';
 }
 function diskTable(m){const d=disks(m);if(!d.length)return '';
@@ -481,20 +509,41 @@ const STATE_TIP='Status of replication from the source server to this appliance:
   '• finalizing — converting the boot disk and cloning volumes during cutover\n'+
   '• image ready / launched — migration complete\n'+
   '• failed — something went wrong; see the error shown below';
+// Per-migration UI state that must survive the 5s rebuild.
+const collapsedMigs=new Set();   // migration ids the user collapsed
+const seenMigs=new Set();        // migrations rendered at least once (for first-time defaults)
+function toggleCollapse(id,btn){
+  const card=$('mig'+id);if(!card)return;
+  const now=card.classList.toggle('collapsed');
+  if(now)collapsedMigs.add(id);else collapsedMigs.delete(id);
+  btn.textContent=now?'▸':'▾';btn.title=now?'Expand':'Collapse';
+}
 function migCard(v){
   const m=v.migration;const err=anyDiskError(m);
-  let h='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+infoIcon(STATE_TIP)+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
+  const collapsed=collapsedMigs.has(m.id);
+  const firstSeen=!seenMigs.has(m.id);seenMigs.add(m.id);
+
+  // Header: collapse chevron + per-migration refresh (acts on this card only).
+  let h='<div class="mighead">'+
+    '<button class="chev" title="'+(collapsed?'Expand':'Collapse')+'" onclick="toggleCollapse('+m.id+',this)">'+(collapsed?'▸':'▾')+'</button>'+
+    '<span class="muted" style="font-size:12px;flex:1">'+(collapsed?'collapsed — click ▸ to expand':'')+'</span>'+
+    '<button class="mini" title="Refresh this migration" onclick="refreshMig('+m.id+',this)">↻ Refresh</button></div>';
+
+  h+='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+infoIcon(STATE_TIP)+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
     '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_hostname||'-')+'</span></td>'+
     '<td><span class="pill '+stateClass(m.state)+'">'+esc(stateLabel(m.state))+'</span></td>'+
     '<td class="muted">'+disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining')+'</td>'+
     '<td>'+progressLine(v,m)+'</td>'+
     '<td class="muted">'+(v.rpo_seconds?Math.round(v.rpo_seconds)+'s':'—')+'</td></tr></table>';
-  if(m.last_error)h+='<div class="resultbox bad">'+esc(m.last_error)+'</div>';
-  else if(err)h+='<div class="resultbox bad">Last replication attempt failed: '+esc(err)+'</div>';
+
+  // Everything below the status table is hidden when the card is collapsed.
+  let b='';
+  if(m.last_error)b+='<div class="resultbox bad">'+esc(m.last_error)+'</div>';
+  else if(err)b+='<div class="resultbox bad">Last replication attempt failed: '+esc(err)+'</div>';
 
   if(['image_ready','launched'].includes(m.state)){
     const arts=disks(m).map(d=>esc(d.artifact_id||('vmrep-'+m.name+'-img'))).join(', ');
-    h+='<div class="banner">✔ <b>Migration completed.</b> '+disks(m).length+' image volume(s) in your Linode account ('+
+    b+='<div class="banner">✔ <b>Migration completed.</b> '+disks(m).length+' image volume(s) in your Linode account ('+
        '<a href="https://cloud.linode.com/volumes" target="_blank" rel="noopener">cloud.linode.com/volumes</a>): <code style="display:inline;padding:1px 5px">'+arts+'</code>. '+
        (m.launched_linode_id?('Launched Linode '+esc(m.launched_linode_id)+' — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a>.')
        :'To launch: create a Linode (same region), attach these volumes (boot=sda, data=sdb…) and boot from GRUB 2.')+'</div>';
@@ -502,42 +551,72 @@ function migCard(v){
 
   let checks='';for(const c of (v.validations||[]))checks+='<div style="font-size:13px;margin:2px 0"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>';
   const allOk=(v.validations||[]).every(c=>c.ok);
-  h+='<details'+(allOk?'':' open')+'><summary>Validation checks'+(allOk?' (all passing)':'')+'</summary><div>'+checks+'</div></details>';
-  h+='<details><summary>Disks ('+disks(m).length+')</summary><div>'+diskTable(m)+'</div></details>';
+  b+='<details'+(allOk?'':' open')+'><summary>Validation checks'+(allOk?' (all passing)':'')+'</summary><div>'+checks+'</div></details>';
+  b+='<details><summary>Disks ('+disks(m).length+')</summary><div>'+diskTable(m)+'</div></details>';
   const cachedLog=logCache[m.id];
-  h+='<details ontoggle="if(this.open)ensureLog('+m.id+')"><summary>Activity log</summary><div>'+
+  b+='<details ontoggle="if(this.open)ensureLog('+m.id+')"><summary>Activity log</summary><div>'+
      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="muted" style="font-size:12px;flex:1">Newest entries at the bottom · scroll up for history</span>'+
      '<button class="mini" onclick="loadLog('+m.id+',true)" title="Refresh log">↻ Refresh</button></div>'+
      '<div id="log'+m.id+'" class="log" onscroll="if(logCache['+m.id+'])logCache['+m.id+'].scroll=this.scrollTop">'+
      (cachedLog?cachedLog.html:'<div class="muted">loading…</div>')+'</div></div></details>';
 
   if(v.enroll_cmd && !allDone(m) && m.state!=='migrating'){
-    h+='<details open><summary>Enroll the source server (all '+disks(m).length+' disk(s))</summary><div>'+
-       '<label>Run this on '+esc(m.source_hostname||'the source')+'</label>'+
+    const certErr=/certificate|tls|x509/i.test(err||'');
+    // Default-open on first sight; afterwards the open/closed state is preserved
+    // across refreshes (openKeys), so closing it makes it stay closed.
+    b+='<details'+(firstSeen?' open':'')+'><summary>Enroll the source server (all '+disks(m).length+' disk(s))</summary><div>';
+    if(certErr)b+='<div class="resultbox bad" style="margin-bottom:8px">The agent could not complete the TLS handshake — this usually means it was installed against an <b>older appliance certificate</b>. A retry will not fix it: <b>re-run the command below</b> to reinstall the agent with the current certificates.</div>';
+    b+='<label>Run this on '+esc(m.source_hostname||'the source')+'</label>'+
        '<div style="display:flex;gap:8px;align-items:flex-start"><pre id="enroll'+m.id+'" style="flex:1;margin:0">'+esc(v.enroll_cmd)+'</pre>'+
        '<button onclick="copyText(document.getElementById(\'enroll'+m.id+'\').textContent,this)">Copy</button></div>'+
        '<div class="muted" style="font-size:12px;margin-top:8px">If a disk’s sync fails, no reinstall is needed — the agent retries every 60s. '+
        'Force a retry on the source with <code style="display:inline;padding:1px 5px">sudo systemctl start vmrepl-agent.service</code>, then click <b>Check status</b> below.</div>'+
        '<div class="actions"><button onclick="checkStatus('+m.id+',this)">Check status</button></div>'+
-       '<div id="status'+m.id+'" class="resultbox hide"></div></div></details>';
+       '<div id="status'+m.id+'" class="resultbox hide"></div>'+
+       '<hr class="migdivider"></div></details>';
   }
   if(v.uninstall_cmd && ['image_ready','launched'].includes(m.state)){
-    h+='<details><summary>Remove the agent from the source</summary><div style="display:flex;gap:8px;align-items:flex-start">'+
+    b+='<details><summary>Remove the agent from the source</summary><div style="display:flex;gap:8px;align-items:flex-start">'+
        '<pre id="unin'+m.id+'" style="flex:1;margin:0">'+esc(v.uninstall_cmd)+'</pre>'+
        '<button onclick="copyText(document.getElementById(\'unin'+m.id+'\').textContent,this)">Copy</button></div></details>';
   }
 
-  h+='<div class="actions">';
+  b+='<div class="actions">';
   if(!['migrating','image_ready','launched'].includes(m.state)){
-    h+='<button onclick="assessMig('+m.id+',this)">Pre-cutover assessment</button>';
-    if(v.assessed)h+='<span class="pill ok">✔ assessment passed</span>';
-    if(v.can_migrate)h+='<button class="primary"'+(v.assessed?'':' disabled title="Run the assessment first"')+' onclick="startMig('+m.id+',this)">Cutover instance</button>'+
+    b+='<button onclick="assessMig('+m.id+',this)">Pre-cutover assessment</button>';
+    if(v.assessed)b+='<span class="pill ok">✔ assessment passed</span>';
+    // Always show the Cutover button for consistency; disable (with a reason)
+    // until validations pass and the assessment has been run.
+    const ready=v.can_migrate&&v.assessed;
+    const why=!v.can_migrate?'Validation checks must all pass first':(!v.assessed?'Run the pre-cutover assessment first':'');
+    b+='<button class="primary"'+(ready?'':' disabled title="'+why+'"')+' onclick="startMig('+m.id+',this)">Cutover instance</button>'+
       infoIcon('Cuts over to Linode: stops replication, converts the boot disk to boot on Linode, and clones every replicated disk into launchable image volumes. You can optionally launch a new Linode instance right after. Run the pre-cutover assessment first — this is the final step.');
   }
-  if(m.state==='migrating')h+='<button class="danger" onclick="stopMig('+m.id+',this)">Stop</button>';
-  h+='<span style="flex:1"></span><button class="danger" onclick="deleteMig('+m.id+',\''+esc(m.name)+'\',this)">Delete</button></div>';
-  const card=document.createElement('div');card.className='mig';card.id='mig'+m.id;card.innerHTML=h;return card;
+  if(m.state==='migrating')b+='<button class="danger" onclick="stopMig('+m.id+',this)">Stop</button>';
+  b+='<span style="flex:1"></span><button class="danger" onclick="deleteMig('+m.id+',\''+esc(m.name)+'\',this)">Delete</button></div>';
+
+  h+='<div class="migbody">'+b+'</div>';
+  const card=document.createElement('div');card.className='mig'+(collapsed?' collapsed':'');card.id='mig'+m.id;card.innerHTML=h;return card;
 }
+
+// replaceCard swaps just this migration's card in place, preserving which
+// <details> were open and the activity-log scroll position.
+function replaceCard(id,v){
+  const old=$('mig'+id);const open=cardOpenKeys(old);
+  const card=migCard(v);
+  if(old)old.replaceWith(card);
+  card.querySelectorAll('details').forEach(d=>{if(open.has(d.querySelector('summary').textContent))d.open=true});
+  const lb=card.querySelector('.log');if(lb&&logCache[id])lb.scrollTop=logCache[id].scroll;
+  return card;
+}
+// refreshMig re-fetches and re-renders ONLY this migration's card.
+async function refreshMig(id,btn){
+  busy(btn,true);
+  try{const v=await api('GET','/api/v1/migrations/'+id);flash(replaceCard(id,v));}
+  catch(e){toast('Refresh failed: '+e.message,'bad')}
+  finally{busy(btn,false)}
+}
+function cardOpenKeys(card){const s=new Set();if(card)card.querySelectorAll('details[open]').forEach(d=>s.add(d.querySelector('summary').textContent));return s}
 
 // Preserve which <details> were open across refreshes so the UI doesn't collapse.
 function openKeys(){const s=new Set();document.querySelectorAll('#migs details[open]').forEach((d,i)=>{const card=d.closest('.mig');if(card)s.add(card.id+':'+d.querySelector('summary').textContent)});return s}
@@ -546,6 +625,7 @@ async function refresh(animate){
   try{
     const open=openKeys();
     const list=await api('GET','/api/v1/migrations');
+    list.sort((a,b)=>a.migration.id-b.migration.id); // oldest first; newest at the bottom
     const c=$('creating');if(c)c.remove();
     const migs=$('migs');
     migs.innerHTML='';
