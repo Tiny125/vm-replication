@@ -105,7 +105,6 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/migrations/{id}", s.auth(s.handleGetMigration))
 	s.mux.Handle("GET /api/v1/migrations/{id}/events", s.auth(s.handleMigrationEvents))
 	s.mux.Handle("DELETE /api/v1/migrations/{id}", s.auth(s.handleDeleteMigration))
-	s.mux.Handle("POST /api/v1/migrations/{id}/assess", s.auth(s.handleAssessMigration))
 	s.mux.Handle("POST /api/v1/migrations/{id}/start", s.auth(s.handleStartMigration))
 	s.mux.Handle("POST /api/v1/migrations/{id}/stop", s.auth(s.handleStopMigration))
 	s.mux.Handle("POST /api/v1/diagnostics/connection", s.auth(s.handleConnTest))

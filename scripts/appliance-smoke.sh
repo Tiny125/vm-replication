@@ -113,12 +113,9 @@ echo "$V" | jq -e '.can_migrate==true' >/dev/null || { echo "FAIL: validations n
 echo "$V" | jq -e '.migration.state=="ready"' >/dev/null || { echo "FAIL: status should flip to 'ready' once safe, got: $(echo "$V" | jq -r '.migration.state')"; exit 1; }
 echo "   OK: all disks baselined, can_migrate=true, status shows ready"
 
-echo "== Cutover gated on assessment =="
-if api -X POST "$BASE/api/v1/migrations/$MID/start" -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1; then
-  echo "FAIL: cutover succeeded without assessment"; exit 1
-fi
-api -X POST "$BASE/api/v1/migrations/$MID/assess" | jq -e '.assessed==true' >/dev/null || { echo "FAIL: assessment did not pass"; exit 1; }
-echo "   OK: gated, then assessment successful"
+echo "== Cutover is auto-enabled once baselined (no manual assessment) =="
+echo "$V" | jq -e '.can_migrate==true' >/dev/null || { echo "FAIL: should be cutover-ready once baselined"; exit 1; }
+echo "   OK: can_migrate true without an assessment step"
 
 echo "== Cutover (file-fallback finalize) =="
 api -X POST "$BASE/api/v1/migrations/$MID/start" -H 'Content-Type: application/json' -d '{}' >/dev/null
