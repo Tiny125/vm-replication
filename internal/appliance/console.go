@@ -546,7 +546,7 @@ function migCard(v){
     b+='<div class="banner">✔ <b>Migration completed.</b> '+disks(m).length+' image volume(s) in your Linode account ('+
        '<a href="https://cloud.linode.com/volumes" target="_blank" rel="noopener">cloud.linode.com/volumes</a>): <code style="display:inline;padding:1px 5px">'+arts+'</code>. '+
        (m.launched_linode_id?('Launched Linode '+esc(m.launched_linode_id)+' — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a>.')
-       :'To launch: create a Linode (same region), attach these volumes (boot=sda, data=sdb…) and boot from GRUB 2.')+'</div>';
+       :'To launch manually: create a Linode (same region), attach these volumes (boot disk = <b>sda</b>, data = sdb…), add a config that boots from the volume, and start it. If it doesn’t boot, boot the Linode into <b>Rescue Mode</b> and run <code style="display:inline;padding:1px 5px">machine-convert.sh /dev/sda</code> against the boot volume.')+'</div>';
   }
 
   let checks='';for(const c of (v.validations||[]))checks+='<div style="font-size:13px;margin:2px 0"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>';
@@ -582,7 +582,12 @@ function migCard(v){
   }
 
   b+='<div class="actions">';
-  if(!['migrating','image_ready','launched'].includes(m.state)){
+  if(m.state==='failed' && allDone(m)){
+    // A cutover failed but the data is fully replicated — offer a retry that
+    // re-runs the cutover on the existing data (no re-replication needed).
+    b+='<button class="primary" onclick="startMig('+m.id+',this)">Retry cutover</button>'+
+      infoIcon('Re-runs the cutover on the data already replicated to this appliance. Use this after a cutover failure — no re-replication of the source is needed.');
+  }else if(!['migrating','image_ready','launched'].includes(m.state)){
     b+='<button onclick="assessMig('+m.id+',this)">Pre-cutover assessment</button>';
     if(v.assessed)b+='<span class="pill ok">✔ assessment passed</span>';
     // Always show the Cutover button for consistency; disable (with a reason)

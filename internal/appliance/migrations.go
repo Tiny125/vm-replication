@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/tiny125/vm-replication/internal/api"
@@ -327,13 +328,22 @@ func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view := s.view(ctx, m, "")
-	if !view.Assessed {
-		writeErr(w, http.StatusConflict, "run the pre-migration assessment first")
-		return
-	}
-	if !view.CanMigrate {
-		writeErr(w, http.StatusConflict, "validation checks not satisfied; see migration validations")
-		return
+	// Retry path: a previous cutover failed (e.g. machine-convert), but the data
+	// is already fully replicated to the appliance volume. Allow re-running the
+	// cutover on that existing data without re-passing the freshness gates (the
+	// source agent may be gone by now) as long as the boot disk is baselined.
+	retry := m.State == api.MigFailed && len(m.Disks) > 0 && m.Disks[0].FullSyncDone
+	if !retry {
+		if !view.Assessed {
+			writeErr(w, http.StatusConflict, "run the pre-migration assessment first")
+			return
+		}
+		if !view.CanMigrate {
+			writeErr(w, http.StatusConflict, "validation checks not satisfied; see migration validations")
+			return
+		}
+	} else {
+		_ = s.st.AddEvent(ctx, id, "info", "retrying cutover on the already-replicated data")
 	}
 	if err := s.st.SetMigrationState(ctx, id, api.MigMigrating, ""); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -447,7 +457,10 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	boot := m.Disks[0]
 	bootDevice := s.diskDevicePath(m, boot)
 
-	// 1) Make the boot disk bootable on Linode (virtio/GRUB/fstab/etc).
+	// 1) Make the boot disk bootable on Linode (virtio/GRUB/fstab/etc). This is
+	//    best-effort: if it fails we still clone the replicated data into an image
+	//    volume so the operator can attach it to a Linode and finish by hand,
+	//    rather than being stranded with a failed migration and no artifact.
 	if s.cfg.ConvertScript != "" && isBlockDevice(bootDevice) {
 		log.Printf("appliance: migration %d: machine conversion on boot disk %s", m.ID, bootDevice)
 		// machine-convert.sh requires bash (set -o pipefail, etc). Run it under
@@ -458,8 +471,10 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 			return
 		}
 		if err != nil {
-			s.fail(m.ID, fmt.Sprintf("machine-convert: %v: %s", err, trimOut(out)))
-			return
+			log.Printf("appliance: migration %d: machine-convert failed (continuing best-effort): %v\n%s", m.ID, err, trimOut(out))
+			_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion did not complete ("+oneLine(err.Error())+"); the image volume is still being created — it may need manual GRUB/virtio fixup before it boots (see docs/CUTOVER.md). Detail: "+oneLine(trimOut(out)))
+		} else {
+			_ = s.st.AddEvent(sctx, m.ID, "info", "boot disk converted for Linode (GRUB, virtio, network)")
 		}
 	} else {
 		log.Printf("appliance: migration %d: skipping machine-convert (no script or non-block device)", m.ID)
@@ -763,6 +778,17 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// oneLine collapses whitespace/newlines to single spaces and caps the length,
+// so multi-line command output fits cleanly into one activity-log entry.
+func oneLine(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	const max = 400
+	if len(s) > max {
+		s = s[:max] + "…"
+	}
+	return s
 }
 
 func humanBytes(n int64) string {
