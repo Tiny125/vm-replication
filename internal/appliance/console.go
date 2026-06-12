@@ -92,9 +92,9 @@ const consoleHTML = `<!DOCTYPE html>
  .resultbox{margin-top:8px;font-size:13px;border-radius:10px;padding:9px 12px;border:1px solid var(--border);background:var(--surface2)}
  .resultbox.ok{background:#f1faf4;border-color:#cde8d8;color:#0f5c30}
  .resultbox.bad{background:#fdeceb;border-color:#f0c9c7;color:#a3201c}
- .log{overflow:hidden;font-size:12.5px;font-family:"SF Mono",ui-monospace,Menlo,monospace;
+ .log{max-height:240px;overflow:auto;font-size:12.5px;font-family:"SF Mono",ui-monospace,Menlo,monospace;
    border:1px solid var(--border);border-radius:10px;background:var(--surface2);padding:6px 12px}
- .logbox{max-height:62vh;overflow-y:auto;overflow-x:hidden}
+ .logbox{max-height:62vh;overflow:auto}
  .mini{padding:3px 9px;font-size:12px;line-height:1.2}
  .info{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
    background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;font-weight:700;
@@ -105,10 +105,10 @@ const consoleHTML = `<!DOCTYPE html>
    width:max-content;max-width:280px;line-height:1.45;text-align:left;z-index:30;box-shadow:0 8px 24px rgba(0,0,0,.22)}
  .info:hover::before{content:"";position:absolute;left:50%;bottom:150%;transform:translateX(-50%) translateY(100%);
    border:5px solid transparent;border-top-color:#1d1d1f;z-index:30}
- .logrow{padding:5px 2px;border-bottom:1px solid var(--border);line-height:1.5;overflow-wrap:break-word}
+ .logrow{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}
  .logrow:last-child{border-bottom:none}
- .logrow .t{color:var(--muted);margin-right:8px;white-space:nowrap;font-variant-numeric:tabular-nums}
- .logrow.error{color:var(--red)} .logrow.warn{color:var(--amber)}
+ .logrow .t{color:var(--muted);white-space:nowrap}
+ .logrow.error .m{color:var(--red)} .logrow.warn .m{color:var(--amber)}
  .leg{position:relative;display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;
    border-radius:50%;background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;
    font-weight:700;font-style:normal;cursor:help;margin-left:6px;vertical-align:middle;flex:none}
@@ -492,15 +492,15 @@ async function checkStatus(id,btn){
 // (which rebuilds the cards) can restore the log without a flicker/refetch.
 const logCache={};
 function ensureLog(id){if(logCache[id]===undefined)loadLog(id,false)}
-// logRows renders events oldest→newest (latest at the bottom). With limit set,
+// logRows renders events newest-first (the original layout). With limit set,
 // only the latest N entries are shown (used inline; the modal shows all).
 function logRows(ev,limit){
-  let rows=(ev||[]).slice().reverse();
-  if(limit&&rows.length>limit)rows=rows.slice(rows.length-limit);
+  let rows=ev||[];
+  if(limit&&rows.length>limit)rows=rows.slice(0,limit);
   if(!rows.length)return '<div class="muted">No activity yet.</div>';
-  return rows.map(e=>'<div class="logrow '+esc(e.level)+'"><span class="t">'+fmtTime(e.at)+'</span>'+esc(e.message)+'</div>').join('');
+  return rows.map(e=>'<div class="logrow '+esc(e.level)+'"><span class="t">'+fmtTime(e.at)+'</span><span class="m">'+esc(e.message)+'</span></div>').join('');
 }
-// loadLog fetches the activity log into the inline box (latest 5 only, no scroll).
+// loadLog fetches the activity log into the inline box (latest 5, newest first).
 async function loadLog(id,doFlash){
   const box=$('log'+id);if(!box)return;
   if(doFlash)flash(box);
