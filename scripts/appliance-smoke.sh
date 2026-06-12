@@ -47,9 +47,17 @@ dd if=/dev/urandom of="$WORK/sda.img" bs=1M count=16 status=none
 dd if=/dev/urandom of="$WORK/sdb.img" bs=1M count=24 status=none
 SZA=$(stat -c %s "$WORK/sda.img"); SZB=$(stat -c %s "$WORK/sdb.img")
 
+echo "== Reject invalid source_ip =="
+if api -X POST "$BASE/api/v1/migrations" -H 'Content-Type: application/json' \
+  -d "{\"name\":\"badip\",\"source_ip\":\"1.2.3.4; rm -rf /\",\"devices\":[{\"device\":\"$WORK/sda.img\",\"size_bytes\":$SZA}]}" >/dev/null 2>&1; then
+  echo "FAIL: invalid source_ip accepted"; exit 1
+fi
+echo "   OK: invalid source_ip rejected"
+
 echo "== Create MULTI-DISK migration via console API =="
 MIG=$(api -X POST "$BASE/api/v1/migrations" -H 'Content-Type: application/json' \
-  -d "{\"name\":\"ec2-3disk\",\"source_hostname\":\"ec2\",\"devices\":[{\"device\":\"$WORK/sda.img\",\"size_bytes\":$SZA},{\"device\":\"$WORK/sdb.img\",\"size_bytes\":$SZB}]}")
+  -d "{\"name\":\"ec2-3disk\",\"source_hostname\":\"ec2\",\"source_ip\":\"127.0.0.1\",\"devices\":[{\"device\":\"$WORK/sda.img\",\"size_bytes\":$SZA},{\"device\":\"$WORK/sdb.img\",\"size_bytes\":$SZB}]}")
+echo "$MIG" | jq -e '.migration.source_ip=="127.0.0.1"' >/dev/null || { echo "FAIL: source_ip not stored/echoed"; exit 1; }
 MID=$(echo "$MIG" | jq -r '.migration.id')
 NDISKS=$(echo "$MIG" | jq -r '.migration.disks | length')
 PORT0=$(echo "$MIG" | jq -r '.migration.disks[0].receiver_port')

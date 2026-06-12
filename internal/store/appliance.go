@@ -166,14 +166,14 @@ func (s *Store) LinodeTokenSet(ctx context.Context) (bool, error) {
 // migCols selects only the migration-level fields; per-disk state lives in
 // migration_disks and is loaded separately. (The legacy single-disk columns on
 // the migrations table remain for older databases but are no longer read.)
-const migCols = `id, name, state, source_hostname, source_device, source_disk_size,
+const migCols = `id, name, state, source_hostname, source_ip, source_device, source_disk_size,
  image_id, launched_id, last_error, assessed_at, migrate_started, migrate_finished, created_at`
 
 func scanMigration(row interface{ Scan(...any) error }) (api.Migration, error) {
 	var m api.Migration
 	var state string
 	var assessed, migStart, migFinish, created int64
-	if err := row.Scan(&m.ID, &m.Name, &state, &m.SourceHostname, &m.SourceDevice, &m.SourceDiskSize,
+	if err := row.Scan(&m.ID, &m.Name, &state, &m.SourceHostname, &m.SourceIP, &m.SourceDevice, &m.SourceDiskSize,
 		&m.ImageID, &m.LaunchedID, &m.LastError, &assessed, &migStart, &migFinish, &created); err != nil {
 		return api.Migration{}, err
 	}
@@ -210,9 +210,9 @@ func (s *Store) CreateMigration(ctx context.Context, r api.CreateMigrationReques
 	}
 	now := time.Now()
 	res, err := s.db.ExecContext(ctx, `
-INSERT INTO migrations (name, state, source_hostname, source_device, source_disk_size, enroll_token, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		r.Name, string(api.MigCreated), r.SourceHostname, devices[0].Device, devices[0].SizeBytes, token, unix(now))
+INSERT INTO migrations (name, state, source_hostname, source_ip, source_device, source_disk_size, enroll_token, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.Name, string(api.MigCreated), r.SourceHostname, r.SourceIP, devices[0].Device, devices[0].SizeBytes, token, unix(now))
 	if err != nil {
 		return api.Migration{}, "", err
 	}

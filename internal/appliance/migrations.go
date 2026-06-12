@@ -155,6 +155,11 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "at most 8 disks per migration (Linode device slots sda–sdh)")
 		return
 	}
+	req.SourceIP = strings.TrimSpace(req.SourceIP)
+	if req.SourceIP != "" && !validHost(req.SourceIP) {
+		writeErr(w, http.StatusBadRequest, "source IP is not a valid IP address or hostname")
+		return
+	}
 	req.Devices = devices
 
 	ctx := r.Context()

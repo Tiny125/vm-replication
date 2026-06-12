@@ -204,8 +204,9 @@ type Migration struct {
 
 	// Source details entered in the console.
 	SourceHostname string `json:"source_hostname"`
-	SourceDevice   string `json:"source_device"`    // boot disk (mirror of Disks[0])
-	SourceDiskSize int64  `json:"source_disk_size"` // boot disk size (bytes)
+	SourceIP       string `json:"source_ip,omitempty"` // verified reachable IP/host
+	SourceDevice   string `json:"source_device"`       // boot disk (mirror of Disks[0])
+	SourceDiskSize int64  `json:"source_disk_size"`    // boot disk size (bytes)
 
 	// Disks (boot first). Authoritative per-disk state.
 	Disks []Disk `json:"disks"`
@@ -236,6 +237,7 @@ type DeviceSpec struct {
 type CreateMigrationRequest struct {
 	Name           string       `json:"name"`
 	SourceHostname string       `json:"source_hostname"`
+	SourceIP       string       `json:"source_ip,omitempty"`
 	Devices        []DeviceSpec `json:"devices"`
 	SourceDevice   string       `json:"source_device,omitempty"`
 	SourceDiskSize int64        `json:"source_disk_size,omitempty"`
