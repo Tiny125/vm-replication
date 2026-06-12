@@ -92,9 +92,9 @@ const consoleHTML = `<!DOCTYPE html>
  .resultbox{margin-top:8px;font-size:13px;border-radius:10px;padding:9px 12px;border:1px solid var(--border);background:var(--surface2)}
  .resultbox.ok{background:#f1faf4;border-color:#cde8d8;color:#0f5c30}
  .resultbox.bad{background:#fdeceb;border-color:#f0c9c7;color:#a3201c}
- .log{max-height:200px;overflow-y:auto;overflow-x:hidden;font-size:12.5px;
-   font-family:"SF Mono",ui-monospace,Menlo,monospace;border:1px solid var(--border);border-radius:10px;
-   background:var(--surface2);padding:8px 12px}
+ .log{overflow:hidden;font-size:12.5px;font-family:"SF Mono",ui-monospace,Menlo,monospace;
+   border:1px solid var(--border);border-radius:10px;background:var(--surface2);padding:6px 12px}
+ .logbox{max-height:62vh;overflow-y:auto;overflow-x:hidden}
  .mini{padding:3px 9px;font-size:12px;line-height:1.2}
  .info{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
    background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;font-weight:700;
@@ -105,21 +105,20 @@ const consoleHTML = `<!DOCTYPE html>
    width:max-content;max-width:280px;line-height:1.45;text-align:left;z-index:30;box-shadow:0 8px 24px rgba(0,0,0,.22)}
  .info:hover::before{content:"";position:absolute;left:50%;bottom:150%;transform:translateX(-50%) translateY(100%);
    border:5px solid transparent;border-top-color:#1d1d1f;z-index:30}
- .logrow{padding:5px 2px;border-bottom:1px solid var(--border);line-height:1.5}
+ .logrow{padding:5px 2px;border-bottom:1px solid var(--border);line-height:1.5;overflow-wrap:break-word}
  .logrow:last-child{border-bottom:none}
- .logrow .t{display:inline-block;min-width:62px;margin-right:8px;color:var(--muted);
-   white-space:nowrap;font-variant-numeric:tabular-nums;vertical-align:top}
- .logrow .m{overflow-wrap:anywhere}
- .logrow.error .m{color:var(--red)} .logrow.warn .m{color:var(--amber)}
+ .logrow .t{color:var(--muted);margin-right:8px;white-space:nowrap;font-variant-numeric:tabular-nums}
+ .logrow.error{color:var(--red)} .logrow.warn{color:var(--amber)}
  .leg{position:relative;display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;
    border-radius:50%;background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;
    font-weight:700;font-style:normal;cursor:help;margin-left:6px;vertical-align:middle;flex:none}
  .leg:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
  .legbox{display:none;position:absolute;top:150%;left:50%;transform:translateX(-50%);z-index:40;
    background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.2);
-   padding:12px 14px;width:max-content;max-width:340px;text-transform:none;letter-spacing:normal;font-weight:400}
+   padding:12px 14px;width:300px;text-transform:none;letter-spacing:normal;font-weight:400}
  .leg:hover .legbox{display:block}
- .legrow{display:flex;align-items:center;gap:8px;margin:5px 0;font-size:12.5px;color:var(--text);white-space:nowrap}
+ .legrow{display:flex;align-items:flex-start;gap:8px;margin:6px 0;font-size:12.5px;color:var(--text);white-space:normal;line-height:1.35}
+ .legrow .pill{flex:none}
  .legrow .desc{color:var(--muted)}
  .modal.wide{max-width:760px}
  .flash{animation:flash .8s ease}
@@ -489,30 +488,31 @@ async function checkStatus(id,btn){
   }catch(e){const box=$('status'+id);if(box){box.className='resultbox bad';box.textContent='Error: '+e.message}}
   finally{busy(btn,false)}
 }
-// Cache rendered activity-log HTML + scroll position per migration so the 5s
-// auto-poll (which rebuilds the cards) can restore the log without refetching
-// or yanking the user back to the bottom while they read history.
+// Cache rendered (latest-5) activity-log HTML per migration so the 5s auto-poll
+// (which rebuilds the cards) can restore the log without a flicker/refetch.
 const logCache={};
 function ensureLog(id){if(logCache[id]===undefined)loadLog(id,false)}
-// logRows renders events oldest→newest as block rows (timestamp + message).
-function logRows(ev){
-  const rows=(ev||[]).slice().reverse();
-  return rows.length?rows.map(e=>'<div class="logrow '+esc(e.level)+'"><span class="t">'+fmtTime(e.at)+'</span><span class="m">'+esc(e.message)+'</span></div>').join(''):'<div class="muted">No activity yet.</div>';
+// logRows renders events oldest→newest (latest at the bottom). With limit set,
+// only the latest N entries are shown (used inline; the modal shows all).
+function logRows(ev,limit){
+  let rows=(ev||[]).slice().reverse();
+  if(limit&&rows.length>limit)rows=rows.slice(rows.length-limit);
+  if(!rows.length)return '<div class="muted">No activity yet.</div>';
+  return rows.map(e=>'<div class="logrow '+esc(e.level)+'"><span class="t">'+fmtTime(e.at)+'</span>'+esc(e.message)+'</div>').join('');
 }
-// loadLog fetches the activity log into the inline box (latest at the bottom).
+// loadLog fetches the activity log into the inline box (latest 5 only, no scroll).
 async function loadLog(id,doFlash){
   const box=$('log'+id);if(!box)return;
   if(doFlash)flash(box);
   try{const ev=await api('GET','/api/v1/migrations/'+id+'/events');
-    box.innerHTML=logRows(ev);
-    box.scrollTop=box.scrollHeight;
-    logCache[id]={html:box.innerHTML,scroll:box.scrollTop};
+    box.innerHTML=logRows(ev,5);
+    logCache[id]={html:box.innerHTML};
   }catch(e){box.innerHTML='<div class="err">'+esc(e.message)+'</div>'}
 }
-// showLogModal opens the full activity log in a large, easy-to-read modal.
+// showLogModal opens the FULL activity log in a large, scrollable modal.
 async function showLogModal(id){
   let body='<div class="muted">loading…</div>';
-  try{const ev=await api('GET','/api/v1/migrations/'+id+'/events');body='<div class="log" style="max-height:62vh">'+logRows(ev)+'</div>';}
+  try{const ev=await api('GET','/api/v1/migrations/'+id+'/events');body='<div class="log logbox">'+logRows(ev)+'</div>';}
   catch(e){body='<div class="err">'+esc(e.message)+'</div>';}
   uiDialog({title:'Activity log — migration #'+id,html:body,wide:true,cancel:false,okText:'Close'});
 }
@@ -629,7 +629,7 @@ function migCard(v){
     b+='<div class="banner">✔ <b>Migration completed.</b> '+disks(m).length+' image volume(s) in your Linode account ('+
        '<a href="https://cloud.linode.com/volumes" target="_blank" rel="noopener">cloud.linode.com/volumes</a>): <code style="display:inline;padding:1px 5px">'+arts+'</code>. '+
        (m.launched_linode_id?('Launched Linode '+esc(m.launched_linode_id)+' — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a>.')
-       :'To launch manually: create a Linode (same region), attach these volumes (boot disk = <b>sda</b>, data = sdb…), add a config that boots from the volume, and start it. If it doesn’t boot, boot the Linode into <b>Rescue Mode</b> and run <code style="display:inline;padding:1px 5px">machine-convert.sh /dev/sda</code> against the boot volume.')+'</div>';
+       :'To launch manually: create a Linode (same region), attach these volumes (boot disk = <b>sda</b>, data = sdb…), then add a config. If the boot disk has a <b>partition table + GRUB</b>, use kernel <code style="display:inline;padding:1px 5px">GRUB 2</code>; if it is a <b>partitionless whole-disk filesystem</b>, use a <b>Linode kernel</b> (e.g. “Latest 64-bit”) with root <code style="display:inline;padding:1px 5px">/dev/sda</code>. Then boot. The “Cutover” launch option picks the right kernel for you automatically.')+'</div>';
   }
 
   let checks='';for(const c of (v.validations||[]))checks+='<div style="font-size:13px;margin:2px 0"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>';
@@ -638,10 +638,10 @@ function migCard(v){
   b+='<details><summary>Disks ('+disks(m).length+')</summary><div>'+diskTable(m)+'</div></details>';
   const cachedLog=logCache[m.id];
   b+='<details ontoggle="if(this.open)ensureLog('+m.id+')"><summary>Activity log</summary><div>'+
-     '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="muted" style="font-size:12px;flex:1">Newest entries at the bottom · scroll up for history</span>'+
+     '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="muted" style="font-size:12px;flex:1">Latest 5 entries — click Expand for the full history</span>'+
      '<button class="mini" onclick="showLogModal('+m.id+')" title="Open full log">⤢ Expand</button>'+
      '<button class="mini" onclick="loadLog('+m.id+',true)" title="Refresh log">↻ Refresh</button></div>'+
-     '<div id="log'+m.id+'" class="log" onscroll="if(logCache['+m.id+'])logCache['+m.id+'].scroll=this.scrollTop">'+
+     '<div id="log'+m.id+'" class="log">'+
      (cachedLog?cachedLog.html:'<div class="muted">loading…</div>')+'</div></div></details>';
 
   if(v.enroll_cmd && !allDone(m) && m.state!=='migrating'){
@@ -695,7 +695,6 @@ function replaceCard(id,v){
   const card=migCard(v);
   if(old)old.replaceWith(card);
   card.querySelectorAll('details').forEach(d=>{if(open.has(d.querySelector('summary').textContent))d.open=true});
-  const lb=card.querySelector('.log');if(lb&&logCache[id])lb.scrollTop=logCache[id].scroll;
   return card;
 }
 // refreshMig re-fetches and re-renders ONLY this migration's card.
@@ -724,8 +723,6 @@ async function refresh(animate){
     // cleanup hasn't been dismissed yet (they're no longer in the list).
     Object.keys(pendingCleanup).forEach(id=>{if(!$('mig'+id)){const cc=cleanupCard(id);if(cc)migs.appendChild(cc);}});
     if(!migs.children.length){migs.innerHTML='<div class="muted" style="padding:8px">No migrations yet. Create one above.</div>';}
-    // Restore each cached activity-log scroll position so polling doesn't yank the view.
-    Object.keys(logCache).forEach(id=>{const b=$('log'+id);if(b&&logCache[id])b.scrollTop=logCache[id].scroll});
     if(animate)flash(migs);
     $('updated').textContent='updated '+new Date().toLocaleTimeString();
     loadSettings();

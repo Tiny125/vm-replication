@@ -170,14 +170,17 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Assign a unique receiver port per disk and provision a volume per disk.
+	// If anything fails, roll the whole thing back (delete any volumes created
+	// and the migration row) so a failed create never leaves a stray migration.
 	for _, d := range m.Disks {
 		port := s.cfg.BaseReceiverPort + int(d.ID)
 		if err := s.st.AssignDiskPort(ctx, d.ID, port); err != nil {
+			s.rollbackCreate(ctx, m.ID)
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		if err := s.provisionDiskStorage(ctx, m, d); err != nil {
-			_ = s.st.SetMigrationState(ctx, m.ID, api.MigFailed, "provision storage: "+err.Error())
+			s.rollbackCreate(ctx, m.ID)
 			writeErr(w, http.StatusInternalServerError, "provision storage: "+err.Error())
 			return
 		}
@@ -207,28 +210,27 @@ func (s *Server) provisionDiskStorage(ctx context.Context, m api.Migration, d ap
 	if sizeGiB < 10 {
 		sizeGiB = 10 // Linode minimum volume size
 	}
-	label := volumeLabel(m.Name, d.Index, len(m.Disks))
+	label := volumeLabel(m.Name, d.ID)
 	vol, err := cl.CreateVolume(ctx, label, s.cfg.Region, sizeGiB, s.cfg.ApplianceLinodeID)
 	if err != nil {
 		return err
 	}
-	if _, err := cl.WaitVolumeActive(ctx, vol.ID, 3*time.Minute); err != nil {
-		return err
-	}
+	// Record the volume id immediately (before waiting for it to become active)
+	// so that a later failure still lets the rollback / delete path remove it.
 	device := vol.FilesystemPath
 	if device == "" {
 		device = "/dev/disk/by-id/scsi-0Linode_Volume_" + label
 	}
-	if err := s.st.SetDiskVolume(ctx, d.ID, vol.ID, device); err != nil {
+	_ = s.st.SetDiskVolume(ctx, d.ID, vol.ID, device)
+	if _, err := cl.WaitVolumeActive(ctx, vol.ID, 3*time.Minute); err != nil {
 		return err
 	}
 	_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("disk %d (%s): provisioned %dGiB volume %q (id %d)", d.Index, d.SourceDevice, sizeGiB, label, vol.ID))
 	return nil
 }
 
-// volumeLabel builds a Linode-safe volume label "vmrep-<name>" (with a disk
-// suffix for multi-disk). Linode labels are 1–32 chars, [A-Za-z0-9_-].
-func volumeLabel(name string, idx, total int) string {
+// sanitizeLabel keeps only Linode-safe label characters [A-Za-z0-9_-].
+func sanitizeLabel(name string) string {
 	clean := make([]rune, 0, len(name))
 	for _, r := range name {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
@@ -237,16 +239,37 @@ func volumeLabel(name string, idx, total int) string {
 			clean = append(clean, '-')
 		}
 	}
-	base := "vmrep-" + string(clean)
-	suffix := ""
-	if total > 1 {
-		suffix = fmt.Sprintf("-d%d", idx)
+	return string(clean)
+}
+
+// volumeLabel builds a UNIQUE Linode-safe replication-volume label
+// "vmrep-<name>-<diskID>". The disk id guarantees uniqueness across migrations
+// (and against orphaned volumes from a deleted migration of the same name),
+// avoiding "Label must be unique". Linode labels are 1–32 chars.
+func volumeLabel(name string, diskID int64) string {
+	return fitLabel("vmrep-", sanitizeLabel(name), fmt.Sprintf("-%d", diskID))
+}
+
+// imageLabel builds a unique label for a cloned artifact volume. It includes a
+// short random component so re-running a cutover (which clones again) never
+// collides with a clone from a previous attempt.
+func imageLabel(name string, diskID int64) string {
+	// diskID makes it unique per disk; the time byte makes a re-run's clone
+	// distinct from a previous attempt's leftover.
+	return fitLabel("vmrp-", sanitizeLabel(name), fmt.Sprintf("-i%d-%02x", diskID, time.Now().UnixNano()&0xff))
+}
+
+// fitLabel assembles prefix+middle+suffix within Linode's 32-char limit,
+// truncating only the middle (name) part.
+func fitLabel(prefix, middle, suffix string) string {
+	room := 32 - len(prefix) - len(suffix)
+	if room < 0 {
+		room = 0
 	}
-	max := 32 - len(suffix)
-	if len(base) > max {
-		base = base[:max]
+	if len(middle) > room {
+		middle = middle[:room]
 	}
-	return base + suffix
+	return prefix + middle + suffix
 }
 
 func (s *Server) handleListMigrations(w http.ResponseWriter, r *http.Request) {
@@ -411,10 +434,32 @@ func (s *Server) handleDeleteMigration(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not found")
 		return
 	}
+	s.cleanupMigrationResources(ctx, m)
+	if err := s.st.DeleteMigration(ctx, id); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// rollbackCreate undoes a failed migration creation: it re-loads the migration
+// (to pick up any volume ids recorded so far), deletes those resources, and
+// removes the migration row so nothing lingers in the console.
+func (s *Server) rollbackCreate(ctx context.Context, id int64) {
+	if m, err := s.st.Migration(ctx, id); err == nil {
+		s.cleanupMigrationResources(ctx, m)
+	}
+	_ = s.st.DeleteMigration(ctx, id)
+}
+
+// cleanupMigrationResources stops a migration's receivers/finalize and removes
+// its replication volumes (or file-fallback images) and manifests. It does NOT
+// delete the migration row — the caller decides that. Safe to call repeatedly.
+func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration) {
 	s.recMu.Lock()
-	if cancel := s.finalizes[id]; cancel != nil {
+	if cancel := s.finalizes[m.ID]; cancel != nil {
 		cancel()
-		delete(s.finalizes, id)
+		delete(s.finalizes, m.ID)
 	}
 	s.recMu.Unlock()
 	s.stopReceivers(m)
@@ -439,12 +484,6 @@ func (s *Server) handleDeleteMigration(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = os.Remove(s.diskManifestPath(m, d))
 	}
-
-	if err := s.st.DeleteMigration(ctx, id); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // finalize converts the boot disk to boot on Linode, clones every disk's volume
@@ -466,6 +505,10 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	//    best-effort: if it fails we still clone the replicated data into an image
 	//    volume so the operator can attach it to a Linode and finish by hand,
 	//    rather than being stranded with a failed migration and no artifact.
+	//    kernel/rootDevice default to the GRUB2 path; the convert script tells us
+	//    (via "vmrepl-layout:") when the disk is a partitionless whole-disk root,
+	//    which must boot via a Linode-supplied kernel instead.
+	kernel, rootDevice := "linode/grub2", "/dev/sda"
 	if s.cfg.ConvertScript != "" && isBlockDevice(bootDevice) {
 		log.Printf("appliance: migration %d: machine conversion on boot disk %s", m.ID, bootDevice)
 		// machine-convert.sh requires bash (set -o pipefail, etc). Run it under
@@ -475,11 +518,16 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		if canceled() {
 			return
 		}
+		if strings.Contains(string(out), "vmrepl-layout: wholedisk") {
+			// Partitionless filesystem: no on-disk bootloader, so boot with a
+			// Linode kernel that mounts the whole volume as root.
+			kernel, rootDevice = "linode/latest-64bit", "/dev/sda"
+		}
 		if err != nil {
 			log.Printf("appliance: migration %d: machine-convert failed (continuing best-effort): %v\n%s", m.ID, err, trimOut(out))
 			_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion did not complete ("+oneLine(err.Error())+"); the image volume is still being created — it may need manual GRUB/virtio fixup before it boots (see docs/CUTOVER.md). Detail: "+oneLine(trimOut(out)))
 		} else {
-			_ = s.st.AddEvent(sctx, m.ID, "info", "boot disk converted for Linode (GRUB, virtio, network)")
+			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("boot disk converted for Linode (virtio, network); boot kernel %s root %s", kernel, rootDevice))
 		}
 	} else {
 		log.Printf("appliance: migration %d: skipping machine-convert (no script or non-block device)", m.ID)
@@ -498,10 +546,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	// 2) Clone every disk's volume into an immutable artifact, in disk order.
 	cloneIDs := make([]int64, len(m.Disks))
 	for i, d := range m.Disks {
-		label := volumeLabel(m.Name, d.Index, len(m.Disks)) + "-img"
-		if len(label) > 32 {
-			label = label[:32]
-		}
+		label := imageLabel(m.Name, d.ID)
 		log.Printf("appliance: migration %d: cloning disk %d volume %d -> %s", m.ID, d.Index, d.VolumeID, label)
 		clone, err := cl.CloneVolume(ctx, d.VolumeID, label)
 		if canceled() {
@@ -554,7 +599,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 				return
 			}
 		}
-		cfgID, err := cl.CreateConfigBootingVolumes(ctx, inst.ID, cloneIDs, "boot-migrated")
+		cfgID, err := cl.CreateConfigBootingVolumes(ctx, inst.ID, cloneIDs, "boot-migrated", kernel, rootDevice)
 		if err != nil {
 			if canceled() {
 				return
