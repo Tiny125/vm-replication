@@ -19,6 +19,7 @@ set -euo pipefail
 
 DEV="${1:-/dev/sda}"
 MNT="$(mktemp -d)"
+KPARTX_USED=0
 log() { echo ">> $*"; }
 cleanup() {
   for m in dev/pts dev proc sys run; do
@@ -26,27 +27,60 @@ cleanup() {
   done
   mountpoint -q "$MNT" && umount -l "$MNT" 2>/dev/null || true
   rmdir "$MNT" 2>/dev/null || true
+  [ "$KPARTX_USED" = 1 ] && kpartx -d "$DEV" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 [ "$(id -u)" -eq 0 ] || { echo "must run as root"; exit 1; }
+# Resolve a /dev/disk/by-id/... symlink (how Linode volumes attach) to the
+# canonical device so partition re-read and node names are predictable.
+DEV="$(readlink -f "$DEV" 2>/dev/null || echo "$DEV")"
 [ -b "$DEV" ] || { echo "$DEV is not a block device"; exit 1; }
 
+# The data arrived as a raw block stream, so the kernel's cached partition table
+# for this device is stale. Force a re-read through every mechanism available,
+# then let udev settle so the partition nodes + fs metadata appear.
 log "Re-reading partition table on $DEV"
 partprobe "$DEV" 2>/dev/null || true
+blockdev --rereadpt "$DEV" 2>/dev/null || true
+partx -u "$DEV" 2>/dev/null || true
+command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=15 2>/dev/null || true
 sleep 1
 
-# Find the root partition: largest ext4/xfs/btrfs partition with /etc/fstab.
+# Enumerate child partitions. We do NOT pre-filter by filesystem type — udev may
+# not have probed it yet — and instead probe each by trying to mount it.
+list_parts() { lsblk -lnpo NAME,TYPE "$DEV" 2>/dev/null | awk '$2=="part"{print $1}'; }
+mapfile -t PARTS < <(list_parts)
+
+# If the kernel still won't expose partition nodes (device busy, GPT backup
+# mismatch after writing a smaller image onto a larger volume), map them with
+# kpartx via device-mapper as a fallback.
+if [ "${#PARTS[@]}" -eq 0 ] && command -v kpartx >/dev/null 2>&1; then
+  log "No kernel partition nodes; mapping with kpartx"
+  kpartx -as "$DEV" 2>/dev/null || true
+  KPARTX_USED=1
+  sleep 1
+  base="$(basename "$DEV")"
+  mapfile -t PARTS < <(ls /dev/mapper/"${base}"* 2>/dev/null || true)
+fi
+
+# Find the root partition: the one carrying /etc/fstab and a real root tree.
 ROOT_PART=""
-mapfile -t PARTS < <(lsblk -lnpo NAME,FSTYPE "$DEV" | awk '$2 ~ /ext4|ext3|xfs|btrfs/ {print $1}')
 for p in "${PARTS[@]}"; do
+  [ -b "$p" ] || continue
   umount "$MNT" 2>/dev/null || true
-  if mount -o ro "$p" "$MNT" 2>/dev/null && [ -f "$MNT/etc/fstab" ] && [ -d "$MNT/boot" ]; then
-    ROOT_PART="$p"; umount "$MNT"; break
+  if mount -o ro "$p" "$MNT" 2>/dev/null; then
+    if [ -f "$MNT/etc/fstab" ] && { [ -d "$MNT/sbin" ] || [ -L "$MNT/sbin" ] || [ -d "$MNT/bin" ] || [ -L "$MNT/bin" ]; }; then
+      ROOT_PART="$p"; umount "$MNT" 2>/dev/null || true; break
+    fi
+    umount "$MNT" 2>/dev/null || true
   fi
-  umount "$MNT" 2>/dev/null || true
 done
-[ -n "$ROOT_PART" ] || { echo "could not locate a root partition with /etc/fstab on $DEV"; exit 1; }
+if [ -z "$ROOT_PART" ]; then
+  echo "could not locate a root partition with /etc/fstab on $DEV (partitions found: ${PARTS[*]:-none})"
+  lsblk -po NAME,TYPE,FSTYPE,SIZE "$DEV" 2>/dev/null || true
+  exit 1
+fi
 log "Root partition: $ROOT_PART"
 
 log "Mounting root and binding kernel filesystems"
