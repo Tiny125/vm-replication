@@ -716,6 +716,15 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 		v.EnrollCmd = s.enrollCmd(token, m)
 	}
 	v.UninstallCmd = s.uninstallCmd()
+
+	// Reflect readiness in the displayed status so the operator can see at a
+	// glance when it's safe to cut over: a replicating migration whose disks are
+	// all baselined and within the RPO lag shows as "ready to cut over". This is
+	// presentational and recomputed on every poll, so if lag grows again it
+	// reverts to "replicating" automatically.
+	if v.CanMigrate && (m.State == api.MigReplicating || m.State == api.MigAwaitingAgent) {
+		v.Migration.State = api.MigReady
+	}
 	return v
 }
 

@@ -110,7 +110,8 @@ echo "== Check aggregate validations =="
 V=$(api "$BASE/api/v1/migrations/$MID")
 echo "$V" | jq -e '.migration.disks | all(.full_sync_done)' >/dev/null || { echo "FAIL: not all disks baselined"; exit 1; }
 echo "$V" | jq -e '.can_migrate==true' >/dev/null || { echo "FAIL: validations not satisfied: $(echo "$V" | jq -c '.validations')"; exit 1; }
-echo "   OK: all disks baselined, can_migrate=true"
+echo "$V" | jq -e '.migration.state=="ready"' >/dev/null || { echo "FAIL: status should flip to 'ready' once safe, got: $(echo "$V" | jq -r '.migration.state')"; exit 1; }
+echo "   OK: all disks baselined, can_migrate=true, status shows ready"
 
 echo "== Cutover gated on assessment =="
 if api -X POST "$BASE/api/v1/migrations/$MID/start" -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1; then
