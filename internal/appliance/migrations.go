@@ -203,13 +203,14 @@ func (s *Server) provisionDiskStorage(ctx context.Context, m api.Migration, d ap
 	if !ok || s.cfg.ApplianceLinodeID == 0 {
 		return nil // file fallback
 	}
-	// Size the volume with headroom so the agent's exact device size (in bytes)
-	// is always <= the volume, regardless of GB/GiB rounding. We round the source
-	// up to whole GiB and add 1 GiB of slack; the receiver requires the target be
-	// at least the source size, so undersizing would reject the session.
-	sizeGiB := int((d.SizeBytes+(1<<30)-1)/(1<<30)) + 1
-	if sizeGiB < 10 {
-		sizeGiB = 10 // Linode minimum volume size
+	// Size the volume to exactly the entered size, rounded up to whole GiB. The
+	// console form computes size_bytes as <GB input> * 2^30, so this matches the
+	// operator's input 1:1; the receiver only requires target >= source, and an
+	// equal-size volume satisfies that. Sizes of 1–19 GiB are bumped to 20 GiB
+	// (small-volume floor; Linode's own minimum is 10).
+	sizeGiB := int((d.SizeBytes + (1 << 30) - 1) / (1 << 30))
+	if sizeGiB < 20 {
+		sizeGiB = 20
 	}
 	label := volumeLabel(m.Name, d.ID)
 	vol, err := cl.CreateVolume(ctx, label, s.cfg.Region, sizeGiB, s.cfg.ApplianceLinodeID)
@@ -811,10 +812,12 @@ func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCh
 
 	diskWord := func(k int) string { return fmt.Sprintf("%d/%d disks", k, n) }
 	return []api.ValidationCheck{
-		{Name: "Storage provisioned", OK: allStorage, Detail: diskWord(storageOK) + " ready"},
-		{Name: "Agent connected", OK: allAgents, Detail: diskWord(agentsSeen) + " checked in"},
-		{Name: "Initial full sync complete", OK: allFull, Detail: diskWord(fullDone) + " baselined"},
-		{Name: fmt.Sprintf("Replication lag within %ds", s.cfg.RPOTargetSec), OK: lagOK, Detail: lagDetail2(anySync, rpoSec)},
+		// Pre-migration: environment/connectivity readiness while replicating.
+		{Name: "Storage provisioned", OK: allStorage, Detail: diskWord(storageOK) + " ready", Group: "pre"},
+		{Name: "Agent connected", OK: allAgents, Detail: diskWord(agentsSeen) + " checked in", Group: "pre"},
+		{Name: fmt.Sprintf("Replication lag within %ds", s.cfg.RPOTargetSec), OK: lagOK, Detail: lagDetail2(anySync, rpoSec), Group: "pre"},
+		// Migration: the gate that actually allows cutover.
+		{Name: "Initial full sync complete", OK: allFull, Detail: diskWord(fullDone) + " baselined", Group: "migration"},
 	}
 }
 

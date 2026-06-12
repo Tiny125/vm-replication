@@ -248,6 +248,7 @@ type ValidationCheck struct {
 	Name   string `json:"name"`
 	OK     bool   `json:"ok"`
 	Detail string `json:"detail"`
+	Group  string `json:"group,omitempty"` // "pre" (pre-migration) | "migration"
 }
 
 // MigrationView is a migration plus its computed validation checks and the
