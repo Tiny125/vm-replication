@@ -123,6 +123,12 @@ func (c *Client) GetInstance(ctx context.Context, id int64) (Instance, error) {
 	return inst, err
 }
 
+// DeleteInstance permanently deletes a Linode instance (used to clean up a
+// previous cutover attempt before retrying, and on migration delete).
+func (c *Client) DeleteInstance(ctx context.Context, id int64) error {
+	return c.do(ctx, http.MethodDelete, fmt.Sprintf("/linode/instances/%d", id), nil, nil)
+}
+
 // CloneVolume clones a volume into a new immutable volume (the migration's
 // "snapshot" artifact) and returns it.
 func (c *Client) CloneVolume(ctx context.Context, volumeID int64, label string) (Volume, error) {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -250,15 +251,6 @@ func volumeLabel(name string, diskID int64) string {
 	return fitLabel("vmrep-", sanitizeLabel(name), fmt.Sprintf("-%d", diskID))
 }
 
-// imageLabel builds a unique label for a cloned artifact volume. It includes a
-// short random component so re-running a cutover (which clones again) never
-// collides with a clone from a previous attempt.
-func imageLabel(name string, diskID int64) string {
-	// diskID makes it unique per disk; the time byte makes a re-run's clone
-	// distinct from a previous attempt's leftover.
-	return fitLabel("vmrp-", sanitizeLabel(name), fmt.Sprintf("-i%d-%02x", diskID, time.Now().UnixNano()&0xff))
-}
-
 // fitLabel assembles prefix+middle+suffix within Linode's 32-char limit,
 // truncating only the middle (name) part.
 func fitLabel(prefix, middle, suffix string) string {
@@ -317,28 +309,6 @@ func (s *Server) handleMigrationEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, events)
 }
 
-// handleAssessMigration runs the pre-migration assessment: re-evaluates all
-// validation checks and records a pass (gating the Cutover button).
-func (s *Server) handleAssessMigration(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
-	}
-	ctx := r.Context()
-	m, err := s.st.Migration(ctx, id)
-	if err != nil {
-		writeErr(w, http.StatusNotFound, "not found")
-		return
-	}
-	view := s.view(ctx, m, "")
-	if err := s.st.SetAssessed(ctx, id, allOK(view.Validations)); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	m, _ = s.st.Migration(ctx, id)
-	writeJSON(w, http.StatusOK, s.view(ctx, m, ""))
-}
-
 // handleStartMigration cuts over: it stops replication and runs finalize
 // (convert + clone every disk + optional launch). The console labels this
 // "Cutover instance".
@@ -355,22 +325,14 @@ func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not found")
 		return
 	}
-	view := s.view(ctx, m, "")
-	// Retry path: a previous cutover failed (e.g. machine-convert), but the data
-	// is already fully replicated to the appliance volume. Allow re-running the
-	// cutover on that existing data without re-passing the freshness gates (the
-	// source agent may be gone by now) as long as the boot disk is baselined.
-	retry := m.State == api.MigFailed && len(m.Disks) > 0 && m.Disks[0].FullSyncDone
-	if !retry {
-		if !view.Assessed {
-			writeErr(w, http.StatusConflict, "run the pre-migration assessment first")
-			return
-		}
-		if !view.CanMigrate {
-			writeErr(w, http.StatusConflict, "validation checks not satisfied; see migration validations")
-			return
-		}
-	} else {
+	// Readiness is auto-computed: cutover is allowed once every disk's initial
+	// full sync is complete. No manual assessment, and the live agent/lag don't
+	// gate it (so a previously-failed cutover can be retried).
+	if !cutoverReady(m) {
+		writeErr(w, http.StatusConflict, "the initial full sync must finish on all disks before cutover")
+		return
+	}
+	if m.State == api.MigFailed {
 		_ = s.st.AddEvent(ctx, id, "info", "retrying cutover on the already-replicated data")
 	}
 	if err := s.st.SetMigrationState(ctx, id, api.MigMigrating, ""); err != nil {
@@ -465,8 +427,26 @@ func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration)
 	s.stopReceivers(m)
 
 	cl, haveLinode := s.linodeClient(ctx)
+	// Also remove anything created by a cutover: the launched instance and the
+	// cloned <name>-cutover artifact volumes.
+	if haveLinode && m.LaunchedID != 0 {
+		if err := cl.DeleteInstance(ctx, m.LaunchedID); err != nil {
+			log.Printf("appliance: delete cutover Linode %d failed (remove it in Cloud Manager): %v", m.LaunchedID, err)
+		}
+	}
 	for _, d := range m.Disks {
 		s.progress.Delete(d.ID)
+		if haveLinode {
+			if avid := artifactVolumeID(d.ArtifactID); avid != 0 {
+				_ = cl.DetachVolume(ctx, avid)
+				for i := 0; i < 10; i++ {
+					if cl.DeleteVolume(ctx, avid) == nil {
+						break
+					}
+					time.Sleep(2 * time.Second)
+				}
+			}
+		}
 		if d.VolumeID != 0 && haveLinode {
 			_ = cl.DetachVolume(ctx, d.VolumeID)
 			var derr error
@@ -543,17 +523,21 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 
 	_ = s.st.AddEvent(sctx, m.ID, "info", "cutover started: converting boot disk and cloning volumes")
 
-	// 2) Clone every disk's volume into an immutable artifact, in disk order.
+	// On a retry, remove any instance/volumes left over from the previous cutover
+	// attempt so we start clean and the <name>-cutover labels are free to reuse.
+	s.cleanupCutoverArtifacts(sctx, m)
+
+	// 2) Clone every disk's volume into a launchable <name>-cutover artifact.
 	cloneIDs := make([]int64, len(m.Disks))
 	for i, d := range m.Disks {
-		label := imageLabel(m.Name, d.ID)
+		label := cutoverVolumeLabel(m.Name, d.Index, len(m.Disks))
 		log.Printf("appliance: migration %d: cloning disk %d volume %d -> %s", m.ID, d.Index, d.VolumeID, label)
 		clone, err := cl.CloneVolume(ctx, d.VolumeID, label)
 		if canceled() {
 			return
 		}
 		if err != nil {
-			s.fail(m.ID, fmt.Sprintf("clone disk %d volume: %v", d.Index, err))
+			s.fail(m.ID, fmt.Sprintf("clone disk %d into %s: %v", d.Index, label, err))
 			return
 		}
 		if _, err := cl.WaitVolumeActive(ctx, clone.ID, 15*time.Minute); err != nil {
@@ -565,12 +549,13 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		}
 		cloneIDs[i] = clone.ID
 		_ = s.st.SetDiskArtifact(sctx, d.ID, fmt.Sprintf("volume:%d", clone.ID))
+		_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("disk %d cloned into cutover volume %q (id %d)", d.Index, label, clone.ID))
 	}
 	// The boot clone is the migration's headline artifact.
 	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", cloneIDs[0]), 0)
 
-	// 3) Optionally launch a new instance booting from the boot artifact with the
-	//    data artifacts attached (sda, sdb, …).
+	// 3) Optionally launch a <name>-cutover instance booting from the boot
+	//    artifact with the data artifacts attached (sda, sdb, …).
 	if req.LaunchInstance {
 		region := req.Region
 		if region == "" {
@@ -581,7 +566,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 			}
 		}
 		typ := orDefault(req.Type, "g6-standard-2")
-		label := orDefault(req.Label, m.Name)
+		label := orDefault(req.Label, cutoverName(m.Name))
 		inst, err := cl.CreateInstance(ctx, label, region, typ)
 		if canceled() {
 			return
@@ -590,15 +575,14 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 			s.fail(m.ID, "create instance: "+err.Error())
 			return
 		}
-		for i, vid := range cloneIDs {
-			if err := cl.AttachVolume(ctx, vid, inst.ID); err != nil {
-				if canceled() {
-					return
-				}
-				s.fail(m.ID, fmt.Sprintf("attach artifact (disk %d): %v", i, err))
-				return
-			}
-		}
+		// Record the instance id immediately so a failure below still lets a
+		// retry (or delete) clean it up.
+		_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", cloneIDs[0]), inst.ID)
+		_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("created cutover Linode %q (id %d); building boot config", label, inst.ID))
+		// Create the boot config that references the cloned volumes as devices;
+		// this is what associates the volumes with the new instance. (Attaching a
+		// volume before any config exists fails with "couldn't choose a
+		// configuration profile to add this volume to".)
 		cfgID, err := cl.CreateConfigBootingVolumes(ctx, inst.ID, cloneIDs, "boot-migrated", kernel, rootDevice)
 		if err != nil {
 			if canceled() {
@@ -614,16 +598,74 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 			s.fail(m.ID, "boot instance: "+err.Error())
 			return
 		}
-		_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", cloneIDs[0]), inst.ID)
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
 		_ = s.st.SetMigrateFinished(sctx, m.ID)
-		_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: launched Linode %d from the image volumes", inst.ID))
+		_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: launched cutover Linode %q (id %d) from %d volume(s)", label, inst.ID, len(cloneIDs)))
 		return
 	}
 
 	_ = s.st.SetMigrationState(sctx, m.ID, api.MigImageReady, "")
 	_ = s.st.SetMigrateFinished(sctx, m.ID)
-	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %d image volume(s) ready to launch", len(m.Disks)))
+	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %d cutover volume(s) ready to launch", len(m.Disks)))
+}
+
+// cleanupCutoverArtifacts deletes the Linode instance and cloned volumes created
+// by a previous cutover attempt (recorded on the migration), logging each step,
+// then clears those references. No-op on a first cutover.
+func (s *Server) cleanupCutoverArtifacts(ctx context.Context, m api.Migration) {
+	cl, ok := s.linodeClient(ctx)
+	if !ok {
+		return
+	}
+	if m.LaunchedID != 0 {
+		_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("removing previous cutover Linode %d before retrying", m.LaunchedID))
+		if err := cl.DeleteInstance(ctx, m.LaunchedID); err != nil {
+			_ = s.st.AddEvent(ctx, m.ID, "warn", fmt.Sprintf("could not delete previous cutover Linode %d (remove it in Cloud Manager): %v", m.LaunchedID, err))
+		}
+	}
+	for _, d := range m.Disks {
+		vid := artifactVolumeID(d.ArtifactID)
+		if vid == 0 {
+			continue
+		}
+		_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("removing previous cutover volume %d (disk %d) before retrying", vid, d.Index))
+		_ = cl.DetachVolume(ctx, vid)
+		var derr error
+		for i := 0; i < 10; i++ {
+			if derr = cl.DeleteVolume(ctx, vid); derr == nil {
+				break
+			}
+			time.Sleep(2 * time.Second)
+		}
+		if derr != nil {
+			_ = s.st.AddEvent(ctx, m.ID, "warn", fmt.Sprintf("could not delete previous cutover volume %d: %v", vid, derr))
+		}
+		_ = s.st.SetDiskArtifact(ctx, d.ID, "")
+	}
+	_ = s.st.SetMigrationImage(ctx, m.ID, "", 0)
+}
+
+// artifactVolumeID parses "volume:<id>" → id (0 if not a volume artifact).
+func artifactVolumeID(artifact string) int64 {
+	if !strings.HasPrefix(artifact, "volume:") {
+		return 0
+	}
+	id, _ := strconv.ParseInt(strings.TrimPrefix(artifact, "volume:"), 10, 64)
+	return id
+}
+
+// cutoverName is the instance label for a cutover launch: "<name>-cutover".
+func cutoverName(name string) string { return sanitizeLabel(name) + "-cutover" }
+
+// cutoverVolumeLabel is the cloned-volume label: "<name>-cutover" (with a disk
+// suffix for multi-disk), capped to Linode's 32-char limit. Deterministic so a
+// retry reuses the same label after the old volume is deleted.
+func cutoverVolumeLabel(name string, idx, total int) string {
+	suffix := "-cutover"
+	if total > 1 {
+		suffix = fmt.Sprintf("-cutover-%d", idx)
+	}
+	return fitLabel("", sanitizeLabel(name), suffix)
 }
 
 func (s *Server) fail(id int64, msg string) {
@@ -648,9 +690,12 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	}
 	v.RPOSeconds = maxLag
 	v.Validations = s.validations(m, maxLag)
-	v.CanMigrate = allOK(v.Validations) &&
-		(m.State == api.MigReplicating || m.State == api.MigReady || m.State == api.MigAwaitingAgent)
-	v.Assessed = !m.AssessedAt.IsZero() && v.CanMigrate
+	// Cutover readiness depends only on the initial full sync (and storage) being
+	// done — not on the live agent connection or replication lag, which are just
+	// informational once baselined and would otherwise wrongly block a retry
+	// (after a cutover the agent stops replicating, so lag/agent always "fail").
+	v.CanMigrate = cutoverReady(m)
+	v.Assessed = v.CanMigrate // no separate manual assessment; readiness is auto-computed
 
 	switch m.State {
 	case api.MigCreated, api.MigAwaitingAgent:
@@ -795,6 +840,22 @@ func (s *Server) curlPinFlag() string {
 func allOK(checks []api.ValidationCheck) bool {
 	for _, c := range checks {
 		if !c.OK {
+			return false
+		}
+	}
+	return true
+}
+
+// cutoverReady reports whether a migration can be cut over: every disk's initial
+// full sync is complete and its storage is provisioned. It is independent of
+// migration state, so a previously-failed migration can be retried, and of the
+// live agent/lag, which stop mattering once the baseline exists.
+func cutoverReady(m api.Migration) bool {
+	if len(m.Disks) == 0 {
+		return false
+	}
+	for _, d := range m.Disks {
+		if !d.FullSyncDone {
 			return false
 		}
 	}

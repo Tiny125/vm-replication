@@ -51,6 +51,8 @@ const consoleHTML = `<!DOCTYPE html>
  button:disabled{opacity:.4;cursor:not-allowed;transform:none}
  button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
  button.primary:hover{background:var(--accent-press)}
+ button.done{background:var(--green);border-color:var(--green)}
+ button.done:hover{background:#178343}
  button.danger{color:var(--red);border-color:#f0c9c7;background:#fff}
  button.danger:hover{background:#fdeceb}
  button.busy{position:relative;color:transparent!important}
@@ -242,7 +244,6 @@ const consoleHTML = `<!DOCTYPE html>
 
     <div style="display:flex;align-items:center;gap:12px;margin:6px 0 12px">
       <h2 style="margin:0">Migrations</h2>
-      <span class="muted" id="updated" style="font-size:12px"></span>
     </div>
     <div id="migs"></div>
   </div>
@@ -434,31 +435,24 @@ function anyDiskError(m){return disks(m).map(d=>d.last_error).filter(Boolean)[0]
 async function startMig(id,btn){
   const r=await confirmModal({
     title:'Cut over migration #'+id+'?',
-    html:'This stops replication, converts the boot disk, and clones every disk into launchable image volumes. This is the final step.',
+    html:'<div class="warn" style="margin-bottom:8px">After cutover the source agent <b>stops replicating</b> — the migrated copy is frozen at this point.</div>'+
+      'This converts the boot disk and clones every disk into launchable <b>&lt;name&gt;-cutover</b> volumes. This is the final step.',
     okText:'Cut over',
-    checkbox:{label:'Also launch a new Linode instance now (all disks attached). Leave unchecked to just create the image volumes.',checked:false}
+    checkbox:{label:'Also launch a new <name>-cutover Linode now (boot=sda, data=sdb…). Leave unchecked to just create the cutover volumes.',checked:true}
   });
   if(!r)return;
   busy(btn,true);
   try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:r.checked});await refreshMig(id)}
   catch(e){alertModal({title:'Cannot cut over',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
-async function assessMig(id,btn){
-  busy(btn,true);
-  try{const v=await api('POST','/api/v1/migrations/'+id+'/assess');
-    if(!v.assessed){const fails=(v.validations||[]).filter(c=>!c.ok).map(c=>'<div style="margin:4px 0"><span class="x">✘</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>').join('');
-      await alertModal({title:'Assessment failed',html:'<div class="muted" style="margin-bottom:6px">These checks must pass before cutover:</div>'+fails,danger:true});}
-    flash(replaceCard(id,v));
-  }catch(e){alertModal({title:'Assessment error',html:esc(e.message),danger:true})}finally{busy(btn,false)}
-}
 async function stopMig(id,btn){
-  if(!await confirmModal({title:'Stop cutover #'+id+'?',html:'The finalize run is cancelled and replication resumes; you will need to re-run the assessment.',okText:'Stop cutover',okDanger:true}))return;
+  if(!await confirmModal({title:'Stop cutover #'+id+'?',html:'The finalize run is cancelled and replication resumes.',okText:'Stop cutover',okDanger:true}))return;
   busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/stop');await refreshMig(id)}catch(e){alertModal({title:'Cannot stop',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function deleteMig(id,name,btn){
   if(!await confirmModal({title:'Delete migration #'+id+'?',
-    html:'<b>'+esc(name)+'</b><div style="margin-top:8px" class="warn">This deletes the replication volume(s) and ALL replicated data, and cannot be undone.</div>'+
-      '<div class="muted" style="margin-top:8px;font-size:13px">Completed image volumes are kept. After deletion this card stays briefly with the command to remove the agent from the source — dismiss it once that’s done.</div>',
+    html:'<b>'+esc(name)+'</b><div style="margin-top:8px" class="warn">This deletes the replication volume(s), any <name>-cutover image volume(s) and the launched cutover Linode, and ALL replicated data. It cannot be undone.</div>'+
+      '<div class="muted" style="margin-top:8px;font-size:13px">After deletion this card stays briefly with the command to remove the agent from the source — dismiss it once that’s done.</div>',
     okText:'Delete',okDanger:true}))return;
   busy(btn,true);
   try{
@@ -470,6 +464,17 @@ async function deleteMig(id,name,btn){
     toast('Migration #'+id+' ('+name+') deleted — remove the source agent','ok');
   }
   catch(e){toast('Delete failed: '+e.message,'bad')}finally{busy(btn,false)}
+}
+// completeMig is the green "migration complete" action: it shows the command to
+// remove the replication agent from the source — the final step of the cycle.
+function completeMig(id){
+  const meta=migMeta[id]||{};const cmd=meta.uninstall||'';
+  const body='<div style="font-size:13.5px;margin-bottom:10px">Your server is migrated and launched on Linode. To finish, remove the replication agent from <b>'+esc(meta.source||'the source server')+'</b>:</div>'+
+    (cmd?('<div style="display:flex;gap:8px;align-items:flex-start"><pre id="donecmd'+id+'" style="flex:1;margin:0">'+esc(cmd)+'</pre>'+
+      '<button onclick="copyText(document.getElementById(\'donecmd'+id+'\').textContent,this)">Copy</button></div>')
+      :'<div class="muted">Run your uninstall command on the source to remove the agent.</div>')+
+    '<div class="muted" style="font-size:12px;margin-top:10px">After removing the agent you can Delete this migration to clean up the appliance’s replication volumes (the launched cutover Linode and its volumes are yours to keep).</div>';
+  uiDialog({title:'Migration complete — remove source agent',html:body,wide:true,cancel:false,okText:'Done'});
 }
 // "Check status" re-fetches THIS migration and shows the latest result in a box.
 async function checkStatus(id,btn){
@@ -634,7 +639,8 @@ function migCard(v){
 
   let checks='';for(const c of (v.validations||[]))checks+='<div style="font-size:13px;margin:2px 0"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>';
   const allOk=(v.validations||[]).every(c=>c.ok);
-  b+='<details'+(allOk?'':' open')+'><summary>Validation checks'+(allOk?' (all passing)':'')+'</summary><div>'+checks+'</div></details>';
+  b+='<details'+(allOk?'':' open')+'><summary>Pre-migration validation checks'+(allOk?' (all passing)':'')+'</summary><div>'+
+     '<div class="muted" style="font-size:12px;margin-bottom:6px">These track readiness during replication. Once the <b>initial full sync</b> is complete the migration can be cut over; agent-connection and replication-lag are informational from then on (they stop updating after cutover).</div>'+checks+'</div></details>';
   b+='<details><summary>Disks ('+disks(m).length+')</summary><div>'+diskTable(m)+'</div></details>';
   const cachedLog=logCache[m.id];
   b+='<details ontoggle="if(this.open)ensureLog('+m.id+')"><summary>Activity log</summary><div>'+
@@ -666,22 +672,23 @@ function migCard(v){
   }
 
   b+='<div class="actions">';
-  if(m.state==='failed' && allDone(m)){
-    // A cutover failed but the data is fully replicated — offer a retry that
-    // re-runs the cutover on the existing data (no re-replication needed).
+  if(['image_ready','launched'].includes(m.state)){
+    // Done: green button leads to the agent-removal notice — the intended way
+    // to finish the migration cycle.
+    b+='<button class="primary done" onclick="completeMig('+m.id+')">✓ Migration complete — remove source agent</button>';
+  }else if(m.state==='migrating'){
+    b+='<button class="danger" onclick="stopMig('+m.id+',this)">Stop</button>';
+  }else if(m.state==='failed' && allDone(m)){
+    // A cutover failed but the data is fully replicated — retry re-runs it.
     b+='<button class="primary" onclick="startMig('+m.id+',this)">Retry cutover</button>'+
-      infoIcon('Re-runs the cutover on the data already replicated to this appliance. Use this after a cutover failure — no re-replication of the source is needed.');
-  }else if(!['migrating','image_ready','launched'].includes(m.state)){
-    b+='<button onclick="assessMig('+m.id+',this)">Pre-cutover assessment</button>';
-    if(v.assessed)b+='<span class="pill ok">✔ assessment passed</span>';
-    // Always show the Cutover button for consistency; disable (with a reason)
-    // until validations pass and the assessment has been run.
-    const ready=v.can_migrate&&v.assessed;
-    const why=!v.can_migrate?'Validation checks must all pass first':(!v.assessed?'Run the pre-cutover assessment first':'');
-    b+='<button class="primary"'+(ready?'':' disabled title="'+why+'"')+' onclick="startMig('+m.id+',this)">Cutover instance</button>'+
-      infoIcon('Cuts over to Linode: stops replication, converts the boot disk to boot on Linode, and clones every replicated disk into launchable image volumes. You can optionally launch a new Linode instance right after. Run the pre-cutover assessment first — this is the final step.');
+      infoIcon('Re-runs the cutover on the data already replicated to this appliance. It first removes any half-built <name>-cutover instance/volumes from the failed attempt, then launches fresh — no re-replication of the source is needed.');
+  }else{
+    // Readiness is auto-computed: the Cutover button enables itself once the
+    // initial full sync is complete (no manual assessment).
+    const ready=v.can_migrate;
+    b+='<button class="primary"'+(ready?'':' disabled title="The initial full sync must complete on all disks first"')+' onclick="startMig('+m.id+',this)">Cutover instance</button>'+
+      infoIcon('Cuts over to Linode: stops replication, converts the boot disk, clones every disk into <name>-cutover volumes, and (optionally) launches a <name>-cutover Linode. Enables automatically once the initial full sync completes.');
   }
-  if(m.state==='migrating')b+='<button class="danger" onclick="stopMig('+m.id+',this)">Stop</button>';
   b+='<span style="flex:1"></span><button class="danger" onclick="deleteMig('+m.id+',\''+esc(m.name)+'\',this)">Delete</button></div>';
 
   h+='<div class="migbody">'+b+'</div>';
@@ -724,7 +731,6 @@ async function refresh(animate){
     Object.keys(pendingCleanup).forEach(id=>{if(!$('mig'+id)){const cc=cleanupCard(id);if(cc)migs.appendChild(cc);}});
     if(!migs.children.length){migs.innerHTML='<div class="muted" style="padding:8px">No migrations yet. Create one above.</div>';}
     if(animate)flash(migs);
-    $('updated').textContent='updated '+new Date().toLocaleTimeString();
     loadSettings();
   }catch(e){/* 401 handled in api() */}
 }
