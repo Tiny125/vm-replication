@@ -268,6 +268,27 @@ type MigrationView struct {
 	ElapsedSeconds int64   `json:"elapsed_seconds"`
 }
 
+// ConnTestRequest asks the appliance to probe network reachability to a source.
+type ConnTestRequest struct {
+	IP string `json:"ip"`
+}
+
+// PortProbe is the result of a single TCP connect attempt.
+type PortProbe struct {
+	Port   int    `json:"port"`
+	Open   bool   `json:"open"`
+	Detail string `json:"detail"`
+}
+
+// ConnTestResult reports reachability from the appliance to a source host: an
+// ICMP ping plus a sampled TCP probe of the replication port range.
+type ConnTestResult struct {
+	IP         string      `json:"ip"`
+	PingOK     bool        `json:"ping_ok"`
+	PingDetail string      `json:"ping_detail"`
+	Ports      []PortProbe `json:"ports"`
+}
+
 // LoginRequest authenticates to the console.
 type LoginRequest struct {
 	Password string `json:"password"`

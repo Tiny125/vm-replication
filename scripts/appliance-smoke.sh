@@ -62,6 +62,16 @@ echo "$ENROLL" | grep -q 'https://' && echo "$ENROLL" | grep -q 'pinnedpubkey' \
   || { echo "FAIL: enrollment command not hardened: $ENROLL"; exit 1; }
 echo "   OK: 2 disks, distinct ports, hardened enroll cmd"
 
+echo "== Connection-test diagnostic (probe loopback) =="
+CT=$(api -X POST "$BASE/api/v1/diagnostics/connection" -H 'Content-Type: application/json' -d '{"ip":"127.0.0.1"}')
+echo "$CT" | jq -e '.ip=="127.0.0.1" and (.ports|type=="array") and (.ports|length>=2)' >/dev/null \
+  || { echo "FAIL: conn-test shape unexpected: $CT"; exit 1; }
+# Reject obviously bad input (command-injection guard / validation).
+if api -X POST "$BASE/api/v1/diagnostics/connection" -H 'Content-Type: application/json' -d '{"ip":"1.2.3.4; rm -rf /"}' >/dev/null 2>&1; then
+  echo "FAIL: conn-test accepted invalid host"; exit 1
+fi
+echo "   OK: probes returned, invalid host rejected"
+
 echo "== Activity log records the creation event =="
 EVENTS=$(api "$BASE/api/v1/migrations/$MID/events")
 echo "$EVENTS" | jq -e 'type=="array" and length>=1' >/dev/null || { echo "FAIL: events endpoint empty: $EVENTS"; exit 1; }

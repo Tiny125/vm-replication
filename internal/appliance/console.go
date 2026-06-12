@@ -55,6 +55,9 @@ const consoleHTML = `<!DOCTYPE html>
  button.busy.light::after{border-color:rgba(0,0,0,.25);border-top-color:var(--text)}
  @keyframes spin{to{transform:rotate(360deg)}}
  .bar{display:flex;gap:10px;align-items:center;margin-bottom:24px;flex-wrap:wrap}
+ button.tab{background:transparent;border-color:transparent;color:var(--muted);font-weight:600}
+ button.tab:hover{background:var(--surface2)}
+ button.tab.active{background:var(--surface);border-color:var(--border);color:var(--text);box-shadow:var(--shadow)}
  .hide{display:none}
  .muted{color:var(--muted)}
  .err{color:var(--red);font-size:13px;margin-top:8px}
@@ -114,12 +117,41 @@ const consoleHTML = `<!DOCTYPE html>
   <!-- APP -->
   <div id="app" class="hide">
     <div class="bar">
+      <button id="tabMig" class="tab active" onclick="nav('mig')">Migrations</button>
+      <button id="tabConn" class="tab" onclick="nav('conn')">Connection test</button>
+      <span style="flex:1"></span>
       <button id="refreshBtn" onclick="refresh(true)">Refresh</button>
       <span class="muted" id="updated"></span>
-      <span style="flex:1"></span>
       <button onclick="logout()">Sign out</button>
     </div>
 
+  <!-- VIEW: CONNECTION TEST -->
+  <div id="view-conn" class="hide">
+    <div class="card">
+      <h2>Connection test</h2>
+      <div class="muted" style="font-size:13.5px;margin-bottom:14px">
+        Checks whether this replication appliance can reach a source server over the network.
+        It runs an <b>ICMP ping</b> for basic reachability, then a <b>TCP probe</b> across the
+        replication port range (<code style="display:inline;padding:1px 5px">5000–5100</code>, sampled every 10th port).
+        Nothing is installed or changed on either side — it's a read-only diagnostic.
+        <details style="margin-top:8px"><summary>How to read the results</summary><div style="font-size:13px">
+          During replication the <b>source agent dials out to this appliance</b> on 5000–5100, so the source
+          itself usually has nothing listening there — a probe that says <i>“connection refused”</i> still means
+          the host is <b>reachable</b> and only a firewall/security-group is the open question. A <i>“timed out”</i>
+          result means traffic is being <b>filtered</b> (security group / firewall) or the host is down. Use this to
+          confirm the two machines can see each other before enrolling the agent.
+        </div></details>
+      </div>
+      <div class="row">
+        <div><label>Source server IP or hostname</label><input id="conn_ip" placeholder="e.g. 10.0.1.23" onkeydown="if(event.key==='Enter')runConnTest(this)"></div>
+      </div>
+      <div style="margin-top:14px"><button id="connBtn" class="primary" onclick="runConnTest(this)">Test connection</button></div>
+      <div id="connOut" class="hide" style="margin-top:16px"></div>
+    </div>
+  </div>
+
+  <!-- VIEW: MIGRATIONS -->
+  <div id="view-mig">
     <div id="settings" class="card"></div>
 
     <div class="card">
@@ -148,6 +180,7 @@ const consoleHTML = `<!DOCTYPE html>
 
     <h2 style="margin:6px 0 12px">Migrations</h2>
     <div id="migs"></div>
+  </div>
   </div>
 </div>
 
@@ -182,6 +215,36 @@ async function login(btn){
   finally{busy(btn,false)}
 }
 async function logout(){try{await api('POST','/logout')}catch(e){}show('login')}
+
+function nav(which){
+  const mig=which==='mig';
+  $('view-mig').classList.toggle('hide',!mig);
+  $('view-conn').classList.toggle('hide',mig);
+  $('tabMig').classList.toggle('active',mig);
+  $('tabConn').classList.toggle('active',!mig);
+}
+async function runConnTest(btn){
+  const ip=$('conn_ip').value.trim();const out=$('connOut');
+  if(!ip){out.classList.remove('hide');out.innerHTML='<div class="resultbox bad">Enter a source IP or hostname first.</div>';return}
+  busy(btn,true);
+  out.classList.remove('hide');
+  out.innerHTML='<div class="center"><div class="spinner"></div><div>Testing connection to '+esc(ip)+'…</div></div>';
+  try{
+    const r=await api('POST','/api/v1/diagnostics/connection',{ip:ip});
+    const open=(r.ports||[]).filter(p=>p.open).length;
+    const reachable=r.ping_ok||open>0||(r.ports||[]).some(p=>/refused/.test(p.detail));
+    let h='<div class="resultbox '+(reachable?'ok':'bad')+'">'+
+      (reachable?'✔ <b>'+esc(r.ip)+' is reachable from this appliance.</b>':'✘ <b>Could not reach '+esc(r.ip)+'.</b>')+'</div>';
+    h+='<table style="margin-top:12px"><tr><th>Check</th><th>Result</th><th>Detail</th></tr>';
+    h+='<tr><td>ICMP ping</td><td>'+(r.ping_ok?'<span class="y">✔ reply</span>':'<span class="x">✘ no reply</span>')+'</td><td class="muted">'+esc(r.ping_detail)+'</td></tr>';
+    for(const p of (r.ports||[])){
+      h+='<tr><td>TCP '+p.port+'</td><td>'+(p.open?'<span class="y">✔ open</span>':'<span class="muted">closed</span>')+'</td><td class="muted">'+esc(p.detail)+'</td></tr>';
+    }
+    h+='</table><div class="muted" style="font-size:12px;margin-top:8px">Ports 5000–5100 sampled every 10th port. The source normally has no listener there (the agent dials out to this appliance), so “connection refused” still confirms reachability.</div>';
+    out.innerHTML=h;
+  }catch(e){out.innerHTML='<div class="resultbox bad">Error: '+esc(e.message)+'</div>'}
+  finally{busy(btn,false)}
+}
 
 async function loadSettings(){
   const st=await api('GET','/api/v1/settings');
