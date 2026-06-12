@@ -92,9 +92,9 @@ const consoleHTML = `<!DOCTYPE html>
  .resultbox{margin-top:8px;font-size:13px;border-radius:10px;padding:9px 12px;border:1px solid var(--border);background:var(--surface2)}
  .resultbox.ok{background:#f1faf4;border-color:#cde8d8;color:#0f5c30}
  .resultbox.bad{background:#fdeceb;border-color:#f0c9c7;color:#a3201c}
- .log{max-height:140px;overflow-y:auto;overflow-x:hidden;font-size:12.5px;line-height:1.5;
+ .log{max-height:200px;overflow-y:auto;overflow-x:hidden;font-size:12.5px;
    font-family:"SF Mono",ui-monospace,Menlo,monospace;border:1px solid var(--border);border-radius:10px;
-   background:var(--surface2);padding:6px 10px}
+   background:var(--surface2);padding:8px 12px}
  .mini{padding:3px 9px;font-size:12px;line-height:1.2}
  .info{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
    background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;font-weight:700;
@@ -105,12 +105,23 @@ const consoleHTML = `<!DOCTYPE html>
    width:max-content;max-width:280px;line-height:1.45;text-align:left;z-index:30;box-shadow:0 8px 24px rgba(0,0,0,.22)}
  .info:hover::before{content:"";position:absolute;left:50%;bottom:150%;transform:translateX(-50%) translateY(100%);
    border:5px solid transparent;border-top-color:#1d1d1f;z-index:30}
- .logrow{display:grid;grid-template-columns:64px 1fr;column-gap:10px;align-items:baseline;
-   padding:4px 0;border-bottom:1px solid var(--border)}
+ .logrow{padding:5px 2px;border-bottom:1px solid var(--border);line-height:1.5}
  .logrow:last-child{border-bottom:none}
- .logrow .t{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
- .logrow .m{min-width:0;overflow-wrap:anywhere;white-space:pre-wrap}
+ .logrow .t{display:inline-block;min-width:62px;margin-right:8px;color:var(--muted);
+   white-space:nowrap;font-variant-numeric:tabular-nums;vertical-align:top}
+ .logrow .m{overflow-wrap:anywhere}
  .logrow.error .m{color:var(--red)} .logrow.warn .m{color:var(--amber)}
+ .leg{position:relative;display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;
+   border-radius:50%;background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;
+   font-weight:700;font-style:normal;cursor:help;margin-left:6px;vertical-align:middle;flex:none}
+ .leg:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+ .legbox{display:none;position:absolute;top:150%;left:50%;transform:translateX(-50%);z-index:40;
+   background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.2);
+   padding:12px 14px;width:max-content;max-width:340px;text-transform:none;letter-spacing:normal;font-weight:400}
+ .leg:hover .legbox{display:block}
+ .legrow{display:flex;align-items:center;gap:8px;margin:5px 0;font-size:12.5px;color:var(--text);white-space:nowrap}
+ .legrow .desc{color:var(--muted)}
+ .modal.wide{max-width:760px}
  .flash{animation:flash .8s ease}
  @keyframes flash{0%{background:rgba(0,113,227,.10)}100%{background:transparent}}
  .center{display:flex;flex-direction:column;align-items:center;gap:14px;padding:36px 0;color:var(--muted)}
@@ -202,18 +213,24 @@ const consoleHTML = `<!DOCTYPE html>
       <details>
         <summary>How do I find the source details?</summary>
         <div>
-          <div class="muted" style="font-size:13px;margin-bottom:8px">Run this on your <b>source server</b> — it lists the hostname and every whole disk (add a row per disk):</div>
+          <div class="muted" style="font-size:13px;margin-bottom:8px">Run this on your <b>source server</b> — it prints the hostname, its reachable IP, and every whole disk (add a row per disk):</div>
           <div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:8px">
-            <pre id="srcCmd" style="flex:1;margin:0">echo "Hostname : $(hostname)"; lsblk -b -d -n -o NAME,SIZE,TYPE | awk '$3=="disk"{printf "Device   : /dev/%s\nSize(GB) : %d\n", $1, ($2+1073741823)/1073741824}'</pre>
+            <pre id="srcCmd" style="flex:1;margin:0">echo "Hostname : $(hostname)"; echo "IP       : $(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')"; lsblk -b -d -n -o NAME,SIZE,TYPE | awk '$3=="disk"{printf "Device   : /dev/%s\nSize(GB) : %d\n", $1, ($2+1073741823)/1073741824}'</pre>
             <button onclick="copyText(document.getElementById('srcCmd').textContent,this)">Copy</button>
           </div>
-          <div class="muted" style="font-size:12px">Add <b>one row per whole disk</b> (e.g. <code style="display:inline;padding:1px 5px">/dev/sda</code>). The disk with the root filesystem <code style="display:inline;padding:1px 5px">/</code> is the <b>boot disk</b> — put it first. Round sizes up.</div>
+          <div class="muted" style="font-size:12px">Use the printed <b>IP</b> below (it must pass the connection test). Add <b>one row per whole disk</b> (e.g. <code style="display:inline;padding:1px 5px">/dev/sda</code>). The disk with the root filesystem <code style="display:inline;padding:1px 5px">/</code> is the <b>boot disk</b> — put it first. Round sizes up.</div>
         </div>
       </details>
       <div class="row">
         <div><label>Name</label><input id="m_name" placeholder="web01"></div>
         <div><label>Source hostname</label><input id="m_host" placeholder="web01.prod"></div>
       </div>
+      <label style="margin-top:12px">Source IP address <span class="muted">(must pass the connection test before you can create)</span></label>
+      <div style="display:flex;gap:8px;align-items:flex-start">
+        <input id="m_ip" placeholder="e.g. 172.236.148.63" style="flex:1" oninput="ipChanged()" onkeydown="if(event.key==='Enter')testCreateIP(this)">
+        <button id="m_iptest" onclick="testCreateIP(this)">Test connection</button>
+      </div>
+      <div id="m_ipstatus" class="resultbox hide" style="margin-top:6px"></div>
       <label style="margin-top:12px">Source disks (first = boot disk)</label>
       <div id="disks"></div>
       <div style="margin-top:8px"><button onclick="addDisk()">+ Add disk</button></div>
@@ -265,7 +282,7 @@ function uiDialog(opts){
     const ov=document.createElement('div');ov.className='modal-overlay';
     const check=opts.checkbox?'<label class="modal-check"><input type="checkbox" id="__mck"'+(opts.checkbox.checked?' checked':'')+'><span>'+esc(opts.checkbox.label)+'</span></label>':'';
     const cancelBtn=opts.cancel===false?'':'<button class="modal-cancel">'+esc(opts.cancelText||'Cancel')+'</button>';
-    ov.innerHTML='<div class="modal" role="dialog" aria-modal="true">'+
+    ov.innerHTML='<div class="modal'+(opts.wide?' wide':'')+'" role="dialog" aria-modal="true">'+
       '<h3>'+esc(opts.title||'')+'</h3>'+
       '<div class="modal-body">'+(opts.html||'')+'</div>'+check+
       '<div class="modal-actions">'+cancelBtn+
@@ -362,8 +379,32 @@ function addDisk(dev,gb){
     '<button class="danger" title="Remove disk" onclick="this.closest(\'.row\').remove()">✕</button></div>';
   $('disks').appendChild(row);
 }
+// IP addresses that passed the in-form connection test; only these may be used
+// to create a migration.
+const testedOkIPs=new Set();
+function ipChanged(){$('m_ipstatus').classList.add('hide');}
+async function testCreateIP(btn){
+  const ip=$('m_ip').value.trim();const s=$('m_ipstatus');
+  s.classList.remove('hide');
+  if(!ip){s.className='resultbox bad';s.textContent='Enter the source IP address first.';return}
+  busy(btn,true);
+  s.className='resultbox';s.textContent='Testing connection to '+ip+'…';
+  try{
+    const r=await api('POST','/api/v1/diagnostics/connection',{ip:ip});
+    const open=(r.ports||[]).filter(p=>p.open).length;
+    const reachable=r.ping_ok||open>0||(r.ports||[]).some(p=>/refused/.test(p.detail));
+    if(reachable){testedOkIPs.add(ip);s.className='resultbox ok';s.textContent='✔ '+ip+' is reachable — you can create the migration.';}
+    else{testedOkIPs.delete(ip);s.className='resultbox bad';s.textContent='✘ '+ip+' is not reachable. Fix connectivity (see the Connection test tab) before creating.';}
+  }catch(e){s.className='resultbox bad';s.textContent='Error: '+e.message}
+  finally{busy(btn,false)}
+}
 async function createMig(btn){
   $('createErr').textContent='';
+  const name=$('m_name').value.trim(),host=$('m_host').value.trim(),ip=$('m_ip').value.trim();
+  if(!name){$('createErr').textContent='Enter a migration name.';return}
+  if(!host){$('createErr').textContent='Enter the source hostname.';return}
+  if(!ip){$('createErr').textContent='Enter the source IP address.';return}
+  if(!testedOkIPs.has(ip)){$('createErr').textContent='Run and pass the connection test for '+ip+' first (click “Test connection”).';return}
   const rows=document.querySelectorAll('#disks .row');const devices=[];
   for(const r of rows){const dev=r.querySelector('.d_dev').value.trim();const gb=parseInt(r.querySelector('.d_size').value,10);
     if(!dev)continue; if(!gb||gb<=0){$('createErr').textContent='Each disk needs a positive size (GB): '+dev;return}
@@ -374,13 +415,13 @@ async function createMig(btn){
   // (new migrations are appended, newest last).
   $('migs').insertAdjacentHTML('beforeend','<div id="creating" class="mig"><div class="center"><div class="spinner"></div><div>Creating migration & provisioning volume(s)…</div></div></div>');
   $('creating').scrollIntoView({behavior:'smooth',block:'center'});
-  const name=$('m_name').value;
   try{
-    await api('POST','/api/v1/migrations',{name:name,source_hostname:$('m_host').value,devices:devices});
-    $('m_name').value=$('m_host').value='';$('disks').innerHTML='';diskSeq=0;addDisk();
+    await api('POST','/api/v1/migrations',{name:name,source_hostname:host,source_ip:ip,devices:devices});
+    $('m_name').value=$('m_host').value=$('m_ip').value='';$('m_ipstatus').classList.add('hide');
+    $('disks').innerHTML='';diskSeq=0;addDisk();
     await refresh(true);
     const last=$('migs').lastElementChild;if(last)last.scrollIntoView({behavior:'smooth',block:'center'});
-    toast('Migration '+(name?'"'+name+'" ':'')+'created — enroll the source agent to start replicating','ok');
+    toast('Migration "'+name+'" created — enroll the source agent to start replicating','ok');
   }catch(e){$('createErr').textContent='Error: '+e.message;const c=$('creating');if(c)c.remove();toast('Create failed: '+e.message,'bad');}
   finally{busy(btn,false)}
 }
@@ -453,18 +494,27 @@ async function checkStatus(id,btn){
 // or yanking the user back to the bottom while they read history.
 const logCache={};
 function ensureLog(id){if(logCache[id]===undefined)loadLog(id,false)}
-// loadLog fetches the activity log into the box. The API returns newest-first;
-// we render oldest→newest so the latest entry sits at the bottom, then scroll
-// the box to it. doFlash highlights the box on a manual refresh.
+// logRows renders events oldest→newest as block rows (timestamp + message).
+function logRows(ev){
+  const rows=(ev||[]).slice().reverse();
+  return rows.length?rows.map(e=>'<div class="logrow '+esc(e.level)+'"><span class="t">'+fmtTime(e.at)+'</span><span class="m">'+esc(e.message)+'</span></div>').join(''):'<div class="muted">No activity yet.</div>';
+}
+// loadLog fetches the activity log into the inline box (latest at the bottom).
 async function loadLog(id,doFlash){
   const box=$('log'+id);if(!box)return;
   if(doFlash)flash(box);
   try{const ev=await api('GET','/api/v1/migrations/'+id+'/events');
-    const rows=(ev||[]).slice().reverse();
-    box.innerHTML=rows.length?rows.map(e=>'<div class="logrow '+esc(e.level)+'"><span class="t">'+fmtTime(e.at)+'</span><span class="m">'+esc(e.message)+'</span></div>').join(''):'<div class="muted">No activity yet.</div>';
+    box.innerHTML=logRows(ev);
     box.scrollTop=box.scrollHeight;
     logCache[id]={html:box.innerHTML,scroll:box.scrollTop};
   }catch(e){box.innerHTML='<div class="err">'+esc(e.message)+'</div>'}
+}
+// showLogModal opens the full activity log in a large, easy-to-read modal.
+async function showLogModal(id){
+  let body='<div class="muted">loading…</div>';
+  try{const ev=await api('GET','/api/v1/migrations/'+id+'/events');body='<div class="log" style="max-height:62vh">'+logRows(ev)+'</div>';}
+  catch(e){body='<div class="err">'+esc(e.message)+'</div>';}
+  uiDialog({title:'Activity log — migration #'+id,html:body,wide:true,cancel:false,okText:'Close'});
 }
 
 // syncPct estimates initial-full-sync completion (0–100). Prefers the live
@@ -509,13 +559,20 @@ function diskTable(m){const d=disks(m);if(!d.length)return '';
 }
 function infoIcon(tip){return '<span class="info" data-tip="'+esc(tip)+'">i</span>'}
 function stateLabel(s){return ({created:'created',awaiting_agent:'waiting for agent',replicating:'replicating',ready:'ready to cut over',migrating:'finalizing',image_ready:'image ready',launched:'launched',failed:'failed'})[s]||s}
-const STATE_TIP='Status of replication from the source server to this appliance:\n'+
-  '• waiting for agent — enrolled; the source agent has not connected yet\n'+
-  '• replicating — agent connected; copying the initial baseline, then ongoing changes\n'+
-  '• ready to cut over — baseline done and lag is low; safe to assess & cut over\n'+
-  '• finalizing — converting the boot disk and cloning volumes during cutover\n'+
-  '• image ready / launched — migration complete\n'+
-  '• failed — something went wrong; see the error shown below';
+// statusLegend renders a hover legend that shows each status as its ACTUAL
+// colored pill (so you can match what you see in the table to its meaning).
+const STATE_DESCS=[['awaiting_agent','enrolled; the agent has not connected yet'],
+  ['replicating','agent connected; copying the baseline, then ongoing changes'],
+  ['ready','baseline done and lag is low — safe to cut over'],
+  ['migrating','converting the boot disk and cloning volumes'],
+  ['image_ready','image volume(s) ready to launch'],
+  ['launched','a new Linode was launched from the image'],
+  ['failed','something went wrong — see the error shown on the card']];
+function statusLegend(){
+  let h='<span class="leg">i<span class="legbox"><div style="font-weight:600;font-size:12px;margin-bottom:6px">Source &rarr; Appliance status</div>';
+  for(const [s,d] of STATE_DESCS)h+='<div class="legrow"><span class="pill '+stateClass(s)+'">'+esc(stateLabel(s))+'</span><span class="desc">'+esc(d)+'</span></div>';
+  return h+'</span></span>';
+}
 // Per-migration UI state that must survive the 5s rebuild.
 const collapsedMigs=new Set();   // migration ids the user collapsed
 const seenMigs=new Set();        // migrations rendered at least once (for first-time defaults)
@@ -555,8 +612,8 @@ function migCard(v){
     '<span class="muted" style="font-size:12px;flex:1">'+(collapsed?'collapsed — click ▸ to expand':'')+'</span>'+
     '<button class="mini" title="Refresh this migration" onclick="refreshMig('+m.id+',this)">↻ Refresh</button></div>';
 
-  h+='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+infoIcon(STATE_TIP)+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
-    '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_hostname||'-')+'</span></td>'+
+  h+='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+statusLegend()+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
+    '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_ip||m.source_hostname||'-')+'</span></td>'+
     '<td><span class="pill '+stateClass(m.state)+'">'+esc(stateLabel(m.state))+'</span></td>'+
     '<td class="muted">'+disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining')+'</td>'+
     '<td>'+progressLine(v,m)+'</td>'+
@@ -582,6 +639,7 @@ function migCard(v){
   const cachedLog=logCache[m.id];
   b+='<details ontoggle="if(this.open)ensureLog('+m.id+')"><summary>Activity log</summary><div>'+
      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="muted" style="font-size:12px;flex:1">Newest entries at the bottom · scroll up for history</span>'+
+     '<button class="mini" onclick="showLogModal('+m.id+')" title="Open full log">⤢ Expand</button>'+
      '<button class="mini" onclick="loadLog('+m.id+',true)" title="Refresh log">↻ Refresh</button></div>'+
      '<div id="log'+m.id+'" class="log" onscroll="if(logCache['+m.id+'])logCache['+m.id+'].scroll=this.scrollTop">'+
      (cachedLog?cachedLog.html:'<div class="muted">loading…</div>')+'</div></div></details>';

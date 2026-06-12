@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS migrations (
   name            TEXT NOT NULL UNIQUE,
   state           TEXT NOT NULL,
   source_hostname TEXT NOT NULL DEFAULT '',
+  source_ip       TEXT NOT NULL DEFAULT '',
   source_device   TEXT NOT NULL DEFAULT '',
   source_disk_size INTEGER NOT NULL DEFAULT 0,
   enroll_token    TEXT NOT NULL,
@@ -164,6 +165,7 @@ CREATE INDEX IF NOT EXISTS idx_events_migration ON migration_events(migration_id
 	// when already applied, which is safe to ignore (SQLite has no IF NOT EXISTS
 	// for columns).
 	for _, stmt := range []string{
+		`ALTER TABLE migrations ADD COLUMN source_ip TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE migrations ADD COLUMN assessed_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE migrations ADD COLUMN migrate_started INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE migrations ADD COLUMN migrate_finished INTEGER NOT NULL DEFAULT 0`,
