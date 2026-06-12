@@ -64,24 +64,39 @@ if [ "${#PARTS[@]}" -eq 0 ] && command -v kpartx >/dev/null 2>&1; then
   mapfile -t PARTS < <(ls /dev/mapper/"${base}"* 2>/dev/null || true)
 fi
 
-# Find the root partition: the one carrying /etc/fstab and a real root tree.
+# Some sources (and many cloud images) put the root filesystem directly on the
+# whole disk with NO partition table. In that case mount the device itself.
+PARTITIONED=1
+if [ "${#PARTS[@]}" -eq 0 ]; then
+  PARTS=("$DEV")
+  PARTITIONED=0
+fi
+
+# Find the root: the candidate carrying /etc/fstab and a real root tree.
 ROOT_PART=""
+is_root() { [ -f "$1/etc/fstab" ] && { [ -d "$1/sbin" ] || [ -L "$1/sbin" ] || [ -d "$1/bin" ] || [ -L "$1/bin" ]; }; }
 for p in "${PARTS[@]}"; do
   [ -b "$p" ] || continue
   umount "$MNT" 2>/dev/null || true
   if mount -o ro "$p" "$MNT" 2>/dev/null; then
-    if [ -f "$MNT/etc/fstab" ] && { [ -d "$MNT/sbin" ] || [ -L "$MNT/sbin" ] || [ -d "$MNT/bin" ] || [ -L "$MNT/bin" ]; }; then
-      ROOT_PART="$p"; umount "$MNT" 2>/dev/null || true; break
-    fi
+    if is_root "$MNT"; then ROOT_PART="$p"; umount "$MNT" 2>/dev/null || true; break; fi
     umount "$MNT" 2>/dev/null || true
   fi
 done
 if [ -z "$ROOT_PART" ]; then
-  echo "could not locate a root partition with /etc/fstab on $DEV (partitions found: ${PARTS[*]:-none})"
+  echo "could not locate a root filesystem with /etc/fstab on $DEV (candidates: ${PARTS[*]:-none})"
   lsblk -po NAME,TYPE,FSTYPE,SIZE "$DEV" 2>/dev/null || true
   exit 1
 fi
-log "Root partition: $ROOT_PART"
+log "Root filesystem: $ROOT_PART (partitioned=$PARTITIONED)"
+# Emit a machine-readable layout marker so the caller can pick the right Linode
+# boot kernel/root_device (a partitionless disk boots via the Linode kernel; a
+# partitioned disk boots via GRUB2 once we reinstall it below).
+if [ "$PARTITIONED" -eq 1 ]; then
+  echo "vmrepl-layout: partitioned"
+else
+  echo "vmrepl-layout: wholedisk"
+fi
 
 log "Mounting root and binding kernel filesystems"
 mount "$ROOT_PART" "$MNT"

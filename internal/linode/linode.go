@@ -193,7 +193,18 @@ func (c *Client) CreateConfigBootingVolume(ctx context.Context, linodeID, volume
 // volume and attaches the rest as additional disks (sda, sdb, … up to sdh).
 // Returns the config id. The OS on the boot volume mounts the data volumes via
 // its fstab (typically by UUID, preserved in the clones).
-func (c *Client) CreateConfigBootingVolumes(ctx context.Context, linodeID int64, volumeIDs []int64, label string) (int64, error) {
+//
+// kernel selects how Linode boots: "linode/grub2" for a partitioned disk with a
+// reinstalled bootloader, or a Linode-supplied kernel (e.g. "linode/latest-64bit")
+// for a partitionless whole-disk root filesystem that has no on-disk bootloader.
+// rootDevice is the device the kernel mounts as / (e.g. "/dev/sda").
+func (c *Client) CreateConfigBootingVolumes(ctx context.Context, linodeID int64, volumeIDs []int64, label, kernel, rootDevice string) (int64, error) {
+	if kernel == "" {
+		kernel = "linode/grub2"
+	}
+	if rootDevice == "" {
+		rootDevice = "/dev/sda"
+	}
 	slots := []string{"sda", "sdb", "sdc", "sdd", "sde", "sdf", "sdg", "sdh"}
 	devices := map[string]any{}
 	for i, vid := range volumeIDs {
@@ -208,9 +219,9 @@ func (c *Client) CreateConfigBootingVolumes(ctx context.Context, linodeID int64,
 	err := c.do(ctx, http.MethodPost, fmt.Sprintf("/linode/instances/%d/configs", linodeID),
 		map[string]any{
 			"label":       label,
-			"kernel":      "linode/grub2",
+			"kernel":      kernel,
 			"devices":     devices,
-			"root_device": "/dev/sda",
+			"root_device": rootDevice,
 			"helpers":     map[string]any{"network": true, "distro": false},
 		}, &cfg)
 	return cfg.ID, err
