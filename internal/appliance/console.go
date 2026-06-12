@@ -94,9 +94,11 @@ const consoleHTML = `<!DOCTYPE html>
  .resultbox{margin-top:8px;font-size:13px;border-radius:10px;padding:9px 12px;border:1px solid var(--border);background:var(--surface2)}
  .resultbox.ok{background:#f1faf4;border-color:#cde8d8;color:#0f5c30}
  .resultbox.bad{background:#fdeceb;border-color:#f0c9c7;color:#a3201c}
- .log{max-height:240px;overflow:auto;font-size:12.5px;font-family:"SF Mono",ui-monospace,Menlo,monospace;
-   border:1px solid var(--border);border-radius:10px;background:var(--surface2);padding:6px 12px}
- .logbox{max-height:62vh;overflow:auto}
+ .logpre{margin:0;border:1px solid var(--border);border-radius:10px;background:var(--surface2);
+   padding:8px 12px;color:var(--text);white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;
+   font-size:12.5px;line-height:1.55;font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace}
+ .logpre.scroll{max-height:62vh;overflow:auto}
+ .logpre .x{color:var(--red)} .logpre .w{color:var(--amber)}
  .mini{padding:3px 9px;font-size:12px;line-height:1.2}
  .info{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
    background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;font-weight:700;
@@ -107,10 +109,6 @@ const consoleHTML = `<!DOCTYPE html>
    width:max-content;max-width:280px;line-height:1.45;text-align:left;z-index:30;box-shadow:0 8px 24px rgba(0,0,0,.22)}
  .info:hover::before{content:"";position:absolute;left:50%;bottom:150%;transform:translateX(-50%) translateY(100%);
    border:5px solid transparent;border-top-color:#1d1d1f;z-index:30}
- .logrow{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}
- .logrow:last-child{border-bottom:none}
- .logrow .t{color:var(--muted);white-space:nowrap}
- .logrow.error .m{color:var(--red)} .logrow.warn .m{color:var(--amber)}
  .leg{position:relative;display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;
    border-radius:50%;background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;
    font-weight:700;font-style:normal;cursor:help;margin-left:6px;vertical-align:middle;flex:none}
@@ -451,8 +449,8 @@ async function stopMig(id,btn){
 }
 async function deleteMig(id,name,btn){
   if(!await confirmModal({title:'Delete migration #'+id+'?',
-    html:'<b>'+esc(name)+'</b><div style="margin-top:8px" class="warn">This deletes the replication volume(s), any <name>-cutover image volume(s) and the launched cutover Linode, and ALL replicated data. It cannot be undone.</div>'+
-      '<div class="muted" style="margin-top:8px;font-size:13px">After deletion this card stays briefly with the command to remove the agent from the source — dismiss it once that’s done.</div>',
+    html:'<b>'+esc(name)+'</b><div style="margin-top:8px" class="warn">This deletes any <name>-cutover image volume(s) and the launched cutover Linode. It cannot be undone.</div>'+
+      '<div class="muted" style="margin-top:8px;font-size:13px">The <b>vrep-'+esc(name)+' replication volume is detached but kept</b> in your Linode account so you can still reference it. After deletion this card stays briefly with the command to remove the agent from the source — dismiss it once that’s done.</div>',
     okText:'Delete',okDanger:true}))return;
   busy(btn,true);
   try{
@@ -493,33 +491,38 @@ async function checkStatus(id,btn){
   }catch(e){const box=$('status'+id);if(box){box.className='resultbox bad';box.textContent='Error: '+e.message}}
   finally{busy(btn,false)}
 }
-// Cache rendered (latest-5) activity-log HTML per migration so the 5s auto-poll
-// (which rebuilds the cards) can restore the log without a flicker/refetch.
+// Cache the rendered (latest-5) activity-log lines per migration so the 5s
+// auto-poll (which rebuilds the cards) can restore the log without a flicker.
 const logCache={};
-function ensureLog(id){if(logCache[id]===undefined)loadLog(id,false)}
-// logRows renders events newest-first (the original layout). With limit set,
-// only the latest N entries are shown (used inline; the modal shows all).
-function logRows(ev,limit){
+function ensureLog(id){if(logCache[id]===undefined)loadLog(id)}
+// logLines renders events newest-first as plain text lines inside a <pre>
+// ("HH:MM:SS  message"). A <pre> lays lines out top-to-bottom and wraps long
+// ones, so entries can never overlap. With limit set, only the latest N show.
+function logLines(ev,limit){
   let rows=ev||[];
   if(limit&&rows.length>limit)rows=rows.slice(0,limit);
-  if(!rows.length)return '<div class="muted">No activity yet.</div>';
-  return rows.map(e=>'<div class="logrow '+esc(e.level)+'"><span class="t">'+fmtTime(e.at)+'</span><span class="m">'+esc(e.message)+'</span></div>').join('');
+  if(!rows.length)return 'No activity yet.';
+  return rows.map(e=>{
+    const line=esc(fmtTime(e.at)+'  '+e.message);
+    if(e.level==='error')return '<span class="x">'+line+'</span>';
+    if(e.level==='warn')return '<span class="w">'+line+'</span>';
+    return line;
+  }).join('\n');
 }
-// loadLog fetches the activity log into the inline box (latest 5, newest first).
-async function loadLog(id,doFlash){
+// loadLog fills the inline <pre> with the latest 5 entries (no scroll).
+async function loadLog(id){
   const box=$('log'+id);if(!box)return;
-  if(doFlash)flash(box);
   try{const ev=await api('GET','/api/v1/migrations/'+id+'/events');
-    box.innerHTML=logRows(ev,5);
+    box.innerHTML=logLines(ev,5);
     logCache[id]={html:box.innerHTML};
-  }catch(e){box.innerHTML='<div class="err">'+esc(e.message)+'</div>'}
+  }catch(e){box.innerHTML=esc(e.message)}
 }
-// showLogModal opens the FULL activity log in a large, scrollable modal.
+// showLogModal opens the FULL activity log in a large, scrollable <pre> modal.
 async function showLogModal(id){
-  let body='<div class="muted">loading…</div>';
-  try{const ev=await api('GET','/api/v1/migrations/'+id+'/events');body='<div class="log logbox">'+logRows(ev)+'</div>';}
-  catch(e){body='<div class="err">'+esc(e.message)+'</div>';}
-  uiDialog({title:'Activity log — migration #'+id,html:body,wide:true,cancel:false,okText:'Close'});
+  let body='loading…';
+  try{const ev=await api('GET','/api/v1/migrations/'+id+'/events');body=logLines(ev);}
+  catch(e){body=esc(e.message);}
+  uiDialog({title:'Activity log — migration #'+id,html:'<pre class="logpre scroll">'+body+'</pre>',wide:true,cancel:false,okText:'Close'});
 }
 
 // syncPct estimates initial-full-sync completion (0–100). Prefers the live
@@ -645,10 +648,8 @@ function migCard(v){
   const cachedLog=logCache[m.id];
   b+='<details ontoggle="if(this.open)ensureLog('+m.id+')"><summary>Activity log</summary><div>'+
      '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="muted" style="font-size:12px;flex:1">Latest 5 entries — click Expand for the full history</span>'+
-     '<button class="mini" onclick="showLogModal('+m.id+')" title="Open full log">⤢ Expand</button>'+
-     '<button class="mini" onclick="loadLog('+m.id+',true)" title="Refresh log">↻ Refresh</button></div>'+
-     '<div id="log'+m.id+'" class="log">'+
-     (cachedLog?cachedLog.html:'<div class="muted">loading…</div>')+'</div></div></details>';
+     '<button class="mini" onclick="showLogModal('+m.id+')" title="Open full log">⤢ Expand</button></div>'+
+     '<pre id="log'+m.id+'" class="logpre">'+(cachedLog?cachedLog.html:'loading…')+'</pre></div></details>';
 
   if(v.enroll_cmd && !allDone(m) && m.state!=='migrating'){
     const certErr=/certificate|tls|x509/i.test(err||'');

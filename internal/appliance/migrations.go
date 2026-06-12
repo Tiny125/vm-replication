@@ -396,7 +396,7 @@ func (s *Server) handleDeleteMigration(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not found")
 		return
 	}
-	s.cleanupMigrationResources(ctx, m)
+	s.cleanupMigrationResources(ctx, m, true) // keep (detach) the replication volume
 	if err := s.st.DeleteMigration(ctx, id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -409,7 +409,7 @@ func (s *Server) handleDeleteMigration(w http.ResponseWriter, r *http.Request) {
 // removes the migration row so nothing lingers in the console.
 func (s *Server) rollbackCreate(ctx context.Context, id int64) {
 	if m, err := s.st.Migration(ctx, id); err == nil {
-		s.cleanupMigrationResources(ctx, m)
+		s.cleanupMigrationResources(ctx, m, false) // failed create: delete everything
 	}
 	_ = s.st.DeleteMigration(ctx, id)
 }
@@ -417,7 +417,13 @@ func (s *Server) rollbackCreate(ctx context.Context, id int64) {
 // cleanupMigrationResources stops a migration's receivers/finalize and removes
 // its replication volumes (or file-fallback images) and manifests. It does NOT
 // delete the migration row — the caller decides that. Safe to call repeatedly.
-func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration) {
+// cleanupMigrationResources stops a migration's receivers/finalize, deletes the
+// cutover artifacts (launched instance + <name>-cutover clone volumes), and
+// handles the replication volume. When keepReplVolume is true (user delete) the
+// vrep-<name> replication volume is only DETACHED — kept in the account so the
+// operator can still reference it — otherwise it is deleted (failed-create
+// rollback). File-fallback images are always removed.
+func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration, keepReplVolume bool) {
 	s.recMu.Lock()
 	if cancel := s.finalizes[m.ID]; cancel != nil {
 		cancel()
@@ -427,8 +433,7 @@ func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration)
 	s.stopReceivers(m)
 
 	cl, haveLinode := s.linodeClient(ctx)
-	// Also remove anything created by a cutover: the launched instance and the
-	// cloned <name>-cutover artifact volumes.
+	// Always remove cutover artifacts: the launched instance and clone volumes.
 	if haveLinode && m.LaunchedID != 0 {
 		if err := cl.DeleteInstance(ctx, m.LaunchedID); err != nil {
 			log.Printf("appliance: delete cutover Linode %d failed (remove it in Cloud Manager): %v", m.LaunchedID, err)
@@ -448,16 +453,20 @@ func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration)
 			}
 		}
 		if d.VolumeID != 0 && haveLinode {
-			_ = cl.DetachVolume(ctx, d.VolumeID)
-			var derr error
-			for i := 0; i < 10; i++ {
-				if derr = cl.DeleteVolume(ctx, d.VolumeID); derr == nil {
-					break
+			_ = cl.DetachVolume(ctx, d.VolumeID) // always detach from the appliance
+			if !keepReplVolume {
+				var derr error
+				for i := 0; i < 10; i++ {
+					if derr = cl.DeleteVolume(ctx, d.VolumeID); derr == nil {
+						break
+					}
+					time.Sleep(2 * time.Second)
 				}
-				time.Sleep(2 * time.Second)
-			}
-			if derr != nil {
-				log.Printf("appliance: delete volume %d failed (remove it in Cloud Manager): %v", d.VolumeID, derr)
+				if derr != nil {
+					log.Printf("appliance: delete volume %d failed (remove it in Cloud Manager): %v", d.VolumeID, derr)
+				}
+			} else {
+				log.Printf("appliance: migration %d: replication volume %d detached and kept for reference", m.ID, d.VolumeID)
 			}
 		} else {
 			_ = os.Remove(s.diskDevicePath(m, d))
@@ -794,7 +803,11 @@ func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCh
 	allAgents := n > 0 && agentsSeen == n
 	allFull := n > 0 && fullDone == n
 	allStorage := n > 0 && storageOK == n
-	lagOK := anySync && allFull && rpoSec <= float64(s.cfg.RPOTargetSec)
+	// Lag reflects how recent the last completed sync is vs the RPO target. It is
+	// independent of the baseline being finished, so it turns green as soon as a
+	// sync lands within the target (e.g. 99s < 120s) instead of staying red until
+	// baseline. It's informational once baselined (cutover no longer depends on it).
+	lagOK := anySync && rpoSec <= float64(s.cfg.RPOTargetSec)
 
 	diskWord := func(k int) string { return fmt.Sprintf("%d/%d disks", k, n) }
 	return []api.ValidationCheck{
