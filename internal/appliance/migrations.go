@@ -679,10 +679,10 @@ func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCh
 
 	diskWord := func(k int) string { return fmt.Sprintf("%d/%d disks", k, n) }
 	return []api.ValidationCheck{
+		{Name: "Storage provisioned", OK: allStorage, Detail: diskWord(storageOK) + " ready"},
 		{Name: "Agent connected", OK: allAgents, Detail: diskWord(agentsSeen) + " checked in"},
 		{Name: "Initial full sync complete", OK: allFull, Detail: diskWord(fullDone) + " baselined"},
 		{Name: fmt.Sprintf("Replication lag within %ds", s.cfg.RPOTargetSec), OK: lagOK, Detail: lagDetail2(anySync, rpoSec)},
-		{Name: "Storage provisioned", OK: allStorage, Detail: diskWord(storageOK) + " ready"},
 	}
 }
 

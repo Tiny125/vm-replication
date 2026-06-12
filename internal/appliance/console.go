@@ -55,6 +55,9 @@ const consoleHTML = `<!DOCTYPE html>
  button.busy.light::after{border-color:rgba(0,0,0,.25);border-top-color:var(--text)}
  @keyframes spin{to{transform:rotate(360deg)}}
  .bar{display:flex;gap:10px;align-items:center;margin-bottom:24px;flex-wrap:wrap}
+ button.tab{background:transparent;border-color:transparent;color:var(--muted);font-weight:600}
+ button.tab:hover{background:var(--surface2)}
+ button.tab.active{background:var(--surface);border-color:var(--border);color:var(--text);box-shadow:var(--shadow)}
  .hide{display:none}
  .muted{color:var(--muted)}
  .err{color:var(--red);font-size:13px;margin-top:8px}
@@ -85,7 +88,18 @@ const consoleHTML = `<!DOCTYPE html>
  .resultbox{margin-top:8px;font-size:13px;border-radius:10px;padding:9px 12px;border:1px solid var(--border);background:var(--surface2)}
  .resultbox.ok{background:#f1faf4;border-color:#cde8d8;color:#0f5c30}
  .resultbox.bad{background:#fdeceb;border-color:#f0c9c7;color:#a3201c}
- .log{max-height:240px;overflow:auto;font-size:12.5px;font-family:"SF Mono",ui-monospace,Menlo,monospace}
+ .log{max-height:138px;overflow-y:auto;font-size:12.5px;font-family:"SF Mono",ui-monospace,Menlo,monospace;
+   border:1px solid var(--border);border-radius:10px;background:var(--surface2);padding:4px 10px}
+ .mini{padding:3px 9px;font-size:12px;line-height:1.2}
+ .info{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
+   background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;font-weight:700;
+   font-style:normal;cursor:help;position:relative;margin-left:6px;vertical-align:middle;flex:none}
+ .info:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+ .info:hover::after{content:attr(data-tip);position:absolute;left:50%;bottom:150%;transform:translateX(-50%);
+   background:#1d1d1f;color:#fff;padding:9px 11px;border-radius:9px;font-size:12px;font-weight:400;white-space:pre-line;
+   width:max-content;max-width:280px;line-height:1.45;text-align:left;z-index:30;box-shadow:0 8px 24px rgba(0,0,0,.22)}
+ .info:hover::before{content:"";position:absolute;left:50%;bottom:150%;transform:translateX(-50%) translateY(100%);
+   border:5px solid transparent;border-top-color:#1d1d1f;z-index:30}
  .logrow{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}
  .logrow:last-child{border-bottom:none}
  .logrow .t{color:var(--muted);white-space:nowrap}
@@ -96,8 +110,35 @@ const consoleHTML = `<!DOCTYPE html>
  .spinner{width:26px;height:26px;border:3px solid var(--surface2);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
  .login-card{max-width:380px;margin:8vh auto 0}
+ .modal-overlay{position:fixed;inset:0;background:rgba(20,20,22,.32);backdrop-filter:saturate(120%) blur(2px);
+   display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;animation:fadein .15s ease}
+ .modal-overlay.closing{animation:fadeout .15s ease forwards}
+ @keyframes fadein{from{opacity:0}to{opacity:1}}
+ @keyframes fadeout{to{opacity:0}}
+ .modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:0 24px 70px rgba(0,0,0,.28);
+   max-width:460px;width:100%;padding:24px 24px 20px;animation:pop .18s cubic-bezier(.2,.8,.3,1)}
+ @keyframes pop{from{transform:scale(.94);opacity:.5}to{transform:scale(1);opacity:1}}
+ .modal h3{font-size:17px;font-weight:600;letter-spacing:-.01em;margin:0 0 10px}
+ .modal-body{font-size:14px;color:var(--text);line-height:1.55}
+ .modal-body b{font-weight:600}
+ .modal-body .warn{color:var(--red);font-weight:500}
+ .modal-check{display:flex;align-items:flex-start;gap:9px;margin-top:16px;font-size:13.5px;color:var(--text);
+   cursor:pointer;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:11px 13px}
+ .modal-check input{width:auto;margin-top:2px;cursor:pointer;accent-color:var(--accent)}
+ .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
+ .toast-wrap{position:fixed;top:18px;right:18px;z-index:200;display:flex;flex-direction:column;gap:10px;max-width:360px}
+ .toast{display:flex;align-items:flex-start;gap:9px;background:var(--surface);border:1px solid var(--border);
+   border-left:4px solid var(--muted);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.16);
+   padding:12px 14px;font-size:13.5px;color:var(--text);animation:toastin .22s cubic-bezier(.2,.8,.3,1)}
+ .toast.ok{border-left-color:var(--green)} .toast.ok .ic{color:var(--green)}
+ .toast.bad{border-left-color:var(--red)} .toast.bad .ic{color:var(--red)}
+ .toast .ic{font-weight:700;line-height:1.4}
+ .toast.closing{animation:toastout .2s ease forwards}
+ @keyframes toastin{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
+ @keyframes toastout{to{transform:translateX(20px);opacity:0}}
 </style></head>
 <body>
+<div id="toasts" class="toast-wrap"></div>
 <div class="wrap">
   <h1>vm-<span class="dot">replication</span></h1>
   <div class="sub">Migrate Linux servers to Akamai Cloud (Linode).</div>
@@ -114,12 +155,39 @@ const consoleHTML = `<!DOCTYPE html>
   <!-- APP -->
   <div id="app" class="hide">
     <div class="bar">
-      <button id="refreshBtn" onclick="refresh(true)">Refresh</button>
-      <span class="muted" id="updated"></span>
+      <button id="tabMig" class="tab active" onclick="nav('mig')">Migrations</button>
+      <button id="tabConn" class="tab" onclick="nav('conn')">Connection test</button>
       <span style="flex:1"></span>
       <button onclick="logout()">Sign out</button>
     </div>
 
+  <!-- VIEW: CONNECTION TEST -->
+  <div id="view-conn" class="hide">
+    <div class="card">
+      <h2>Connection test</h2>
+      <div class="muted" style="font-size:13.5px;margin-bottom:14px">
+        Checks whether this replication appliance can reach a source server over the network.
+        It runs an <b>ICMP ping</b> for basic reachability, then a <b>TCP probe</b> across the
+        replication port range (<code style="display:inline;padding:1px 5px">5000–5100</code>, sampled every 10th port).
+        Nothing is installed or changed on either side — it's a read-only diagnostic.
+        <details style="margin-top:8px"><summary>How to read the results</summary><div style="font-size:13px">
+          During replication the <b>source agent dials out to this appliance</b> on 5000–5100, so the source
+          itself usually has nothing listening there — a probe that says <i>“connection refused”</i> still means
+          the host is <b>reachable</b> and only a firewall/security-group is the open question. A <i>“timed out”</i>
+          result means traffic is being <b>filtered</b> (security group / firewall) or the host is down. Use this to
+          confirm the two machines can see each other before enrolling the agent.
+        </div></details>
+      </div>
+      <div class="row">
+        <div><label>Source server IP or hostname</label><input id="conn_ip" placeholder="e.g. 10.0.1.23" onkeydown="if(event.key==='Enter')runConnTest(this)"></div>
+      </div>
+      <div style="margin-top:14px"><button id="connBtn" class="primary" onclick="runConnTest(this)">Test connection</button></div>
+      <div id="connOut" class="hide" style="margin-top:16px"></div>
+    </div>
+  </div>
+
+  <!-- VIEW: MIGRATIONS -->
+  <div id="view-mig">
     <div id="settings" class="card"></div>
 
     <div class="card">
@@ -142,12 +210,20 @@ const consoleHTML = `<!DOCTYPE html>
       <label style="margin-top:12px">Source disks (first = boot disk)</label>
       <div id="disks"></div>
       <div style="margin-top:8px"><button onclick="addDisk()">+ Add disk</button></div>
-      <div style="margin-top:16px"><button id="createBtn" class="primary" onclick="createMig(this)">Create migration</button></div>
+      <div style="margin-top:16px;display:flex;align-items:center;gap:2px">
+        <button id="createBtn" class="primary" onclick="createMig(this)">Create migration</button>
+        <span class="info" data-tip="Registers this source server and its disks, provisions one replication volume per disk on the appliance, and generates the one-line agent enrollment command. No data is copied until you run that command on the source.">i</span>
+      </div>
       <div id="createErr" class="err"></div>
     </div>
 
-    <h2 style="margin:6px 0 12px">Migrations</h2>
+    <div style="display:flex;align-items:center;gap:12px;margin:6px 0 12px">
+      <h2 style="margin:0">Migrations</h2>
+      <button id="refreshBtn" onclick="refresh(true)">Refresh</button>
+      <span class="muted" id="updated" style="font-size:12px"></span>
+    </div>
     <div id="migs"></div>
+  </div>
   </div>
 </div>
 
@@ -175,6 +251,43 @@ function fmtBytes(n){if(!n)return '0 B';const u=['B','KiB','MiB','GiB','TiB'];le
 function fmtDur(s){if(s==null||s<0)return '—';s=Math.round(s);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
 function fmtTime(t){try{return new Date(t).toLocaleTimeString()}catch(e){return ''}}
 
+// uiDialog renders a themed modal in place of the browser's native confirm()/
+// alert() boxes. Resolves to false on cancel/Escape/backdrop; on confirm it
+// resolves to true, or to {checked:bool} when opts.checkbox is set.
+function uiDialog(opts){
+  return new Promise(resolve=>{
+    const ov=document.createElement('div');ov.className='modal-overlay';
+    const check=opts.checkbox?'<label class="modal-check"><input type="checkbox" id="__mck"'+(opts.checkbox.checked?' checked':'')+'><span>'+esc(opts.checkbox.label)+'</span></label>':'';
+    const cancelBtn=opts.cancel===false?'':'<button class="modal-cancel">'+esc(opts.cancelText||'Cancel')+'</button>';
+    ov.innerHTML='<div class="modal" role="dialog" aria-modal="true">'+
+      '<h3>'+esc(opts.title||'')+'</h3>'+
+      '<div class="modal-body">'+(opts.html||'')+'</div>'+check+
+      '<div class="modal-actions">'+cancelBtn+
+      '<button class="modal-ok '+(opts.okDanger?'danger':'primary')+'">'+esc(opts.okText||'OK')+'</button></div></div>';
+    document.body.appendChild(ov);
+    const ok=ov.querySelector('.modal-ok'),cancel=ov.querySelector('.modal-cancel');
+    let done=false;
+    const close=val=>{if(done)return;done=true;document.removeEventListener('keydown',onKey);ov.classList.add('closing');setTimeout(()=>ov.remove(),150);resolve(val)};
+    const confirm=()=>close(opts.checkbox?{checked:ov.querySelector('#__mck').checked}:true);
+    function onKey(e){if(e.key==='Escape')close(false);else if(e.key==='Enter'){e.preventDefault();confirm()}}
+    ok.onclick=confirm;
+    if(cancel)cancel.onclick=()=>close(false);
+    ov.onclick=e=>{if(e.target===ov)close(false)};
+    document.addEventListener('keydown',onKey);
+    setTimeout(()=>ok.focus(),0);
+  });
+}
+function confirmModal(opts){return uiDialog(opts)}
+function alertModal(opts){return uiDialog({title:opts.title,html:opts.html,okText:opts.okText||'OK',okDanger:opts.danger,cancel:false})}
+
+// toast shows a small auto-dismissing notification (kind: 'ok' | 'bad').
+function toast(msg,kind){
+  const el=document.createElement('div');el.className='toast '+(kind||'');
+  el.innerHTML='<span class="ic">'+(kind==='bad'?'✕':'✓')+'</span><span>'+esc(msg)+'</span>';
+  $('toasts').appendChild(el);
+  setTimeout(()=>{el.classList.add('closing');setTimeout(()=>el.remove(),200)},3800);
+}
+
 async function login(btn){
   $('loginErr').textContent=''; busy(btn,true);
   try{await api('POST','/login',{password:$('pw').value});$('pw').value='';start()}
@@ -182,6 +295,36 @@ async function login(btn){
   finally{busy(btn,false)}
 }
 async function logout(){try{await api('POST','/logout')}catch(e){}show('login')}
+
+function nav(which){
+  const mig=which==='mig';
+  $('view-mig').classList.toggle('hide',!mig);
+  $('view-conn').classList.toggle('hide',mig);
+  $('tabMig').classList.toggle('active',mig);
+  $('tabConn').classList.toggle('active',!mig);
+}
+async function runConnTest(btn){
+  const ip=$('conn_ip').value.trim();const out=$('connOut');
+  if(!ip){out.classList.remove('hide');out.innerHTML='<div class="resultbox bad">Enter a source IP or hostname first.</div>';return}
+  busy(btn,true);
+  out.classList.remove('hide');
+  out.innerHTML='<div class="center"><div class="spinner"></div><div>Testing connection to '+esc(ip)+'…</div></div>';
+  try{
+    const r=await api('POST','/api/v1/diagnostics/connection',{ip:ip});
+    const open=(r.ports||[]).filter(p=>p.open).length;
+    const reachable=r.ping_ok||open>0||(r.ports||[]).some(p=>/refused/.test(p.detail));
+    let h='<div class="resultbox '+(reachable?'ok':'bad')+'">'+
+      (reachable?'✔ <b>'+esc(r.ip)+' is reachable from this appliance.</b>':'✘ <b>Could not reach '+esc(r.ip)+'.</b>')+'</div>';
+    h+='<table style="margin-top:12px"><tr><th>Check</th><th>Result</th><th>Detail</th></tr>';
+    h+='<tr><td>ICMP ping</td><td>'+(r.ping_ok?'<span class="y">✔ reply</span>':'<span class="x">✘ no reply</span>')+'</td><td class="muted">'+esc(r.ping_detail)+'</td></tr>';
+    for(const p of (r.ports||[])){
+      h+='<tr><td>TCP '+p.port+'</td><td>'+(p.open?'<span class="y">✔ open</span>':'<span class="muted">closed</span>')+'</td><td class="muted">'+esc(p.detail)+'</td></tr>';
+    }
+    h+='</table><div class="muted" style="font-size:12px;margin-top:8px">Ports 5000–5100 sampled every 10th port. The source normally has no listener there (the agent dials out to this appliance), so “connection refused” still confirms reachability.</div>';
+    out.innerHTML=h;
+  }catch(e){out.innerHTML='<div class="resultbox bad">Error: '+esc(e.message)+'</div>'}
+  finally{busy(btn,false)}
+}
 
 async function loadSettings(){
   const st=await api('GET','/api/v1/settings');
@@ -199,8 +342,10 @@ async function loadSettings(){
   }
   $('settings').innerHTML=h;
 }
-async function saveToken(btn){busy(btn,true);try{await api('POST','/api/v1/settings/linode-token',{token:$('ltok').value});loadSettings()}catch(e){alert('Error: '+e.message)}finally{busy(btn,false)}}
-async function removeToken(btn){if(!confirm('Remove the stored Linode API token? Provisioning/finalize will stop working until you add a new one.'))return;busy(btn,true);try{await api('DELETE','/api/v1/settings/linode-token');loadSettings()}catch(e){alert('Error: '+e.message)}finally{busy(btn,false)}}
+async function saveToken(btn){busy(btn,true);try{await api('POST','/api/v1/settings/linode-token',{token:$('ltok').value});loadSettings()}catch(e){alertModal({title:'Could not save token',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
+async function removeToken(btn){
+  if(!await confirmModal({title:'Remove Linode API token?',html:'Provisioning and finalize will stop working until you add a new one.',okText:'Remove token',okDanger:true}))return;
+  busy(btn,true);try{await api('DELETE','/api/v1/settings/linode-token');loadSettings()}catch(e){alertModal({title:'Error',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
 
 let diskSeq=0;
 function addDisk(dev,gb){
@@ -221,11 +366,13 @@ async function createMig(btn){
   busy(btn,true);
   // Show a loading placeholder in the migrations list while provisioning runs.
   $('migs').insertAdjacentHTML('afterbegin','<div id="creating" class="mig"><div class="center"><div class="spinner"></div><div>Creating migration & provisioning volume(s)…</div></div></div>');
+  const name=$('m_name').value;
   try{
-    await api('POST','/api/v1/migrations',{name:$('m_name').value,source_hostname:$('m_host').value,devices:devices});
+    await api('POST','/api/v1/migrations',{name:name,source_hostname:$('m_host').value,devices:devices});
     $('m_name').value=$('m_host').value='';$('disks').innerHTML='';diskSeq=0;addDisk();
     await refresh(true);
-  }catch(e){$('createErr').textContent='Error: '+e.message;const c=$('creating');if(c)c.remove();}
+    toast('Migration '+(name?'"'+name+'" ':'')+'created — enroll the source agent to start replicating','ok');
+  }catch(e){$('createErr').textContent='Error: '+e.message;const c=$('creating');if(c)c.remove();toast('Create failed: '+e.message,'bad');}
   finally{busy(btn,false)}
 }
 
@@ -236,26 +383,37 @@ function bytesTotal(m){return disks(m).reduce((a,d)=>a+(d.bytes_on_wire||0),0)}
 function anyDiskError(m){return disks(m).map(d=>d.last_error).filter(Boolean)[0]||''}
 
 async function startMig(id,btn){
-  if(!confirm('Cut over migration #'+id+'?\n\nThis stops replication, converts the boot disk, and clones every disk into launchable image volumes.'))return;
-  const launch=confirm('Also launch a new Linode instance now?\nOK = launch with all disks attached · Cancel = just create the image volumes');
+  const r=await confirmModal({
+    title:'Cut over migration #'+id+'?',
+    html:'This stops replication, converts the boot disk, and clones every disk into launchable image volumes. This is the final step.',
+    okText:'Cut over',
+    checkbox:{label:'Also launch a new Linode instance now (all disks attached). Leave unchecked to just create the image volumes.',checked:false}
+  });
+  if(!r)return;
   busy(btn,true);
-  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:launch});await refresh(true)}
-  catch(e){alert('Cannot cut over: '+e.message)}finally{busy(btn,false)}
+  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:r.checked});await refresh(true)}
+  catch(e){alertModal({title:'Cannot cut over',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function assessMig(id,btn){
   busy(btn,true);
   try{const v=await api('POST','/api/v1/migrations/'+id+'/assess');
-    if(!v.assessed){const fails=(v.validations||[]).filter(c=>!c.ok).map(c=>'✘ '+c.name+' — '+c.detail).join('\n');alert('Assessment failed:\n\n'+fails);}
+    if(!v.assessed){const fails=(v.validations||[]).filter(c=>!c.ok).map(c=>'<div style="margin:4px 0"><span class="x">✘</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>').join('');
+      await alertModal({title:'Assessment failed',html:'<div class="muted" style="margin-bottom:6px">These checks must pass before cutover:</div>'+fails,danger:true});}
     await refresh(true);
-  }catch(e){alert('Assessment error: '+e.message)}finally{busy(btn,false)}
+  }catch(e){alertModal({title:'Assessment error',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function stopMig(id,btn){
-  if(!confirm('Stop cutover #'+id+'? The finalize run is cancelled and replication resumes; you will re-run the assessment.'))return;
-  busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/stop');await refresh(true)}catch(e){alert('Cannot stop: '+e.message)}finally{busy(btn,false)}
+  if(!await confirmModal({title:'Stop cutover #'+id+'?',html:'The finalize run is cancelled and replication resumes; you will need to re-run the assessment.',okText:'Stop cutover',okDanger:true}))return;
+  busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/stop');await refresh(true)}catch(e){alertModal({title:'Cannot stop',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function deleteMig(id,name,btn){
-  if(!confirm('Delete migration #'+id+' ('+name+')?\n\nWARNING: deletes the replication volume(s) and ALL replicated data. Completed image volumes are kept. Remove the agent on the source separately (uninstall command shown on completed migrations).\n\nThis cannot be undone.'))return;
-  busy(btn,true);try{await api('DELETE','/api/v1/migrations/'+id);await refresh(true)}catch(e){alert('Cannot delete: '+e.message)}finally{busy(btn,false)}
+  if(!await confirmModal({title:'Delete migration #'+id+'?',
+    html:'<b>'+esc(name)+'</b><div style="margin-top:8px" class="warn">This deletes the replication volume(s) and ALL replicated data, and cannot be undone.</div>'+
+      '<div class="muted" style="margin-top:8px;font-size:13px">Completed image volumes are kept. Remove the agent from the source separately (the uninstall command is shown on completed migrations).</div>',
+    okText:'Delete',okDanger:true}))return;
+  busy(btn,true);
+  try{await api('DELETE','/api/v1/migrations/'+id);await refresh(true);toast('Migration #'+id+' ('+name+') deleted','ok')}
+  catch(e){toast('Delete failed: '+e.message,'bad')}finally{busy(btn,false)}
 }
 // "Check status" re-fetches and shows the latest agent connection result in a box.
 async function checkStatus(id,btn){
@@ -272,21 +430,34 @@ async function checkStatus(id,btn){
   }catch(e){const box=$('status'+id);if(box){box.className='resultbox bad';box.textContent='Error: '+e.message}}
   finally{busy(btn,false)}
 }
-async function toggleLog(id,btn){
-  const box=$('log'+id);
-  if(!box.classList.contains('hide')){box.classList.add('hide');btn.textContent='Show activity log';return}
-  btn.textContent='Hide activity log';box.classList.remove('hide');box.innerHTML='<div class="muted">loading…</div>';
+// Cache rendered activity-log HTML + scroll position per migration so the 5s
+// auto-poll (which rebuilds the cards) can restore the log without refetching
+// or yanking the user back to the bottom while they read history.
+const logCache={};
+function ensureLog(id){if(logCache[id]===undefined)loadLog(id,false)}
+// loadLog fetches the activity log into the box. The API returns newest-first;
+// we render oldest→newest so the latest entry sits at the bottom, then scroll
+// the box to it. doFlash highlights the box on a manual refresh.
+async function loadLog(id,doFlash){
+  const box=$('log'+id);if(!box)return;
+  if(doFlash)flash(box);
   try{const ev=await api('GET','/api/v1/migrations/'+id+'/events');
-    box.innerHTML=ev.length?ev.map(e=>'<div class="logrow '+esc(e.level)+'"><span class="t">'+fmtTime(e.at)+'</span><span class="m">'+esc(e.message)+'</span></div>').join(''):'<div class="muted">No activity yet.</div>';
+    const rows=(ev||[]).slice().reverse();
+    box.innerHTML=rows.length?rows.map(e=>'<div class="logrow '+esc(e.level)+'"><span class="t">'+fmtTime(e.at)+'</span><span class="m">'+esc(e.message)+'</span></div>').join(''):'<div class="muted">No activity yet.</div>';
+    box.scrollTop=box.scrollHeight;
+    logCache[id]={html:box.innerHTML,scroll:box.scrollTop};
   }catch(e){box.innerHTML='<div class="err">'+esc(e.message)+'</div>'}
 }
 
 function progressLine(v,m){
   let line='<span class="muted">'+esc(v.phase||'')+'</span>';let width=0,indet=false;
   if(v.percent_done>=0){width=Math.max(2,Math.round(v.percent_done));line+=' · '+v.percent_done.toFixed(1)+'%';}
+  // No concrete percent but work is ongoing (steady-state replication, finalizing,
+  // waiting/provisioning): show a moving indeterminate bar so it's clearly alive.
+  else if(['created','awaiting_agent','replicating','ready','migrating'].includes(m.state)){indet=true;}
   if(v.eta_seconds>=0){line+=' · ~'+fmtDur(v.eta_seconds)+' left';}
-  else if(m.state==='migrating'){line+=' · running '+fmtDur(v.elapsed_seconds);indet=true;}
-  if(['image_ready','launched'].includes(m.state)){width=100;line+=' in '+fmtDur(v.elapsed_seconds);}
+  else if(m.state==='migrating'){line+=' · running '+fmtDur(v.elapsed_seconds);}
+  if(['image_ready','launched'].includes(m.state)){width=100;indet=false;line+=' in '+fmtDur(v.elapsed_seconds);}
   return line+'<div class="prog'+(indet?' indet':'')+'"><div style="width:'+(indet?35:width)+'%"></div></div>'+
     '<div class="muted" style="font-size:12px;margin-top:3px">'+fmtBytes(bytesTotal(m))+' received</div>';
 }
@@ -298,12 +469,22 @@ function diskTable(m){const d=disks(m);if(!d.length)return '';
        '<td>'+(x.full_sync_done?'<span class="y">✔ done</span>':'<span class="muted">baselining</span>')+'</td><td>'+note+'</td></tr>';}
   return h+'</table>';
 }
+function infoIcon(tip){return '<span class="info" data-tip="'+esc(tip)+'">i</span>'}
+function stateLabel(s){return ({created:'created',awaiting_agent:'waiting for agent',replicating:'replicating',ready:'ready to cut over',migrating:'finalizing',image_ready:'image ready',launched:'launched',failed:'failed'})[s]||s}
+const STATE_TIP='Status of replication from the source server to this appliance:\n'+
+  '• waiting for agent — enrolled; the source agent has not connected yet\n'+
+  '• replicating — agent connected; copying the initial baseline, then ongoing changes\n'+
+  '• ready to cut over — baseline done and lag is low; safe to assess & cut over\n'+
+  '• finalizing — converting the boot disk and cloning volumes during cutover\n'+
+  '• image ready / launched — migration complete\n'+
+  '• failed — something went wrong; see the error shown below';
 function migCard(v){
   const m=v.migration;const err=anyDiskError(m);
-  let h='<table style="margin-bottom:4px"><tr><th>#'+m.id+' '+esc(m.name)+'</th><th>State</th><th>Source</th><th>Progress</th><th>RPO</th></tr><tr>'+
-    '<td><span class="pill '+stateClass(m.state)+'">'+esc(m.state)+'</span></td>'+
+  let h='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+infoIcon(STATE_TIP)+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
+    '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_hostname||'-')+'</span></td>'+
+    '<td><span class="pill '+stateClass(m.state)+'">'+esc(stateLabel(m.state))+'</span></td>'+
     '<td class="muted">'+disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining')+'</td>'+
-    '<td class="muted">'+esc(m.source_hostname||'-')+'</td><td>'+progressLine(v,m)+'</td>'+
+    '<td>'+progressLine(v,m)+'</td>'+
     '<td class="muted">'+(v.rpo_seconds?Math.round(v.rpo_seconds)+'s':'—')+'</td></tr></table>';
   if(m.last_error)h+='<div class="resultbox bad">'+esc(m.last_error)+'</div>';
   else if(err)h+='<div class="resultbox bad">Last replication attempt failed: '+esc(err)+'</div>';
@@ -320,7 +501,12 @@ function migCard(v){
   const allOk=(v.validations||[]).every(c=>c.ok);
   h+='<details'+(allOk?'':' open')+'><summary>Validation checks'+(allOk?' (all passing)':'')+'</summary><div>'+checks+'</div></details>';
   h+='<details><summary>Disks ('+disks(m).length+')</summary><div>'+diskTable(m)+'</div></details>';
-  h+='<details><summary>Activity log</summary><div><button onclick="toggleLog('+m.id+',this)">Show activity log</button><div id="log'+m.id+'" class="log hide" style="margin-top:8px"></div></div></details>';
+  const cachedLog=logCache[m.id];
+  h+='<details ontoggle="if(this.open)ensureLog('+m.id+')"><summary>Activity log</summary><div>'+
+     '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="muted" style="font-size:12px;flex:1">Newest entries at the bottom · scroll up for history</span>'+
+     '<button class="mini" onclick="loadLog('+m.id+',true)" title="Refresh log">↻ Refresh</button></div>'+
+     '<div id="log'+m.id+'" class="log" onscroll="if(logCache['+m.id+'])logCache['+m.id+'].scroll=this.scrollTop">'+
+     (cachedLog?cachedLog.html:'<div class="muted">loading…</div>')+'</div></div></details>';
 
   if(v.enroll_cmd && !allDone(m) && m.state!=='migrating'){
     h+='<details open><summary>Enroll the source server (all '+disks(m).length+' disk(s))</summary><div>'+
@@ -340,9 +526,10 @@ function migCard(v){
 
   h+='<div class="actions">';
   if(!['migrating','image_ready','launched'].includes(m.state)){
-    h+='<button onclick="assessMig('+m.id+',this)">Pre-migration assessment</button>';
+    h+='<button onclick="assessMig('+m.id+',this)">Pre-cutover assessment</button>';
     if(v.assessed)h+='<span class="pill ok">✔ assessment passed</span>';
-    if(v.can_migrate)h+='<button class="primary"'+(v.assessed?'':' disabled title="Run the assessment first"')+' onclick="startMig('+m.id+',this)">Cutover instance</button>';
+    if(v.can_migrate)h+='<button class="primary"'+(v.assessed?'':' disabled title="Run the assessment first"')+' onclick="startMig('+m.id+',this)">Cutover instance</button>'+
+      infoIcon('Cuts over to Linode: stops replication, converts the boot disk to boot on Linode, and clones every replicated disk into launchable image volumes. You can optionally launch a new Linode instance right after. Run the pre-cutover assessment first — this is the final step.');
   }
   if(m.state==='migrating')h+='<button class="danger" onclick="stopMig('+m.id+',this)">Stop</button>';
   h+='<span style="flex:1"></span><button class="danger" onclick="deleteMig('+m.id+',\''+esc(m.name)+'\',this)">Delete</button></div>';
@@ -362,6 +549,8 @@ async function refresh(animate){
     if(!list.length){migs.innerHTML='<div class="muted" style="padding:8px">No migrations yet. Create one above.</div>';}
     else list.forEach(v=>{const card=migCard(v);migs.appendChild(card);
       card.querySelectorAll('details').forEach(d=>{if(open.has(card.id+':'+d.querySelector('summary').textContent))d.open=true});});
+    // Restore each cached activity-log scroll position so polling doesn't yank the view.
+    Object.keys(logCache).forEach(id=>{const b=$('log'+id);if(b&&logCache[id])b.scrollTop=logCache[id].scroll});
     if(animate)flash(migs);
     $('updated').textContent='updated '+new Date().toLocaleTimeString();
     loadSettings();
