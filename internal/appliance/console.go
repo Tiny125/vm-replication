@@ -366,11 +366,13 @@ async function createMig(btn){
   busy(btn,true);
   // Show a loading placeholder in the migrations list while provisioning runs.
   $('migs').insertAdjacentHTML('afterbegin','<div id="creating" class="mig"><div class="center"><div class="spinner"></div><div>Creating migration & provisioning volume(s)…</div></div></div>');
+  const name=$('m_name').value;
   try{
-    await api('POST','/api/v1/migrations',{name:$('m_name').value,source_hostname:$('m_host').value,devices:devices});
+    await api('POST','/api/v1/migrations',{name:name,source_hostname:$('m_host').value,devices:devices});
     $('m_name').value=$('m_host').value='';$('disks').innerHTML='';diskSeq=0;addDisk();
     await refresh(true);
-  }catch(e){$('createErr').textContent='Error: '+e.message;const c=$('creating');if(c)c.remove();}
+    toast('Migration '+(name?'"'+name+'" ':'')+'created — enroll the source agent to start replicating','ok');
+  }catch(e){$('createErr').textContent='Error: '+e.message;const c=$('creating');if(c)c.remove();toast('Create failed: '+e.message,'bad');}
   finally{busy(btn,false)}
 }
 
