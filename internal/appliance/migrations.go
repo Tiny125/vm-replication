@@ -450,7 +450,10 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	// 1) Make the boot disk bootable on Linode (virtio/GRUB/fstab/etc).
 	if s.cfg.ConvertScript != "" && isBlockDevice(bootDevice) {
 		log.Printf("appliance: migration %d: machine conversion on boot disk %s", m.ID, bootDevice)
-		out, err := exec.CommandContext(ctx, "/bin/sh", s.cfg.ConvertScript, bootDevice).CombinedOutput()
+		// machine-convert.sh requires bash (set -o pipefail, etc). Run it under
+		// bash explicitly — invoking via /bin/sh would use dash on Debian/Ubuntu
+		// and fail with "Illegal option -o pipefail".
+		out, err := exec.CommandContext(ctx, bashPath(), s.cfg.ConvertScript, bootDevice).CombinedOutput()
 		if canceled() {
 			return
 		}
@@ -722,6 +725,21 @@ func allOK(checks []api.ValidationCheck) bool {
 		}
 	}
 	return true
+}
+
+// bashPath resolves a bash interpreter for running machine-convert.sh. It
+// prefers $PATH, then falls back to the usual absolute locations, and finally
+// to "bash" (letting exec surface a clear not-found error).
+func bashPath() string {
+	if p, err := exec.LookPath("bash"); err == nil {
+		return p
+	}
+	for _, p := range []string{"/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"} {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	return "bash"
 }
 
 func isBlockDevice(path string) bool {
