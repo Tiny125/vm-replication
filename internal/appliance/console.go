@@ -88,7 +88,18 @@ const consoleHTML = `<!DOCTYPE html>
  .resultbox{margin-top:8px;font-size:13px;border-radius:10px;padding:9px 12px;border:1px solid var(--border);background:var(--surface2)}
  .resultbox.ok{background:#f1faf4;border-color:#cde8d8;color:#0f5c30}
  .resultbox.bad{background:#fdeceb;border-color:#f0c9c7;color:#a3201c}
- .log{max-height:240px;overflow:auto;font-size:12.5px;font-family:"SF Mono",ui-monospace,Menlo,monospace}
+ .log{max-height:138px;overflow-y:auto;font-size:12.5px;font-family:"SF Mono",ui-monospace,Menlo,monospace;
+   border:1px solid var(--border);border-radius:10px;background:var(--surface2);padding:4px 10px}
+ .mini{padding:3px 9px;font-size:12px;line-height:1.2}
+ .info{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
+   background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;font-weight:700;
+   font-style:normal;cursor:help;position:relative;margin-left:6px;vertical-align:middle;flex:none}
+ .info:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+ .info:hover::after{content:attr(data-tip);position:absolute;left:50%;bottom:150%;transform:translateX(-50%);
+   background:#1d1d1f;color:#fff;padding:9px 11px;border-radius:9px;font-size:12px;font-weight:400;white-space:pre-line;
+   width:max-content;max-width:280px;line-height:1.45;text-align:left;z-index:30;box-shadow:0 8px 24px rgba(0,0,0,.22)}
+ .info:hover::before{content:"";position:absolute;left:50%;bottom:150%;transform:translateX(-50%) translateY(100%);
+   border:5px solid transparent;border-top-color:#1d1d1f;z-index:30}
  .logrow{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}
  .logrow:last-child{border-bottom:none}
  .logrow .t{color:var(--muted);white-space:nowrap}
@@ -120,8 +131,6 @@ const consoleHTML = `<!DOCTYPE html>
       <button id="tabMig" class="tab active" onclick="nav('mig')">Migrations</button>
       <button id="tabConn" class="tab" onclick="nav('conn')">Connection test</button>
       <span style="flex:1"></span>
-      <button id="refreshBtn" onclick="refresh(true)">Refresh</button>
-      <span class="muted" id="updated"></span>
       <button onclick="logout()">Sign out</button>
     </div>
 
@@ -174,11 +183,18 @@ const consoleHTML = `<!DOCTYPE html>
       <label style="margin-top:12px">Source disks (first = boot disk)</label>
       <div id="disks"></div>
       <div style="margin-top:8px"><button onclick="addDisk()">+ Add disk</button></div>
-      <div style="margin-top:16px"><button id="createBtn" class="primary" onclick="createMig(this)">Create migration</button></div>
+      <div style="margin-top:16px;display:flex;align-items:center;gap:2px">
+        <button id="createBtn" class="primary" onclick="createMig(this)">Create migration</button>
+        <span class="info" data-tip="Registers this source server and its disks, provisions one replication volume per disk on the appliance, and generates the one-line agent enrollment command. No data is copied until you run that command on the source.">i</span>
+      </div>
       <div id="createErr" class="err"></div>
     </div>
 
-    <h2 style="margin:6px 0 12px">Migrations</h2>
+    <div style="display:flex;align-items:center;gap:12px;margin:6px 0 12px">
+      <h2 style="margin:0">Migrations</h2>
+      <button id="refreshBtn" onclick="refresh(true)">Refresh</button>
+      <span class="muted" id="updated" style="font-size:12px"></span>
+    </div>
     <div id="migs"></div>
   </div>
   </div>
@@ -335,21 +351,34 @@ async function checkStatus(id,btn){
   }catch(e){const box=$('status'+id);if(box){box.className='resultbox bad';box.textContent='Error: '+e.message}}
   finally{busy(btn,false)}
 }
-async function toggleLog(id,btn){
-  const box=$('log'+id);
-  if(!box.classList.contains('hide')){box.classList.add('hide');btn.textContent='Show activity log';return}
-  btn.textContent='Hide activity log';box.classList.remove('hide');box.innerHTML='<div class="muted">loading…</div>';
+// Cache rendered activity-log HTML + scroll position per migration so the 5s
+// auto-poll (which rebuilds the cards) can restore the log without refetching
+// or yanking the user back to the bottom while they read history.
+const logCache={};
+function ensureLog(id){if(logCache[id]===undefined)loadLog(id,false)}
+// loadLog fetches the activity log into the box. The API returns newest-first;
+// we render oldest→newest so the latest entry sits at the bottom, then scroll
+// the box to it. doFlash highlights the box on a manual refresh.
+async function loadLog(id,doFlash){
+  const box=$('log'+id);if(!box)return;
+  if(doFlash)flash(box);
   try{const ev=await api('GET','/api/v1/migrations/'+id+'/events');
-    box.innerHTML=ev.length?ev.map(e=>'<div class="logrow '+esc(e.level)+'"><span class="t">'+fmtTime(e.at)+'</span><span class="m">'+esc(e.message)+'</span></div>').join(''):'<div class="muted">No activity yet.</div>';
+    const rows=(ev||[]).slice().reverse();
+    box.innerHTML=rows.length?rows.map(e=>'<div class="logrow '+esc(e.level)+'"><span class="t">'+fmtTime(e.at)+'</span><span class="m">'+esc(e.message)+'</span></div>').join(''):'<div class="muted">No activity yet.</div>';
+    box.scrollTop=box.scrollHeight;
+    logCache[id]={html:box.innerHTML,scroll:box.scrollTop};
   }catch(e){box.innerHTML='<div class="err">'+esc(e.message)+'</div>'}
 }
 
 function progressLine(v,m){
   let line='<span class="muted">'+esc(v.phase||'')+'</span>';let width=0,indet=false;
   if(v.percent_done>=0){width=Math.max(2,Math.round(v.percent_done));line+=' · '+v.percent_done.toFixed(1)+'%';}
+  // No concrete percent but work is ongoing (steady-state replication, finalizing,
+  // waiting/provisioning): show a moving indeterminate bar so it's clearly alive.
+  else if(['created','awaiting_agent','replicating','ready','migrating'].includes(m.state)){indet=true;}
   if(v.eta_seconds>=0){line+=' · ~'+fmtDur(v.eta_seconds)+' left';}
-  else if(m.state==='migrating'){line+=' · running '+fmtDur(v.elapsed_seconds);indet=true;}
-  if(['image_ready','launched'].includes(m.state)){width=100;line+=' in '+fmtDur(v.elapsed_seconds);}
+  else if(m.state==='migrating'){line+=' · running '+fmtDur(v.elapsed_seconds);}
+  if(['image_ready','launched'].includes(m.state)){width=100;indet=false;line+=' in '+fmtDur(v.elapsed_seconds);}
   return line+'<div class="prog'+(indet?' indet':'')+'"><div style="width:'+(indet?35:width)+'%"></div></div>'+
     '<div class="muted" style="font-size:12px;margin-top:3px">'+fmtBytes(bytesTotal(m))+' received</div>';
 }
@@ -361,12 +390,22 @@ function diskTable(m){const d=disks(m);if(!d.length)return '';
        '<td>'+(x.full_sync_done?'<span class="y">✔ done</span>':'<span class="muted">baselining</span>')+'</td><td>'+note+'</td></tr>';}
   return h+'</table>';
 }
+function infoIcon(tip){return '<span class="info" data-tip="'+esc(tip)+'">i</span>'}
+function stateLabel(s){return ({created:'created',awaiting_agent:'waiting for agent',replicating:'replicating',ready:'ready to cut over',migrating:'finalizing',image_ready:'image ready',launched:'launched',failed:'failed'})[s]||s}
+const STATE_TIP='Status of replication from the source server to this appliance:\n'+
+  '• waiting for agent — enrolled; the source agent has not connected yet\n'+
+  '• replicating — agent connected; copying the initial baseline, then ongoing changes\n'+
+  '• ready to cut over — baseline done and lag is low; safe to assess & cut over\n'+
+  '• finalizing — converting the boot disk and cloning volumes during cutover\n'+
+  '• image ready / launched — migration complete\n'+
+  '• failed — something went wrong; see the error shown below';
 function migCard(v){
   const m=v.migration;const err=anyDiskError(m);
-  let h='<table style="margin-bottom:4px"><tr><th>#'+m.id+' '+esc(m.name)+'</th><th>State</th><th>Source</th><th>Progress</th><th>RPO</th></tr><tr>'+
-    '<td><span class="pill '+stateClass(m.state)+'">'+esc(m.state)+'</span></td>'+
+  let h='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+infoIcon(STATE_TIP)+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
+    '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_hostname||'-')+'</span></td>'+
+    '<td><span class="pill '+stateClass(m.state)+'">'+esc(stateLabel(m.state))+'</span></td>'+
     '<td class="muted">'+disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining')+'</td>'+
-    '<td class="muted">'+esc(m.source_hostname||'-')+'</td><td>'+progressLine(v,m)+'</td>'+
+    '<td>'+progressLine(v,m)+'</td>'+
     '<td class="muted">'+(v.rpo_seconds?Math.round(v.rpo_seconds)+'s':'—')+'</td></tr></table>';
   if(m.last_error)h+='<div class="resultbox bad">'+esc(m.last_error)+'</div>';
   else if(err)h+='<div class="resultbox bad">Last replication attempt failed: '+esc(err)+'</div>';
@@ -383,7 +422,12 @@ function migCard(v){
   const allOk=(v.validations||[]).every(c=>c.ok);
   h+='<details'+(allOk?'':' open')+'><summary>Validation checks'+(allOk?' (all passing)':'')+'</summary><div>'+checks+'</div></details>';
   h+='<details><summary>Disks ('+disks(m).length+')</summary><div>'+diskTable(m)+'</div></details>';
-  h+='<details><summary>Activity log</summary><div><button onclick="toggleLog('+m.id+',this)">Show activity log</button><div id="log'+m.id+'" class="log hide" style="margin-top:8px"></div></div></details>';
+  const cachedLog=logCache[m.id];
+  h+='<details ontoggle="if(this.open)ensureLog('+m.id+')"><summary>Activity log</summary><div>'+
+     '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="muted" style="font-size:12px;flex:1">Newest entries at the bottom · scroll up for history</span>'+
+     '<button class="mini" onclick="loadLog('+m.id+',true)" title="Refresh log">↻ Refresh</button></div>'+
+     '<div id="log'+m.id+'" class="log" onscroll="if(logCache['+m.id+'])logCache['+m.id+'].scroll=this.scrollTop">'+
+     (cachedLog?cachedLog.html:'<div class="muted">loading…</div>')+'</div></div></details>';
 
   if(v.enroll_cmd && !allDone(m) && m.state!=='migrating'){
     h+='<details open><summary>Enroll the source server (all '+disks(m).length+' disk(s))</summary><div>'+
@@ -403,9 +447,10 @@ function migCard(v){
 
   h+='<div class="actions">';
   if(!['migrating','image_ready','launched'].includes(m.state)){
-    h+='<button onclick="assessMig('+m.id+',this)">Pre-migration assessment</button>';
+    h+='<button onclick="assessMig('+m.id+',this)">Pre-cutover assessment</button>';
     if(v.assessed)h+='<span class="pill ok">✔ assessment passed</span>';
-    if(v.can_migrate)h+='<button class="primary"'+(v.assessed?'':' disabled title="Run the assessment first"')+' onclick="startMig('+m.id+',this)">Cutover instance</button>';
+    if(v.can_migrate)h+='<button class="primary"'+(v.assessed?'':' disabled title="Run the assessment first"')+' onclick="startMig('+m.id+',this)">Cutover instance</button>'+
+      infoIcon('Cuts over to Linode: stops replication, converts the boot disk to boot on Linode, and clones every replicated disk into launchable image volumes. You can optionally launch a new Linode instance right after. Run the pre-cutover assessment first — this is the final step.');
   }
   if(m.state==='migrating')h+='<button class="danger" onclick="stopMig('+m.id+',this)">Stop</button>';
   h+='<span style="flex:1"></span><button class="danger" onclick="deleteMig('+m.id+',\''+esc(m.name)+'\',this)">Delete</button></div>';
@@ -425,6 +470,8 @@ async function refresh(animate){
     if(!list.length){migs.innerHTML='<div class="muted" style="padding:8px">No migrations yet. Create one above.</div>';}
     else list.forEach(v=>{const card=migCard(v);migs.appendChild(card);
       card.querySelectorAll('details').forEach(d=>{if(open.has(card.id+':'+d.querySelector('summary').textContent))d.open=true});});
+    // Restore each cached activity-log scroll position so polling doesn't yank the view.
+    Object.keys(logCache).forEach(id=>{const b=$('log'+id);if(b&&logCache[id])b.scrollTop=logCache[id].scroll});
     if(animate)flash(migs);
     $('updated').textContent='updated '+new Date().toLocaleTimeString();
     loadSettings();
