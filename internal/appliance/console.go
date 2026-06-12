@@ -88,8 +88,9 @@ const consoleHTML = `<!DOCTYPE html>
  .resultbox{margin-top:8px;font-size:13px;border-radius:10px;padding:9px 12px;border:1px solid var(--border);background:var(--surface2)}
  .resultbox.ok{background:#f1faf4;border-color:#cde8d8;color:#0f5c30}
  .resultbox.bad{background:#fdeceb;border-color:#f0c9c7;color:#a3201c}
- .log{max-height:138px;overflow-y:auto;font-size:12.5px;font-family:"SF Mono",ui-monospace,Menlo,monospace;
-   border:1px solid var(--border);border-radius:10px;background:var(--surface2);padding:4px 10px}
+ .log{max-height:140px;overflow-y:auto;overflow-x:hidden;font-size:12.5px;line-height:1.5;
+   font-family:"SF Mono",ui-monospace,Menlo,monospace;border:1px solid var(--border);border-radius:10px;
+   background:var(--surface2);padding:6px 10px}
  .mini{padding:3px 9px;font-size:12px;line-height:1.2}
  .info{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
    background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;font-weight:700;
@@ -100,9 +101,11 @@ const consoleHTML = `<!DOCTYPE html>
    width:max-content;max-width:280px;line-height:1.45;text-align:left;z-index:30;box-shadow:0 8px 24px rgba(0,0,0,.22)}
  .info:hover::before{content:"";position:absolute;left:50%;bottom:150%;transform:translateX(-50%) translateY(100%);
    border:5px solid transparent;border-top-color:#1d1d1f;z-index:30}
- .logrow{display:flex;gap:10px;padding:3px 0;border-bottom:1px solid var(--border)}
+ .logrow{display:grid;grid-template-columns:64px 1fr;column-gap:10px;align-items:baseline;
+   padding:4px 0;border-bottom:1px solid var(--border)}
  .logrow:last-child{border-bottom:none}
- .logrow .t{color:var(--muted);white-space:nowrap}
+ .logrow .t{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+ .logrow .m{min-width:0;overflow-wrap:anywhere;white-space:pre-wrap}
  .logrow.error .m{color:var(--red)} .logrow.warn .m{color:var(--amber)}
  .flash{animation:flash .8s ease}
  @keyframes flash{0%{background:rgba(0,113,227,.10)}100%{background:transparent}}
@@ -249,7 +252,7 @@ function legacyCopy(t,done){const ta=document.createElement('textarea');ta.value
 function flash(el){if(!el)return;el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash')}
 function fmtBytes(n){if(!n)return '0 B';const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return n.toFixed(1)+' '+u[i]}
 function fmtDur(s){if(s==null||s<0)return '—';s=Math.round(s);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
-function fmtTime(t){try{return new Date(t).toLocaleTimeString()}catch(e){return ''}}
+function fmtTime(t){try{return new Date(t).toLocaleTimeString([],{hour12:false})}catch(e){return ''}}
 
 // uiDialog renders a themed modal in place of the browser's native confirm()/
 // alert() boxes. Resolves to false on cancel/Escape/backdrop; on confirm it
