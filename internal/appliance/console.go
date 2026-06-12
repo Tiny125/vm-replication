@@ -418,10 +418,17 @@ async function stopMig(id,btn){
 async function deleteMig(id,name,btn){
   if(!await confirmModal({title:'Delete migration #'+id+'?',
     html:'<b>'+esc(name)+'</b><div style="margin-top:8px" class="warn">This deletes the replication volume(s) and ALL replicated data, and cannot be undone.</div>'+
-      '<div class="muted" style="margin-top:8px;font-size:13px">Completed image volumes are kept. Remove the agent from the source separately (the uninstall command is shown on completed migrations).</div>',
+      '<div class="muted" style="margin-top:8px;font-size:13px">Completed image volumes are kept. After deletion this card stays briefly with the command to remove the agent from the source — dismiss it once that’s done.</div>',
     okText:'Delete',okDanger:true}))return;
   busy(btn,true);
-  try{await api('DELETE','/api/v1/migrations/'+id);await refresh(true);toast('Migration #'+id+' ('+name+') deleted','ok')}
+  try{
+    await api('DELETE','/api/v1/migrations/'+id);
+    const meta=migMeta[id]||{};
+    pendingCleanup[id]={name:name,source:meta.source||'',cmd:meta.uninstall||''};
+    const cc=cleanupCard(id);const old=$('mig'+id);
+    if(old&&cc)old.replaceWith(cc);else if(cc)$('migs').appendChild(cc);
+    toast('Migration #'+id+' ('+name+') deleted — remove the source agent','ok');
+  }
   catch(e){toast('Delete failed: '+e.message,'bad')}finally{busy(btn,false)}
 }
 // "Check status" re-fetches THIS migration and shows the latest result in a box.
@@ -512,14 +519,33 @@ const STATE_TIP='Status of replication from the source server to this appliance:
 // Per-migration UI state that must survive the 5s rebuild.
 const collapsedMigs=new Set();   // migration ids the user collapsed
 const seenMigs=new Set();        // migrations rendered at least once (for first-time defaults)
+const migMeta={};                // id -> {uninstall, source, name} captured at render time
+const pendingCleanup={};         // id -> {name, source, cmd} for deleted migrations awaiting agent removal
 function toggleCollapse(id,btn){
   const card=$('mig'+id);if(!card)return;
   const now=card.classList.toggle('collapsed');
   if(now)collapsedMigs.add(id);else collapsedMigs.delete(id);
   btn.textContent=now?'▸':'▾';btn.title=now?'Expand':'Collapse';
 }
+// After a migration is deleted we keep a lightweight reminder card holding the
+// command to remove the agent from the source, plus a "Done" tick to dismiss it.
+function cleanupCard(id){
+  const p=pendingCleanup[id];if(!p)return null;
+  const card=document.createElement('div');card.className='mig';card.id='mig'+id;
+  card.innerHTML=
+    '<div class="banner" style="border-color:#cdd6e8;background:#f3f6fc;color:#22408a">✔ <b>Migration #'+id+' ('+esc(p.name)+') deleted.</b> The replication volume and data were removed. One last step: remove the replication agent from your source server.</div>'+
+    (p.cmd?('<label>Run this on '+esc(p.source||'the source server')+' to remove the agent</label>'+
+      '<div style="display:flex;gap:8px;align-items:flex-start"><pre id="uclean'+id+'" style="flex:1;margin:0">'+esc(p.cmd)+'</pre>'+
+      '<button onclick="copyText(document.getElementById(\'uclean'+id+'\').textContent,this)">Copy</button></div>')
+      :'<div class="muted" style="font-size:13px">Remove the agent on the source: <code style="display:inline;padding:1px 5px">curl -fsSL .../install/uninstall.sh | sudo bash</code></div>')+
+    '<div class="actions"><button class="primary" onclick="dismissCleanup('+id+')">✓ Done — agent removed</button>'+
+    '<span class="muted" style="font-size:12px">Reminder only — the migration is already deleted. Dismiss when the agent is gone.</span></div>';
+  return card;
+}
+function dismissCleanup(id){delete pendingCleanup[id];const c=$('mig'+id);if(c)c.remove();}
 function migCard(v){
   const m=v.migration;const err=anyDiskError(m);
+  migMeta[m.id]={uninstall:v.uninstall_cmd||'',source:m.source_hostname||'',name:m.name};
   const collapsed=collapsedMigs.has(m.id);
   const firstSeen=!seenMigs.has(m.id);seenMigs.add(m.id);
 
@@ -634,9 +660,12 @@ async function refresh(animate){
     const c=$('creating');if(c)c.remove();
     const migs=$('migs');
     migs.innerHTML='';
-    if(!list.length){migs.innerHTML='<div class="muted" style="padding:8px">No migrations yet. Create one above.</div>';}
-    else list.forEach(v=>{const card=migCard(v);migs.appendChild(card);
+    list.forEach(v=>{const card=migCard(v);migs.appendChild(card);
       card.querySelectorAll('details').forEach(d=>{if(open.has(card.id+':'+d.querySelector('summary').textContent))d.open=true});});
+    // Keep reminder cards for migrations that were deleted but whose agent
+    // cleanup hasn't been dismissed yet (they're no longer in the list).
+    Object.keys(pendingCleanup).forEach(id=>{if(!$('mig'+id)){const cc=cleanupCard(id);if(cc)migs.appendChild(cc);}});
+    if(!migs.children.length){migs.innerHTML='<div class="muted" style="padding:8px">No migrations yet. Create one above.</div>';}
     // Restore each cached activity-log scroll position so polling doesn't yank the view.
     Object.keys(logCache).forEach(id=>{const b=$('log'+id);if(b&&logCache[id])b.scrollTop=logCache[id].scroll});
     if(animate)flash(migs);
