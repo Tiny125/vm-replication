@@ -126,8 +126,19 @@ const consoleHTML = `<!DOCTYPE html>
    cursor:pointer;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:11px 13px}
  .modal-check input{width:auto;margin-top:2px;cursor:pointer;accent-color:var(--accent)}
  .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
+ .toast-wrap{position:fixed;top:18px;right:18px;z-index:200;display:flex;flex-direction:column;gap:10px;max-width:360px}
+ .toast{display:flex;align-items:flex-start;gap:9px;background:var(--surface);border:1px solid var(--border);
+   border-left:4px solid var(--muted);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.16);
+   padding:12px 14px;font-size:13.5px;color:var(--text);animation:toastin .22s cubic-bezier(.2,.8,.3,1)}
+ .toast.ok{border-left-color:var(--green)} .toast.ok .ic{color:var(--green)}
+ .toast.bad{border-left-color:var(--red)} .toast.bad .ic{color:var(--red)}
+ .toast .ic{font-weight:700;line-height:1.4}
+ .toast.closing{animation:toastout .2s ease forwards}
+ @keyframes toastin{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
+ @keyframes toastout{to{transform:translateX(20px);opacity:0}}
 </style></head>
 <body>
+<div id="toasts" class="toast-wrap"></div>
 <div class="wrap">
   <h1>vm-<span class="dot">replication</span></h1>
   <div class="sub">Migrate Linux servers to Akamai Cloud (Linode).</div>
@@ -269,6 +280,14 @@ function uiDialog(opts){
 function confirmModal(opts){return uiDialog(opts)}
 function alertModal(opts){return uiDialog({title:opts.title,html:opts.html,okText:opts.okText||'OK',okDanger:opts.danger,cancel:false})}
 
+// toast shows a small auto-dismissing notification (kind: 'ok' | 'bad').
+function toast(msg,kind){
+  const el=document.createElement('div');el.className='toast '+(kind||'');
+  el.innerHTML='<span class="ic">'+(kind==='bad'?'✕':'✓')+'</span><span>'+esc(msg)+'</span>';
+  $('toasts').appendChild(el);
+  setTimeout(()=>{el.classList.add('closing');setTimeout(()=>el.remove(),200)},3800);
+}
+
 async function login(btn){
   $('loginErr').textContent=''; busy(btn,true);
   try{await api('POST','/login',{password:$('pw').value});$('pw').value='';start()}
@@ -390,7 +409,9 @@ async function deleteMig(id,name,btn){
     html:'<b>'+esc(name)+'</b><div style="margin-top:8px" class="warn">This deletes the replication volume(s) and ALL replicated data, and cannot be undone.</div>'+
       '<div class="muted" style="margin-top:8px;font-size:13px">Completed image volumes are kept. Remove the agent from the source separately (the uninstall command is shown on completed migrations).</div>',
     okText:'Delete',okDanger:true}))return;
-  busy(btn,true);try{await api('DELETE','/api/v1/migrations/'+id);await refresh(true)}catch(e){alertModal({title:'Cannot delete',html:esc(e.message),danger:true})}finally{busy(btn,false)}
+  busy(btn,true);
+  try{await api('DELETE','/api/v1/migrations/'+id);await refresh(true);toast('Migration #'+id+' ('+name+') deleted','ok')}
+  catch(e){toast('Delete failed: '+e.message,'bad')}finally{busy(btn,false)}
 }
 // "Check status" re-fetches and shows the latest agent connection result in a box.
 async function checkStatus(id,btn){
