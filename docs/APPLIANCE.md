@@ -117,6 +117,21 @@ installs a systemd service (`applianced`), and prints:
 Options: `--public-host <ip>` (if auto-detect is wrong), `--region us-ord`,
 `--port 8080`.
 
+**Sessions & password recovery.** Signing out of the console only clears your
+browser session — it never stops a migration. Replication runs in the
+`applianced` service independent of console logins, so sign-out (or a closed
+browser) leaves every migration running. Forgot the console password? Retrieve
+it on the replication server without disturbing anything:
+
+```
+sudo /usr/local/bin/applianced -data-dir /var/lib/vm-repl -show-password
+```
+
+This only reads the saved password file, so it's safe to run while the service
+is live. (The password is stored only as a hash; the plaintext lives in
+`<data-dir>/initial-admin-password.txt`. If that file was deleted it can't be
+recovered without resetting.)
+
 > The console is served over **HTTPS** with a self-signed certificate generated
 > at install, so the password and Linode token are encrypted in transit. The
 > replication **data plane is always mutual TLS**, and the Linode token (step 3)

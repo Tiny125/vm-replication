@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -47,8 +48,23 @@ func main() {
 		tlsCert       = flag.String("tls-cert", "", "console TLS certificate (self-signed auto-generated if empty)")
 		tlsKey        = flag.String("tls-key", "", "console TLS key")
 		insecureHTTP  = flag.Bool("insecure-http", false, "serve the console over plain HTTP (NOT recommended; testing/behind-proxy only)")
+		showPassword  = flag.Bool("show-password", false, "print the saved console admin password and exit (does not touch the running service)")
 	)
 	flag.Parse()
+
+	// Password recovery: read the saved plaintext password file and exit. This
+	// only reads a file (no DB, no server), so it is safe to run while the
+	// appliance is serving — it won't restart, terminate, or change anything.
+	if *showPassword {
+		pwFile := filepath.Join(*dataDir, "initial-admin-password.txt")
+		b, err := os.ReadFile(pwFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "could not read %s: %v\n(the password is stored only as a hash; if this file was removed it cannot be recovered without resetting)\n", pwFile, err)
+			os.Exit(1)
+		}
+		fmt.Print(string(b))
+		return
+	}
 
 	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
 		log.Fatalf("applianced: data dir: %v", err)

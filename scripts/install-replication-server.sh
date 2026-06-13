@@ -212,6 +212,11 @@ cat <<EOF
    4. Watch replication status; when checks pass, click "Start migration".
    5. The migrated image (a cloned volume) can launch new Linode instances.
 
+ Forgot the password? Retrieve it any time on this server with:
+   sudo /usr/local/bin/applianced -data-dir $LIB -show-password
+ (Signing out of the console does NOT stop migrations — replication keeps
+  running in the background regardless of console sessions.)
+
  The console (HTTPS) and the replication data plane (mutual TLS) are both
  encrypted. Still, restrict port $PORT to trusted networks where you can.
  Logs: journalctl -u applianced -f

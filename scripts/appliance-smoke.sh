@@ -34,6 +34,11 @@ echo "   console served over HTTPS; verifying against generated cert"
 PW="$(cat "$WORK/data/initial-admin-password.txt")"
 echo "   generated admin password: $PW"
 
+echo "== Password recovery (-show-password reads it without touching the service) =="
+SHOWPW="$(cd "$WORK" && ./applianced -data-dir "$WORK/data" -show-password)"
+[ "$SHOWPW" = "$PW" ] || { echo "FAIL: -show-password returned '$SHOWPW', want '$PW'"; exit 1; }
+echo "   OK: -show-password matches"
+
 echo "== Login (over verified TLS) =="
 api -X POST "$BASE/login" -H 'Content-Type: application/json' -d "{\"password\":\"$PW\"}" >/dev/null
 echo "   OK (rejecting wrong password):"
