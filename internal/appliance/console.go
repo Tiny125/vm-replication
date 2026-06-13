@@ -550,6 +550,10 @@ function progressLine(v,m){
     else{
       const pct=syncPct(v,m);
       label=(st==='created'||st==='awaiting_agent'?'waiting for agent':'initial sync')+' · '+pct.toFixed(1)+'%';
+      // Live throughput: bytes copied so far (percent of total source size)
+      // over the elapsed sync time. Shown as e.g. "42.3 MiB/s".
+      const tot=disks(m).reduce((a,d)=>a+(d.size_bytes||0),0);
+      if(pct>0&&v.elapsed_seconds>0&&tot>0)label+=' · '+fmtBytes(pct/100*tot/v.elapsed_seconds)+'/s';
       if(v.eta_seconds>=0)label+=' · ~'+fmtDur(v.eta_seconds)+' left';
       bar=progBar(pct,false);
     }
@@ -640,10 +644,16 @@ function migCard(v){
        :'To launch manually: create a Linode (same region), attach these volumes (boot disk = <b>sda</b>, data = sdb…), then add a config. If the boot disk has a <b>partition table + GRUB</b>, use kernel <code style="display:inline;padding:1px 5px">GRUB 2</code>; if it is a <b>partitionless whole-disk filesystem</b>, use a <b>Linode kernel</b> (e.g. “Latest 64-bit”) with root <code style="display:inline;padding:1px 5px">/dev/sda</code>. Then boot. The “Cutover” launch option picks the right kernel for you automatically.')+'</div>';
   }
 
-  let checks='';for(const c of (v.validations||[]))checks+='<div style="font-size:13px;margin:2px 0"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>';
+  // Two groups: pre-migration (environment readiness while replicating) and
+  // migration (the cutover gate: initial full sync).
+  const checkRow=c=>'<div style="font-size:13px;margin:2px 0"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>';
+  const subHead=t=>'<div class="muted" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin:10px 0 4px">'+t+'</div>';
+  const pre=(v.validations||[]).filter(c=>c.group!=='migration'),mig=(v.validations||[]).filter(c=>c.group==='migration');
+  let checks=subHead('Pre-migration validation checks')+pre.map(checkRow).join('')+
+             subHead('Migration validation check')+mig.map(checkRow).join('');
   const allOk=(v.validations||[]).every(c=>c.ok);
-  b+='<details'+(allOk?'':' open')+'><summary>Pre-migration validation checks'+(allOk?' (all passing)':'')+'</summary><div>'+
-     '<div class="muted" style="font-size:12px;margin-bottom:6px">These track readiness during replication. Once the <b>initial full sync</b> is complete the migration can be cut over; agent-connection and replication-lag are informational from then on (they stop updating after cutover).</div>'+checks+'</div></details>';
+  b+='<details'+(allOk?'':' open')+'><summary>Validation checks'+(allOk?' (all passing)':'')+'</summary><div>'+
+     '<div class="muted" style="font-size:12px;margin-bottom:6px">Pre-migration checks track readiness while replicating (informational after cutover). The migration check — <b>initial full sync complete</b> — is what allows cutover.</div>'+checks+'</div></details>';
   b+='<details><summary>Disks ('+disks(m).length+')</summary><div>'+diskTable(m)+'</div></details>';
   const cachedLog=logCache[m.id];
   b+='<details ontoggle="if(this.open)ensureLog('+m.id+')"><summary>Activity log</summary><div>'+
@@ -703,6 +713,7 @@ function replaceCard(id,v){
   const card=migCard(v);
   if(old)old.replaceWith(card);
   card.querySelectorAll('details').forEach(d=>{if(open.has(d.querySelector('summary').textContent))d.open=true});
+  if(card.querySelector('details[open] pre[id^="log"]'))loadLog(id); // refetch, not just cached
   return card;
 }
 // refreshMig re-fetches and re-renders ONLY this migration's card.
@@ -731,6 +742,9 @@ async function refresh(animate){
     // cleanup hasn't been dismissed yet (they're no longer in the list).
     Object.keys(pendingCleanup).forEach(id=>{if(!$('mig'+id)){const cc=cleanupCard(id);if(cc)migs.appendChild(cc);}});
     if(!migs.children.length){migs.innerHTML='<div class="muted" style="padding:8px">No migrations yet. Create one above.</div>';}
+    // Re-fetch every OPEN activity log so new entries appear automatically
+    // (the cached copy is only a flicker-free placeholder until this lands).
+    document.querySelectorAll('#migs details[open] pre[id^="log"]').forEach(p=>loadLog(parseInt(p.id.slice(3),10)));
     if(animate)flash(migs);
     loadSettings();
   }catch(e){/* 401 handled in api() */}
@@ -738,7 +752,7 @@ async function refresh(animate){
 
 async function start(){show('app');if(!document.querySelector('#disks .row'))addDisk();refresh(false);}
 async function init(){
-  try{await api('GET','/api/v1/session');start();setInterval(()=>{if(!$('app').classList.contains('hide'))refresh(false)},5000);}
+  try{await api('GET','/api/v1/session');start();setInterval(()=>{if(!$('app').classList.contains('hide'))refresh(false)},10000);}
   catch(e){show('login')}
 }
 init();
