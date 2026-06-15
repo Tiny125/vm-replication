@@ -525,16 +525,17 @@ async function showLogModal(id){
   uiDialog({title:'Activity log — migration #'+id,html:'<pre class="logpre scroll">'+body+'</pre>',wide:true,cancel:false,okText:'Close'});
 }
 
-// syncPct estimates initial-full-sync completion (0–100). Prefers the live
-// block-level percentage reported by the receiver; falls back to bytes received
-// vs total source size when no session is active.
+// syncPct is the TRUE initial-full-sync completion (0–100), or -1 when unknown.
+// It uses only the live block-level percentage reported by the receiver during
+// an active full-sync session. It does NOT derive a percentage from cumulative
+// bytes-transferred, which counts re-sent/changed blocks and can exceed the disk
+// size (that produced a misleading "99%" that never finished). When no session
+// is reporting and the baseline isn't done, the progress is genuinely unknown.
 function syncPct(v,m){
   const ds=disks(m);
   if(ds.length&&ds.every(d=>d.full_sync_done))return 100;
   if(v.percent_done>=0)return Math.max(0,Math.min(99.9,v.percent_done));
-  const tot=ds.reduce((a,d)=>a+(d.size_bytes||0),0);
-  if(tot>0)return Math.max(0,Math.min(99,bytesTotal(m)/tot*100));
-  return 0;
+  return -1; // no live session reporting; unknown
 }
 function progBar(width,indet){
   return '<div class="prog'+(indet?' indet':'')+'"><div style="width:'+(indet?35:Math.round(width))+'%"></div></div>';
@@ -569,14 +570,22 @@ function progressLine(v,m){
     if(allBase){label='initial sync completed · 100%';bar=progBar(100,false);}
     else{
       const pct=syncPct(v,m);
-      label=(st==='created'||st==='awaiting_agent'?'waiting for agent':'initial sync')+' · '+pct.toFixed(1)+'%';
-      if(v.eta_seconds>=0)label+=' · ~'+fmtDur(v.eta_seconds)+' left';
-      bar=progBar(pct,false);
+      if(pct<0){
+        // No live session reporting and not yet baselined — show motion, not a
+        // fabricated percentage.
+        label=(st==='created'||st==='awaiting_agent'?'waiting for agent':'initial sync in progress');
+        bar=progBar(0,true); // indeterminate
+      }else{
+        label='initial sync · '+pct.toFixed(1)+'%';
+        if(v.eta_seconds>=0)label+=' · ~'+fmtDur(v.eta_seconds)+' left';
+        bar=progBar(pct,false);
+      }
     }
   }
-  // Throughput line: total received + current copy speed (when measurable).
+  // Throughput line: total bytes transferred over the wire (counts re-sent and
+  // changed blocks, so it can exceed the disk size) + current copy speed.
   const bps=replSpeed(v,m);
-  let recv=fmtBytes(bytesTotal(m))+' received';
+  let recv=fmtBytes(bytesTotal(m))+' transferred';
   if(bps>=0)recv+=' · '+fmtBytes(bps)+'/s';
   return '<span class="muted">'+esc(label)+'</span>'+bar+
     '<div class="muted" style="font-size:12px;margin-top:3px">'+recv+'</div>';
