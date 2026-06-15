@@ -43,9 +43,10 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 // ---- admin password ----
 
 const (
-	keyAdminSalt = "admin_pw_salt"
-	keyAdminHash = "admin_pw_hash"
-	keyLinodeTok = "linode_token_enc"
+	keyAdminSalt  = "admin_pw_salt"
+	keyAdminHash  = "admin_pw_hash"
+	keyLinodeTok  = "linode_token_enc"
+	keyLinodeAcct = "linode_account" // human label of the account the token belongs to
 )
 
 // hashPassword returns hex(sha256(salt || password)) iterated to slow brute
@@ -159,6 +160,18 @@ func (s *Store) LinodeToken(ctx context.Context) (string, error) {
 func (s *Store) LinodeTokenSet(ctx context.Context) (bool, error) {
 	_, ok, err := s.GetSetting(ctx, keyLinodeTok)
 	return ok, err
+}
+
+// SetLinodeAccount records a human label of the account the token belongs to
+// (e.g. "alice <alice@example.com>"), shown in the console.
+func (s *Store) SetLinodeAccount(ctx context.Context, account string) error {
+	return s.SetSetting(ctx, keyLinodeAcct, account)
+}
+
+// LinodeAccount returns the stored account label (empty if unset).
+func (s *Store) LinodeAccount(ctx context.Context) (string, error) {
+	v, _, err := s.GetSetting(ctx, keyLinodeAcct)
+	return v, err
 }
 
 // ---- migrations ----
@@ -464,9 +477,12 @@ func (s *Store) DeleteSetting(ctx context.Context, key string) error {
 	return err
 }
 
-// DeleteLinodeToken removes the stored Linode API token.
+// DeleteLinodeToken removes the stored Linode API token and account label.
 func (s *Store) DeleteLinodeToken(ctx context.Context) error {
-	return s.DeleteSetting(ctx, keyLinodeTok)
+	if err := s.DeleteSetting(ctx, keyLinodeTok); err != nil {
+		return err
+	}
+	return s.DeleteSetting(ctx, keyLinodeAcct)
 }
 
 func boolToInt(b bool) int {

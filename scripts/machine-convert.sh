@@ -80,21 +80,48 @@ fi
 # filesystem". (This only tidies a complete-but-dirty copy; it can't recover
 # blocks that were never replicated.)
 fsck_clean() {
-  local part="$1" fstype
+  local part="$1" fstype rc out sb repaired
   [ -b "$part" ] || return 0
   fstype="$(blkid -s TYPE -o value "$part" 2>/dev/null || true)"
+  out="$(mktemp)"
   case "$fstype" in
     ext2|ext3|ext4)
-      command -v e2fsck >/dev/null 2>&1 || { log "e2fsck not available; skipping check on $part"; return 0; }
+      command -v e2fsck >/dev/null 2>&1 || { log "e2fsck not available; skipping check on $part"; rm -f "$out"; return 0; }
       log "Checking $part ($fstype) before mount"
-      e2fsck -fy "$part" 2>&1 | sed 's/^/   [fsck] /' || true ;;
+      rc=0; e2fsck -fy "$part" >"$out" 2>&1 || rc=$?
+      sed 's/^/   [fsck] /' "$out"
+      # e2fsck: 0=clean, 1=fixed, 2=fixed(reboot) are success; >=4 means errors
+      # remained or the PRIMARY superblock is bad ("Bad magic number in
+      # super-block"). Retry from a backup superblock, which often recovers a
+      # crash-consistent copy whose primary superblock was caught mid-write.
+      if [ "$rc" -ge 4 ]; then
+        log "primary superblock unusable (e2fsck rc=$rc); retrying from a backup superblock"
+        repaired=0
+        for sb in 32768 8193 98304 163840 229376; do
+          rc=0; e2fsck -fy -b "$sb" "$part" >"$out" 2>&1 || rc=$?
+          sed 's/^/   [fsck] /' "$out"
+          if [ "$rc" -lt 4 ]; then
+            log "recovered $part using backup superblock $sb; re-checking"
+            rc=0; e2fsck -fy "$part" >"$out" 2>&1 || rc=$?
+            sed 's/^/   [fsck] /' "$out"
+            repaired=1; break
+          fi
+        done
+        [ "$repaired" = 1 ] || log "WARNING: $part could not be repaired (rc=$rc); the copy is likely inconsistent (a live source copied over many minutes). A fresh full sync of a quiesced/idle source is the reliable fix."
+      fi ;;
     xfs)
-      command -v xfs_repair >/dev/null 2>&1 || { log "xfs_repair not available; skipping check on $part"; return 0; }
+      command -v xfs_repair >/dev/null 2>&1 || { log "xfs_repair not available; skipping check on $part"; rm -f "$out"; return 0; }
       log "Repairing $part (xfs) before mount"
-      xfs_repair "$part" 2>&1 | sed 's/^/   [fsck] /' || true ;;
+      rc=0; xfs_repair "$part" >"$out" 2>&1 || rc=$?
+      sed 's/^/   [fsck] /' "$out"
+      if [ "$rc" -ne 0 ]; then
+        log "xfs_repair failed (rc=$rc); retrying with -L to zap a dirty log"
+        xfs_repair -L "$part" 2>&1 | sed 's/^/   [fsck] /' || true
+      fi ;;
     *)
       log "no automatic fs check for $part (${fstype:-unknown}); skipping" ;;
   esac
+  rm -f "$out"
 }
 
 # Find the root: the candidate carrying /etc/fstab and a real root tree. fsck
