@@ -511,7 +511,13 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		if strings.Contains(string(out), "vmrepl-layout: wholedisk") {
 			// Partitionless filesystem: no on-disk bootloader, so boot with a
 			// Linode kernel that mounts the whole volume as root.
-			kernel, rootDevice = "linode/latest-64bit", "/dev/sda"
+			kernel = "linode/latest-64bit"
+		}
+		// Use the exact root device the convert script detected (e.g. /dev/sda1
+		// for a partitioned disk) — booting a partitioned disk with root_device
+		// /dev/sda panics with "unable to mount root fs".
+		if rd := convertField(string(out), "vmrepl-root:"); rd != "" {
+			rootDevice = rd
 		}
 		if err != nil {
 			log.Printf("appliance: migration %d: machine-convert failed (continuing best-effort): %v\n%s", m.ID, err, trimOut(out))
@@ -914,6 +920,18 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// convertField extracts the value of a "key: value" line emitted by
+// machine-convert.sh (e.g. "vmrepl-root: /dev/sda1") from its output.
+func convertField(out, key string) string {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, key) {
+			return strings.TrimSpace(strings.TrimPrefix(line, key))
+		}
+	}
+	return ""
 }
 
 // oneLine collapses whitespace/newlines to single spaces and caps the length,

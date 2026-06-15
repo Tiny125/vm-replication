@@ -97,6 +97,20 @@ if [ "$PARTITIONED" -eq 1 ]; then
 else
   echo "vmrepl-layout: wholedisk"
 fi
+# Report the root device as it will appear on the launched Linode (the boot
+# volume attaches as /dev/sda). For a partitioned disk this is /dev/sda<N> where
+# N is the root partition number; for a whole-disk filesystem it is /dev/sda.
+# The caller uses this for the Linode config's root_device — using /dev/sda for a
+# partitioned disk makes a Linode-kernel boot panic with "unable to mount root".
+ROOT_PARTNUM=""
+if [ "$PARTITIONED" -eq 1 ]; then
+  ROOT_PARTNUM="$(printf '%s' "$ROOT_PART" | grep -oE '[0-9]+$' || true)"
+fi
+if [ -n "$ROOT_PARTNUM" ]; then
+  echo "vmrepl-root: /dev/sda${ROOT_PARTNUM}"
+else
+  echo "vmrepl-root: /dev/sda"
+fi
 
 log "Mounting root and binding kernel filesystems"
 mount "$ROOT_PART" "$MNT"
@@ -151,17 +165,35 @@ elif command -v dracut >/dev/null 2>&1; then
   dracut -f --kver "\$KVER" || true
 fi
 
-# 4) Reinstall + regenerate GRUB so it points at this disk.
+# 4) Reinstall GRUB to the boot disk and (re)generate its config. This is what
+#    makes Linode's "GRUB 2" boot mode work; if grub.cfg is missing/empty the
+#    instance drops to a "grub>" prompt, so we VERIFY it and fail loudly instead
+#    of silently leaving an unbootable disk.
 DISK="\$(lsblk -no pkname "\$(findmnt -no SOURCE /)" 2>/dev/null | head -1)"
 [ -n "\$DISK" ] && DISK="/dev/\$DISK" || DISK="$DEV"
+PTTYPE="\$(blkid -s PTTYPE -o value "\$DISK" 2>/dev/null || true)"
+log "Boot disk \$DISK (partition table: \${PTTYPE:-unknown})"
+INSTALL=""; GCFG=""; MK=""
 if command -v grub-install >/dev/null 2>&1; then
-  log "Installing GRUB to \$DISK (BIOS)"
-  grub-install --target=i386-pc "\$DISK" || true
-  update-grub || grub-mkconfig -o /boot/grub/grub.cfg || true
+  INSTALL="grub-install"; GCFG="/boot/grub/grub.cfg"
+  if command -v update-grub >/dev/null 2>&1; then MK="update-grub"; else MK="grub-mkconfig -o \$GCFG"; fi
 elif command -v grub2-install >/dev/null 2>&1; then
-  log "Installing GRUB2 to \$DISK (BIOS)"
-  grub2-install "\$DISK" || true
-  grub2-mkconfig -o /boot/grub2/grub.cfg || true
+  INSTALL="grub2-install"; GCFG="/boot/grub2/grub.cfg"; MK="grub2-mkconfig -o \$GCFG"
+fi
+if [ -n "\$INSTALL" ]; then
+  log "Installing GRUB (BIOS/i386-pc) to \$DISK"
+  \$INSTALL --target=i386-pc --recheck "\$DISK" 2>&1 | sed 's/^/   [grub] /' || \
+    log "WARNING: grub-install failed (a GPT disk needs a small BIOS-boot/bios_grub partition for BIOS GRUB)"
+  log "Generating \$GCFG"
+  \$MK 2>&1 | sed 's/^/   [grub] /' || true
+  if [ -s "\$GCFG" ] && grep -qE '^[[:space:]]*(linux|linux16|menuentry)' "\$GCFG"; then
+    log "GRUB config OK: \$GCFG"
+  else
+    echo "   [chroot] ERROR: \$GCFG is missing or has no boot entries; the disk would drop to a grub> prompt" >&2
+    exit 3
+  fi
+else
+  log "no grub-install found — relying on the Linode kernel to boot the root filesystem"
 fi
 
 # 5) Network: let Linode's Network Helper manage it. Reset to DHCP and strip
