@@ -112,13 +112,41 @@ else
   echo "vmrepl-root: /dev/sda"
 fi
 
+# A block-level copy of a RUNNING server is crash-consistent (like a power-loss
+# snapshot), so the filesystem's journal may need replaying before it will mount
+# cleanly. Run the matching repair tool automatically so the migrated instance
+# boots without manual intervention. (This only tidies a complete-but-dirty copy;
+# it can't recover blocks that were never replicated.)
+fsck_clean() {
+  local part="$1" fstype
+  [ -b "$part" ] || return 0
+  fstype="$(blkid -s TYPE -o value "$part" 2>/dev/null || true)"
+  case "$fstype" in
+    ext2|ext3|ext4)
+      command -v e2fsck >/dev/null 2>&1 || { log "e2fsck not available; skipping check on $part"; return 0; }
+      log "Checking $part ($fstype) before mount"
+      e2fsck -fy "$part" 2>&1 | sed 's/^/   [fsck] /' || true ;;
+    xfs)
+      command -v xfs_repair >/dev/null 2>&1 || { log "xfs_repair not available; skipping check on $part"; return 0; }
+      log "Repairing $part (xfs) before mount"
+      xfs_repair "$part" 2>&1 | sed 's/^/   [fsck] /' || true ;;
+    *)
+      log "no automatic fs check for $part (${fstype:-unknown}); skipping" ;;
+  esac
+}
+
+fsck_clean "$ROOT_PART"
 log "Mounting root and binding kernel filesystems"
 mount "$ROOT_PART" "$MNT"
 # If /boot is a separate partition listed in fstab, mount it too.
 if grep -qE '^\S+\s+/boot\s' "$MNT/etc/fstab"; then
   BOOT_SRC=$(awk '$2=="/boot"{print $1}' "$MNT/etc/fstab" | head -1)
   BOOT_DEV=$(blkid -t "${BOOT_SRC#UUID=}" -o device 2>/dev/null || echo "")
-  [ -n "$BOOT_DEV" ] && mount "$BOOT_DEV" "$MNT/boot" 2>/dev/null || true
+  if [ -n "$BOOT_DEV" ]; then
+    umount "$MNT/boot" 2>/dev/null || true
+    fsck_clean "$BOOT_DEV"
+    mount "$BOOT_DEV" "$MNT/boot" 2>/dev/null || true
+  fi
 fi
 mount --bind /dev "$MNT/dev"
 mount --bind /dev/pts "$MNT/dev/pts"
