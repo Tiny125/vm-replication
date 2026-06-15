@@ -41,7 +41,12 @@ func (s *Server) handleAgentInstaller(w http.ResponseWriter, r *http.Request) {
 	var checks, execs strings.Builder
 	for _, d := range m.Disks {
 		target := fmt.Sprintf("%s:%d", s.cfg.PublicHost, d.ReceiverPort)
-		manifest := fmt.Sprintf("/var/lib/vmrepl-source-disk%d.cbt", d.Index)
+		// Manifest path is scoped to THIS migration (by id), not just the device.
+		// Otherwise a new migration on the same device would load a previous
+		// migration's manifest and do a delta sync against its fresh, empty target
+		// volume — so the target would never receive a full copy and the baseline
+		// would never complete.
+		manifest := fmt.Sprintf("/var/lib/vmrepl-source-mig%d-disk%d.cbt", m.ID, d.Index)
 		fmt.Fprintf(&checks, "[ -e %q ] || { echo \"source device %s not found — re-check the device in the console\"; exit 1; }\n", d.SourceDevice, d.SourceDevice)
 		fmt.Fprintf(&execs, "ExecStart=$BIN -device %s -target %s -server-name $SERVER_NAME -manifest %s -cert $ETC/agent.crt -key $ETC/agent.key -ca $ETC/ca.crt\n",
 			d.SourceDevice, target, manifest)
@@ -146,7 +151,7 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 rm -f /usr/local/bin/vmrepl-agent
 rm -rf /etc/vm-repl
-rm -f /var/lib/vmrepl-source-disk*.cbt /var/lib/vmrepl-source.cbt
+rm -f /var/lib/vmrepl-source-*.cbt /var/lib/vmrepl-source.cbt
 echo "vm-replication agent removed. This server's data and OS were never modified."
 `
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
