@@ -72,12 +72,39 @@ if [ "${#PARTS[@]}" -eq 0 ]; then
   PARTITIONED=0
 fi
 
-# Find the root: the candidate carrying /etc/fstab and a real root tree.
+# A block-level copy of a RUNNING server is crash-consistent (like a power-loss
+# snapshot), so the filesystem's journal may need replaying before it will even
+# mount. Repair it with the matching tool BEFORE we try to mount it — both for
+# the read-only probe below and the real mount — otherwise a dirty journal makes
+# the mount fail and root detection wrongly reports "could not locate a root
+# filesystem". (This only tidies a complete-but-dirty copy; it can't recover
+# blocks that were never replicated.)
+fsck_clean() {
+  local part="$1" fstype
+  [ -b "$part" ] || return 0
+  fstype="$(blkid -s TYPE -o value "$part" 2>/dev/null || true)"
+  case "$fstype" in
+    ext2|ext3|ext4)
+      command -v e2fsck >/dev/null 2>&1 || { log "e2fsck not available; skipping check on $part"; return 0; }
+      log "Checking $part ($fstype) before mount"
+      e2fsck -fy "$part" 2>&1 | sed 's/^/   [fsck] /' || true ;;
+    xfs)
+      command -v xfs_repair >/dev/null 2>&1 || { log "xfs_repair not available; skipping check on $part"; return 0; }
+      log "Repairing $part (xfs) before mount"
+      xfs_repair "$part" 2>&1 | sed 's/^/   [fsck] /' || true ;;
+    *)
+      log "no automatic fs check for $part (${fstype:-unknown}); skipping" ;;
+  esac
+}
+
+# Find the root: the candidate carrying /etc/fstab and a real root tree. fsck
+# each candidate first so a dirty journal doesn't block the probe mount.
 ROOT_PART=""
 is_root() { [ -f "$1/etc/fstab" ] && { [ -d "$1/sbin" ] || [ -L "$1/sbin" ] || [ -d "$1/bin" ] || [ -L "$1/bin" ]; }; }
 for p in "${PARTS[@]}"; do
   [ -b "$p" ] || continue
   umount "$MNT" 2>/dev/null || true
+  fsck_clean "$p"
   if mount -o ro "$p" "$MNT" 2>/dev/null; then
     if is_root "$MNT"; then ROOT_PART="$p"; umount "$MNT" 2>/dev/null || true; break; fi
     umount "$MNT" 2>/dev/null || true
@@ -112,30 +139,6 @@ else
   echo "vmrepl-root: /dev/sda"
 fi
 
-# A block-level copy of a RUNNING server is crash-consistent (like a power-loss
-# snapshot), so the filesystem's journal may need replaying before it will mount
-# cleanly. Run the matching repair tool automatically so the migrated instance
-# boots without manual intervention. (This only tidies a complete-but-dirty copy;
-# it can't recover blocks that were never replicated.)
-fsck_clean() {
-  local part="$1" fstype
-  [ -b "$part" ] || return 0
-  fstype="$(blkid -s TYPE -o value "$part" 2>/dev/null || true)"
-  case "$fstype" in
-    ext2|ext3|ext4)
-      command -v e2fsck >/dev/null 2>&1 || { log "e2fsck not available; skipping check on $part"; return 0; }
-      log "Checking $part ($fstype) before mount"
-      e2fsck -fy "$part" 2>&1 | sed 's/^/   [fsck] /' || true ;;
-    xfs)
-      command -v xfs_repair >/dev/null 2>&1 || { log "xfs_repair not available; skipping check on $part"; return 0; }
-      log "Repairing $part (xfs) before mount"
-      xfs_repair "$part" 2>&1 | sed 's/^/   [fsck] /' || true ;;
-    *)
-      log "no automatic fs check for $part (${fstype:-unknown}); skipping" ;;
-  esac
-}
-
-fsck_clean "$ROOT_PART"
 log "Mounting root and binding kernel filesystems"
 mount "$ROOT_PART" "$MNT"
 # If /boot is a separate partition listed in fstab, mount it too.
@@ -193,35 +196,40 @@ elif command -v dracut >/dev/null 2>&1; then
   dracut -f --kver "\$KVER" || true
 fi
 
-# 4) Reinstall GRUB to the boot disk and (re)generate its config. This is what
-#    makes Linode's "GRUB 2" boot mode work; if grub.cfg is missing/empty the
-#    instance drops to a "grub>" prompt, so we VERIFY it and fail loudly instead
-#    of silently leaving an unbootable disk.
-DISK="\$(lsblk -no pkname "\$(findmnt -no SOURCE /)" 2>/dev/null | head -1)"
-[ -n "\$DISK" ] && DISK="/dev/\$DISK" || DISK="$DEV"
-PTTYPE="\$(blkid -s PTTYPE -o value "\$DISK" 2>/dev/null || true)"
-log "Boot disk \$DISK (partition table: \${PTTYPE:-unknown})"
-INSTALL=""; GCFG=""; MK=""
-if command -v grub-install >/dev/null 2>&1; then
-  INSTALL="grub-install"; GCFG="/boot/grub/grub.cfg"
-  if command -v update-grub >/dev/null 2>&1; then MK="update-grub"; else MK="grub-mkconfig -o \$GCFG"; fi
-elif command -v grub2-install >/dev/null 2>&1; then
-  INSTALL="grub2-install"; GCFG="/boot/grub2/grub.cfg"; MK="grub2-mkconfig -o \$GCFG"
-fi
-if [ -n "\$INSTALL" ]; then
-  log "Installing GRUB (BIOS/i386-pc) to \$DISK"
-  \$INSTALL --target=i386-pc --recheck "\$DISK" 2>&1 | sed 's/^/   [grub] /' || \
-    log "WARNING: grub-install failed (a GPT disk needs a small BIOS-boot/bios_grub partition for BIOS GRUB)"
-  log "Generating \$GCFG"
-  \$MK 2>&1 | sed 's/^/   [grub] /' || true
-  if [ -s "\$GCFG" ] && grep -qE '^[[:space:]]*(linux|linux16|menuentry)' "\$GCFG"; then
-    log "GRUB config OK: \$GCFG"
+# 4) Bootloader. A PARTITIONLESS whole-disk filesystem has no partition table to
+#    install GRUB into; it boots via the Linode-supplied kernel instead, so skip
+#    GRUB entirely here. For a PARTITIONED disk, reinstall GRUB and (re)generate
+#    its config so Linode's "GRUB 2" mode works — and VERIFY grub.cfg so we fail
+#    loudly instead of silently leaving a disk that drops to a "grub>" prompt.
+if [ "$PARTITIONED" = "1" ]; then
+  DISK="\$(lsblk -no pkname "\$(findmnt -no SOURCE /)" 2>/dev/null | head -1)"
+  [ -n "\$DISK" ] && DISK="/dev/\$DISK" || DISK="$DEV"
+  PTTYPE="\$(blkid -s PTTYPE -o value "\$DISK" 2>/dev/null || true)"
+  log "Boot disk \$DISK (partition table: \${PTTYPE:-unknown})"
+  INSTALL=""; GCFG=""; MK=""
+  if command -v grub-install >/dev/null 2>&1; then
+    INSTALL="grub-install"; GCFG="/boot/grub/grub.cfg"
+    if command -v update-grub >/dev/null 2>&1; then MK="update-grub"; else MK="grub-mkconfig -o \$GCFG"; fi
+  elif command -v grub2-install >/dev/null 2>&1; then
+    INSTALL="grub2-install"; GCFG="/boot/grub2/grub.cfg"; MK="grub2-mkconfig -o \$GCFG"
+  fi
+  if [ -n "\$INSTALL" ]; then
+    log "Installing GRUB (BIOS/i386-pc) to \$DISK"
+    \$INSTALL --target=i386-pc --recheck "\$DISK" 2>&1 | sed 's/^/   [grub] /' || \
+      log "WARNING: grub-install failed (a GPT disk needs a small BIOS-boot/bios_grub partition for BIOS GRUB)"
+    log "Generating \$GCFG"
+    \$MK 2>&1 | sed 's/^/   [grub] /' || true
+    if [ -s "\$GCFG" ] && grep -qE '^[[:space:]]*(linux|linux16|menuentry)' "\$GCFG"; then
+      log "GRUB config OK: \$GCFG"
+    else
+      echo "   [chroot] ERROR: \$GCFG is missing or has no boot entries; the disk would drop to a grub> prompt" >&2
+      exit 3
+    fi
   else
-    echo "   [chroot] ERROR: \$GCFG is missing or has no boot entries; the disk would drop to a grub> prompt" >&2
-    exit 3
+    log "no grub-install found — relying on the Linode kernel to boot the root filesystem"
   fi
 else
-  log "no grub-install found — relying on the Linode kernel to boot the root filesystem"
+  log "partitionless whole-disk filesystem — booting via the Linode kernel; skipping GRUB install"
 fi
 
 # 5) Network: let Linode's Network Helper manage it. Reset to DHCP and strip
