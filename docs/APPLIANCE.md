@@ -1,6 +1,6 @@
 # Turnkey Appliance — Web Console Migration
 
-This is the **AWS MGN–style** way to use vm-replication: install one service on a
+This is the turnkey way to use the **vm-replication tool**: install one service on a
 **replication server** (a Linode), open a **web console**, and drive migrations
 from the browser. No manual cert copying or command crafting — the console
 generates a one-line command for each source.

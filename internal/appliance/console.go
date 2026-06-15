@@ -539,6 +539,26 @@ function syncPct(v,m){
 function progBar(width,indet){
   return '<div class="prog'+(indet?' indet':'')+'"><div style="width:'+(indet?35:Math.round(width))+'%"></div></div>';
 }
+// replSpeed estimates copy throughput (bytes/sec). It prefers the backend's
+// LIVE in-session rate (accurate while a full-sync session is actively
+// transferring), and otherwise falls back to the change in total bytes received
+// between polls, smoothed with an EMA (covers reconnecting/short sessions where
+// bytes only update at session completion). Returns -1 until measurable.
+const speedSamples={}; // id -> {bytes, t, ema}
+function replSpeed(v,m){
+  // Live in-session rate: bytes written this session / session elapsed.
+  const tot=disks(m).reduce((a,d)=>a+(d.size_bytes||0),0);
+  if(v.percent_done>=0 && v.elapsed_seconds>0 && tot>0) return v.percent_done/100*tot/v.elapsed_seconds;
+  // Fallback: smoothed delta of total bytes received between polls.
+  const now=Date.now(), bytes=bytesTotal(m), s=speedSamples[m.id];
+  if(!s||bytes<s.bytes){speedSamples[m.id]={bytes,t:now,ema:-1};return -1;}
+  const dt=(now-s.t)/1000;
+  if(dt<4)return s.ema;            // don't resample faster than ~the poll interval
+  const inst=Math.max(0,(bytes-s.bytes)/dt);
+  s.ema = s.ema<0 ? inst : 0.5*inst+0.5*s.ema;
+  s.bytes=bytes; s.t=now;
+  return s.ema;
+}
 function progressLine(v,m){
   const st=m.state;let label,bar;
   if(st==='image_ready'||st==='launched'){label='completed in '+fmtDur(v.elapsed_seconds);bar=progBar(100,false);}
@@ -550,16 +570,16 @@ function progressLine(v,m){
     else{
       const pct=syncPct(v,m);
       label=(st==='created'||st==='awaiting_agent'?'waiting for agent':'initial sync')+' · '+pct.toFixed(1)+'%';
-      // Live throughput: bytes copied so far (percent of total source size)
-      // over the elapsed sync time. Shown as e.g. "42.3 MiB/s".
-      const tot=disks(m).reduce((a,d)=>a+(d.size_bytes||0),0);
-      if(pct>0&&v.elapsed_seconds>0&&tot>0)label+=' · '+fmtBytes(pct/100*tot/v.elapsed_seconds)+'/s';
       if(v.eta_seconds>=0)label+=' · ~'+fmtDur(v.eta_seconds)+' left';
       bar=progBar(pct,false);
     }
   }
+  // Throughput line: total received + current copy speed (when measurable).
+  const bps=replSpeed(v,m);
+  let recv=fmtBytes(bytesTotal(m))+' received';
+  if(bps>=0)recv+=' · '+fmtBytes(bps)+'/s';
   return '<span class="muted">'+esc(label)+'</span>'+bar+
-    '<div class="muted" style="font-size:12px;margin-top:3px">'+fmtBytes(bytesTotal(m))+' received</div>';
+    '<div class="muted" style="font-size:12px;margin-top:3px">'+recv+'</div>';
 }
 function diskTable(m){const d=disks(m);if(!d.length)return '';
   let h='<table><tr><th>Disk</th><th>Device</th><th>Size</th><th>Port</th><th>Baseline</th><th>Volume / note</th></tr>';

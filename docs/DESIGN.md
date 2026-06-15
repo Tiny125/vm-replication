@@ -1,6 +1,6 @@
 # vm-replication — Design
 
-A self-hosted, AWS MGN–style tool for **continuous, block-level Linux→Linux
+A self-hosted **vm-replication tool** for **continuous, block-level Linux→Linux
 replication and migration**, with **Akamai Cloud (Linode)** as the target. It
 replicates from any source (on-prem, AWS, GCP, Azure, Alibaba Cloud, …) to a
 Linode instance and cuts over with minimal downtime.

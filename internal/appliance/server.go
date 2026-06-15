@@ -1,4 +1,4 @@
-// Package appliance is the turnkey, AWS MGN–style control plane: a single
+// Package appliance is the turnkey vm-replication control plane: a single
 // service you install on a "replication server" that presents a password-
 // protected web console, enrolls source agents with a copy-paste command,
 // embeds a receiver per migration, tracks replication status, and finalizes a

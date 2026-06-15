@@ -1,6 +1,6 @@
 # vm-replication
 
-A self-hosted, **AWS MGN–style** tool for **continuous, block-level
+A self-hosted **vm-replication tool** for **continuous, block-level
 Linux→Linux replication and migration**, built to migrate servers from anywhere
 (on-prem, AWS, GCP, Azure, Alibaba Cloud, …) **to Akamai Cloud (Linode)**.
 
@@ -13,7 +13,7 @@ boots natively on Linode — with a near-zero-downtime cutover.
 > and Prometheus metrics, systemd services, low-RPO dm-era change tracking,
 > application-consistent snapshots, and Linode provisioning + boot conversion.
 >
-> **Want the turnkey, AWS MGN–style web console?** See
+> **Want the turnkey web console?** See
 > **[`docs/APPLIANCE.md`](docs/APPLIANCE.md)** — one command installs a
 > replication server, you log in with a generated password, enter source
 > details, run a generated one-liner on the source, then click "Start migration"
@@ -21,7 +21,8 @@ boots natively on Linode — with a near-zero-downtime cutover.
 >
 > Prefer the manual/CLI workflow? The [step-by-step guide → `docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md).
 > Also: [`docs/CUTOVER.md`](docs/CUTOVER.md) (runbook),
-> [`docs/OPERATIONS.md`](docs/OPERATIONS.md) (systemd/control plane), and
+> [`docs/OPERATIONS.md`](docs/OPERATIONS.md) (systemd/control plane),
+> [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) (error reference), and
 > [`docs/DESIGN.md`](docs/DESIGN.md) (architecture).
 
 ## How it works

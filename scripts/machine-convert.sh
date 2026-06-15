@@ -3,7 +3,7 @@
 #
 # Replication gives you a byte-identical copy of the source disk, but a copy is
 # not automatically bootable on Linode's KVM/QEMU platform. This script performs
-# the "machine conversion" (the equivalent of AWS MGN's post-launch conversion):
+# the "machine conversion" (the post-cutover boot fixup):
 # it chroots into the replicated root and fixes the things that differ between
 # the source hypervisor and Linode.
 #

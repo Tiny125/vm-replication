@@ -4,7 +4,7 @@
 # It creates a Linode instance, attaches an empty RAW disk sized to your source
 # (plus an optional swap disk), and boots the instance into Rescue Mode (Finnix)
 # so the receiver daemon can write incoming blocks straight to the raw disk at
-# /dev/sda — exactly the AWS MGN "staging area" pattern.
+# /dev/sda — the replication "staging area" pattern.
 #
 # Requirements: bash, curl, jq, and a Linode API token in LINODE_TOKEN.
 #

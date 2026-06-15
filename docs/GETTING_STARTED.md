@@ -32,13 +32,13 @@ three roles. One physical machine can play more than one role.
    └──────────────────────────────┘
 ```
 
-| Role | What it is | Which program runs here | AWS MGN equivalent |
-|---|---|---|---|
-| **Source** | The existing server you want to migrate (on-prem, AWS, GCP, Azure, …) | **`agent`** | Source server + replication agent |
-| **Target / Replication** | A Linode you create, booted into **Rescue Mode**, with an empty raw disk that will receive the data | **`receiver`** | Replication server + staging area |
-| **Control plane** | Optional dashboard/inventory/RPO tracking. Any always-on host. | **`controld`** (+ `replctl` CLI) | MGN console |
+| Role | What it is | Which program runs here |
+|---|---|---|
+| **Source** | The existing server you want to migrate (on-prem, AWS, GCP, Azure, …) | **`agent`** |
+| **Target / Replication** | A Linode you create, booted into **Rescue Mode**, with an empty raw disk that will receive the data | **`receiver`** |
+| **Control plane** | Optional dashboard/inventory/RPO tracking. Any always-on host. | **`controld`** (+ `replctl` CLI) |
 
-> **Key point:** there is no separate "replication server" like AWS MGN. The
+> **Key point:** there is no separate "replication server" you manage by hand. The
 > **Linode target itself, booted in Rescue Mode**, is the replication/staging
 > instance — the `receiver` writes incoming blocks straight onto its raw disk.
 
