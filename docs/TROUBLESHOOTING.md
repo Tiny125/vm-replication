@@ -100,6 +100,14 @@ and you can **Retry cutover** (it cleans up the previous attempt first).
 | `create instance: ... / create boot config: ... / boot instance: ...` | A Linode API call failed during launch. | Read the quoted Linode error; common causes are account limits, region mismatch, or a volume not yet attachable. Retry cutover. |
 | `could not delete previous cutover Linode/volume (...)` (warn) | Cleanup of a prior attempt couldn't finish. | Remove the leftover `<name>-cutover` instance/volume in Cloud Manager, then retry. |
 
+### Launched instance has the wrong IP / no connectivity / very slow Lish
+
+After cutover the new instance can't be pinged, or **Lish login and every command lag ~10s**, and `ip -br a` shows the **source's** IP (e.g. `… proto static`) instead of its own.
+
+| What it means | Remediation |
+|---|---|
+| The migrated disk carried the source's **static** network config (e.g. netplan `01-netcfg.yaml`), which pins the **old IP/nameservers**. netplan merges every `*.yaml` and a higher-sorting filename wins, so it overrode the appliance's DHCP config. With the wrong IP there's no working route, so DNS lookups time out (~10s) and anything that resolves a name — the login MOTD, package tools — crawls. | **Current builds remove the source's network config and write a single DHCP config**, so this is fixed for new cutovers. To fix an instance already launched, in **Lish** run: `mv /etc/netplan/01-netcfg.yaml /var/lib/vmrepl-netbak/ 2>/dev/null; netplan apply` (the appliance's `01-linode.yaml` then takes over via DHCP). Confirm with `ip -br a` that eth0 now has the instance's **own** assigned IP. |
+
 ---
 
 ## 5. Console / auth errors

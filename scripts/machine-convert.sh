@@ -266,11 +266,23 @@ else
   log "partitionless whole-disk filesystem — booting via the Linode kernel; skipping GRUB install"
 fi
 
-# 5) Network: let Linode's Network Helper manage it. Reset to DHCP and strip
-#    source-specific persistent NIC naming so the NIC comes up as eth0.
-log "Resetting network to DHCP / eth0"
+# 5) Network: reset to DHCP on eth0 and REMOVE the source's network config so it
+#    cannot pin the OLD IP / nameservers on the new Linode. This is critical: a
+#    leftover static config (e.g. the source's netplan 01-netcfg.yaml) makes the
+#    new instance claim the source's IP — netplan merges every *.yaml and a
+#    higher-sorting filename wins, so 01-netcfg.yaml overrides our 01-linode.yaml.
+#    The result is no working connectivity (failed pings) and DNS timeouts that
+#    make logins and commands crawl. We back up whatever was there and write one
+#    authoritative DHCP config.
+log "Resetting network to DHCP / eth0 (removing source-specific static config)"
 rm -f /etc/udev/rules.d/70-persistent-net.rules 2>/dev/null || true
+NETBAK="/var/lib/vmrepl-netbak"
+mkdir -p "\$NETBAK" 2>/dev/null || true
 if [ -d /etc/netplan ]; then
+  for f in /etc/netplan/*.yaml /etc/netplan/*.yml; do
+    [ -e "\$f" ] || continue
+    mv "\$f" "\$NETBAK/" 2>/dev/null || rm -f "\$f"
+  done
   cat > /etc/netplan/01-linode.yaml <<NET
 network:
   version: 2
@@ -284,7 +296,26 @@ fi
 if [ -f /etc/network/interfaces ]; then
   printf 'auto lo\niface lo inet loopback\nauto eth0\niface eth0 inet dhcp\n' > /etc/network/interfaces
 fi
+if [ -d /etc/network/interfaces.d ]; then
+  for f in /etc/network/interfaces.d/*; do
+    [ -e "\$f" ] || continue
+    mv "\$f" "\$NETBAK/" 2>/dev/null || rm -f "\$f"
+  done
+fi
+# A saved NetworkManager connection can also pin a static IP; move them aside so
+# NM falls back to DHCP (servers normally just have eth0).
+if [ -d /etc/NetworkManager/system-connections ]; then
+  for f in /etc/NetworkManager/system-connections/*; do
+    [ -e "\$f" ] || continue
+    mv "\$f" "\$NETBAK/" 2>/dev/null || rm -f "\$f"
+  done
+fi
 if [ -d /etc/sysconfig/network-scripts ]; then
+  for f in /etc/sysconfig/network-scripts/ifcfg-*; do
+    [ -e "\$f" ] || continue
+    case "\$f" in */ifcfg-lo) continue ;; esac
+    mv "\$f" "\$NETBAK/" 2>/dev/null || rm -f "\$f"
+  done
   cat > /etc/sysconfig/network-scripts/ifcfg-eth0 <<NET
 DEVICE=eth0
 BOOTPROTO=dhcp
