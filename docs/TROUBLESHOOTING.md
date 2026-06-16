@@ -79,6 +79,8 @@ Shown inline on the New-migration form or as a failed create.
 | `provision storage: linode POST /volumes: 400 ... Label must be unique` | A leftover volume already uses that label. | Remove the orphan `vmrep-<name>-<id>` volume in Cloud Manager, or use a different migration name. |
 | `provision storage: ... Account limit / quota` | Your account's volume/storage quota is reached. | Raise the limit (Linode support) or free up volumes, then create again. |
 | A failed create leaves **no** card | By design — a failed create rolls back its volume + record. | Fix the cause and create again. |
+| `add a valid Linode API token in Settings before creating a migration` | No token is stored, but the appliance needs one to provision storage (and later to remove the volumes on delete). | Add a token under **Settings → Linode automation**, then create the migration. |
+| `the stored Linode API token is not working (revoked, or missing Linodes + Volumes read/write)` | A token is stored but Linode rejected it at create time. | Re-create the token with **Linodes: Read/Write** + **Volumes: Read/Write** and save it again in Settings. |
 
 ---
 
@@ -107,6 +109,7 @@ and you can **Retry cutover** (it cleans up the previous attempt first).
 | `not logged in` / `invalid password` | Session expired or wrong password. | Sign in again. Forgot it? On the appliance run `sudo /usr/local/bin/applianced -data-dir /var/lib/vm-repl -show-password`. |
 | `token is required` / Linode calls failing with 401 | No/invalid Linode token. | Add a valid Personal Access Token (Linodes + Volumes read/write) in the console. |
 | **Can't log in as root on the launched instance (Lish)** | The migrated disk carries the **source's** accounts. Cloud images (Ubuntu, etc.) usually keep **root locked/password-less** and log in via SSH key or a sudo user — so the Lish *serial* console, which only does password login, has nothing to authenticate against. The instance booted fine; this is purely credentials. | **Set root access at cutover:** the Cutover dialog has optional **Root password** and **SSH public key** fields — fill them and the migrated image is reachable immediately (Retry cutover if you already cut over). Or log in over SSH with your original source key/user. Or fix it after the fact in **Rescue Mode**: mount the volume, `chroot`, `passwd root` + `passwd -u root`. |
+| `cannot remove the Linode API token while N migration(s) exist` | Token removal is blocked on purpose: deleting a migration uses the token to remove its Linode volumes, so removing it first would orphan them. | **Delete all migrations first** (each delete cleans up its volumes), then remove the token. |
 
 > Signing out of the console **does not** stop a migration — replication runs in
 > the `applianced` service independent of console sessions.
