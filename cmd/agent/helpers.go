@@ -86,18 +86,37 @@ func buildTracker(c cfg) (cbt.Tracker, error) {
 	}
 }
 
-// prepareSource establishes a consistent read source according to c.snapMode.
-// It returns the path to read from and a cleanup function that must always be
+// prepareSource establishes a read source in the given consistency mode and
+// returns the path to read from plus a cleanup function that must always be
 // called. For "none" it is a pass-through to the device itself.
-func prepareSource(c cfg) (string, func(), error) {
+func prepareSource(c cfg, mode snapshot.Mode) (string, func(), error) {
 	opts := snapshot.Options{
-		Mode:        snapshot.Mode(c.snapMode),
+		Mode:        mode,
 		Device:      c.device,
 		PreHook:     c.preHook,
 		PostHook:    c.postHook,
 		LVMSnapSize: c.lvSize,
 	}
 	return snapshot.Prepare(opts)
+}
+
+// chooseMode resolves the snapshot mode for a pass. Steady-state passes use the
+// operator's -snapshot flag (default none = live, no downtime). When the
+// receiver asks for a crash-consistent resync at cutover, we honor an explicit
+// -snapshot choice if one was pinned, otherwise auto-detect the least-disruptive
+// point-in-time strategy (LVM snapshot when possible, else fsfreeze).
+func chooseMode(c cfg, consistent bool) snapshot.Mode {
+	pinned := snapshot.Mode(c.snapMode)
+	if !consistent {
+		if pinned == "" {
+			return snapshot.ModeNone
+		}
+		return pinned
+	}
+	if pinned != "" && pinned != snapshot.ModeNone {
+		return pinned
+	}
+	return snapshot.DetectMode(c.device)
 }
 
 // defaultManifestPath derives a checkpoint filename from the device path,

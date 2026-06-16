@@ -1,7 +1,10 @@
 package receiver
 
 import (
+	"bufio"
 	"crypto/sha256"
+	"encoding/json"
+	"net"
 	"path/filepath"
 	"testing"
 
@@ -61,4 +64,66 @@ func TestApplyBlockBounds(t *testing.T) {
 	if err := applyBlock(dev, applied, protocol.EncodeBlock(neg, good)); err == nil {
 		t.Error("expected rejection of negative offset")
 	}
+}
+
+// TestConsistentResyncRequest verifies the cutover quiesce handshake: a live
+// (non-consistent) pass is bounced with ConsistentResync set, while a pass the
+// agent already marked Consistent is accepted normally.
+func TestConsistentResyncRequest(t *testing.T) {
+	const blockSize = 4096
+	target := filepath.Join(t.TempDir(), "target.img")
+
+	hello := func(consistent bool) protocol.Hello {
+		return protocol.Hello{
+			ProtocolVersion: 1, BlockSize: blockSize, DeviceSize: blockSize,
+			DevicePath: "/dev/sda", Consistent: consistent,
+		}
+	}
+
+	// requestConsistent mimics the appliance asking for a crash-consistent pass.
+	want := func(h protocol.Hello) bool { return !h.Consistent }
+
+	// Live pass: expect a bounce (Accepted=false, ConsistentResync=true).
+	ack := exchangeHello(t, target, hello(false), want)
+	if ack.Accepted || !ack.ConsistentResync {
+		t.Fatalf("live pass: got accepted=%v resync=%v, want accepted=false resync=true", ack.Accepted, ack.ConsistentResync)
+	}
+
+	// Consistent pass: must be accepted, not re-requested.
+	ack = exchangeHello(t, target, hello(true), want)
+	if !ack.Accepted || ack.ConsistentResync {
+		t.Fatalf("consistent pass: got accepted=%v resync=%v, want accepted=true resync=false", ack.Accepted, ack.ConsistentResync)
+	}
+}
+
+// exchangeHello drives Handle over an in-memory pipe: it sends one Hello and
+// returns the receiver's HelloAck (then drops the connection).
+func exchangeHello(t *testing.T, target string, h protocol.Hello, want ConsistencyFunc) protocol.HelloAck {
+	t.Helper()
+	c, srv := net.Pipe()
+	go func() {
+		_, _ = Handle(srv, target, "", nil, want)
+	}()
+	defer c.Close()
+
+	w := bufio.NewWriter(c)
+	if err := protocol.WriteJSON(w, protocol.MsgHello, h); err != nil {
+		t.Fatalf("write hello: %v", err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatalf("flush hello: %v", err)
+	}
+	r := bufio.NewReader(c)
+	mt, payload, err := protocol.ReadFrame(r)
+	if err != nil {
+		t.Fatalf("read ack: %v", err)
+	}
+	if mt != protocol.MsgHelloAck {
+		t.Fatalf("got frame type %d, want hello-ack", mt)
+	}
+	var ack protocol.HelloAck
+	if err := json.Unmarshal(payload, &ack); err != nil {
+		t.Fatalf("decode ack: %v", err)
+	}
+	return ack
 }
