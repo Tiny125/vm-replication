@@ -26,6 +26,7 @@ import (
 	"github.com/tiny125/vm-replication/internal/codec"
 	"github.com/tiny125/vm-replication/internal/controlclient"
 	"github.com/tiny125/vm-replication/internal/protocol"
+	"github.com/tiny125/vm-replication/internal/snapshot"
 	"github.com/tiny125/vm-replication/internal/transport"
 )
 
@@ -132,14 +133,37 @@ type syncResult struct {
 	deviceSize            int64
 }
 
+// run performs one replication pass. Normally that is a single attempt using the
+// operator's chosen consistency mode (default none = live, no downtime). At
+// cutover the appliance can ask — via the receiver's hello-ack — for a crash-
+// consistent image; when that happens we transparently re-read this pass from a
+// point-in-time source snapshot (LVM/fsfreeze) and ship that instead, so the
+// launched instance boots from a single consistent instant (MGN-style).
 func run(c cfg) (syncResult, error) {
+	consistent := chooseMode(c, false) != snapshot.ModeNone
+	res, resync, err := replicate(c, consistent)
+	if err != nil || !resync {
+		return res, err
+	}
+	log.Printf("agent: receiver requested a crash-consistent snapshot for cutover; re-reading from a point-in-time source snapshot")
+	res, _, err = replicate(c, true)
+	return res, err
+}
+
+// replicate runs one pass. If consistent is true it reads from a point-in-time
+// snapshot; otherwise it reads live. It returns resync=true (without streaming)
+// when the receiver asked for a crash-consistent re-read and this pass wasn't
+// already consistent — the caller then re-invokes with consistent=true.
+func replicate(c cfg, consistent bool) (_ syncResult, resync bool, _ error) {
 	res := syncResult{mode: api.SyncDelta, startedAt: time.Now()}
 
-	// Establish a consistent read source (snapshot/freeze) if requested. The
-	// returned readPath is what we actually replicate from; cleanup releases it.
-	readPath, rawCleanup, err := prepareSource(c)
+	// Establish the read source for this pass. The returned readPath is what we
+	// actually replicate from; cleanup releases it (snapshot/freeze).
+	mode := chooseMode(c, consistent)
+	passConsistent := mode != snapshot.ModeNone
+	readPath, rawCleanup, err := prepareSource(c, mode)
 	if err != nil {
-		return res, fmt.Errorf("prepare source consistency: %w", err)
+		return res, false, fmt.Errorf("prepare source consistency: %w", err)
 	}
 	// Run cleanup at most once, and also on SIGINT/SIGTERM so an interrupted run
 	// never leaves the source filesystem frozen or an LVM snapshot dangling
@@ -160,7 +184,7 @@ func run(c cfg) (syncResult, error) {
 
 	dev, err := blockdiff.OpenDeviceRead(readPath)
 	if err != nil {
-		return res, fmt.Errorf("open source: %w", err)
+		return res, false, fmt.Errorf("open source: %w", err)
 	}
 	defer dev.Close()
 	res.deviceSize = dev.Size
@@ -170,7 +194,7 @@ func run(c cfg) (syncResult, error) {
 	if !c.full {
 		prev, err = blockdiff.LoadManifest(c.manifest)
 		if err != nil {
-			return res, fmt.Errorf("load manifest: %w", err)
+			return res, false, fmt.Errorf("load manifest: %w", err)
 		}
 	}
 	fullSync := !prev.Matches(dev.Size, c.blockSize)
@@ -188,12 +212,12 @@ func run(c cfg) (syncResult, error) {
 	// Pick the change-tracking backend and ask which blocks to consider.
 	tracker, err := buildTracker(c)
 	if err != nil {
-		return res, fmt.Errorf("cbt: %w", err)
+		return res, false, fmt.Errorf("cbt: %w", err)
 	}
 	defer tracker.Close()
 	candidates, considerAllCBT, err := tracker.Candidates(total)
 	if err != nil {
-		return res, fmt.Errorf("cbt candidates: %w", err)
+		return res, false, fmt.Errorf("cbt candidates: %w", err)
 	}
 	considerAll := considerAllCBT || fullSync
 	if !considerAll {
@@ -205,11 +229,11 @@ func run(c cfg) (syncResult, error) {
 	// Connect to the receiver over mTLS.
 	tlsCfg, err := transport.ClientConfig(c.tls, c.serverName)
 	if err != nil {
-		return res, err
+		return res, false, err
 	}
 	conn, err := tls.Dial("tcp", c.target, tlsCfg)
 	if err != nil {
-		return res, fmt.Errorf("dial receiver: %w", err)
+		return res, false, fmt.Errorf("dial receiver: %w", err)
 	}
 	defer conn.Close()
 	w := bufio.NewWriterSize(conn, 1<<20)
@@ -224,14 +248,25 @@ func run(c cfg) (syncResult, error) {
 		DeviceSize:      dev.Size,
 		BlockSize:       c.blockSize,
 		FullSync:        fullSync,
+		Consistent:      passConsistent,
 	}); err != nil {
-		return res, fmt.Errorf("send hello: %w", err)
+		return res, false, fmt.Errorf("send hello: %w", err)
 	}
 	if err := w.Flush(); err != nil {
-		return res, err
+		return res, false, err
 	}
-	if err := expectAck(r); err != nil {
-		return res, err
+	ack, err := expectAck(r)
+	if err != nil {
+		return res, false, err
+	}
+	// The receiver can ask us to re-read this pass crash-consistently (cutover).
+	// If we weren't already consistent, bail out cleanly so the caller re-runs
+	// with consistent=true; the deferred cleanup releases this live attempt.
+	if ack.ConsistentResync && !passConsistent {
+		return res, true, nil
+	}
+	if !ack.Accepted {
+		return res, false, fmt.Errorf("receiver rejected session: %s", ack.Message)
 	}
 
 	start := time.Now()
@@ -271,13 +306,13 @@ func run(c cfg) (syncResult, error) {
 	if considerAll {
 		for i := int64(0); i < total; i++ {
 			if err := process(i); err != nil {
-				return res, err
+				return res, false, err
 			}
 		}
 	} else {
 		for _, i := range candidates {
 			if err := process(i); err != nil {
-				return res, err
+				return res, false, err
 			}
 		}
 	}
@@ -287,23 +322,23 @@ func run(c cfg) (syncResult, error) {
 		ChangedBlocks: changed,
 		BytesOnWire:   bytesWire,
 	}); err != nil {
-		return res, fmt.Errorf("send done: %w", err)
+		return res, false, fmt.Errorf("send done: %w", err)
 	}
 	if err := w.Flush(); err != nil {
-		return res, err
+		return res, false, err
 	}
 
-	ack, err := expectDoneAck(r)
+	dack, err := expectDoneAck(r)
 	if err != nil {
-		return res, err
+		return res, false, err
 	}
-	if !ack.OK {
-		return res, fmt.Errorf("receiver reported failure: %s", ack.Error)
+	if !dack.OK {
+		return res, false, fmt.Errorf("receiver reported failure: %s", dack.Error)
 	}
 
 	// Only commit the new checkpoint once the receiver confirms the apply.
 	if err := next.Save(c.manifest); err != nil {
-		return res, fmt.Errorf("save manifest: %w", err)
+		return res, false, fmt.Errorf("save manifest: %w", err)
 	}
 	// Advance the change-tracker's marker (no-op for hashdiff).
 	if err := tracker.Checkpoint(); err != nil {
@@ -313,10 +348,14 @@ func run(c cfg) (syncResult, error) {
 	res.changed, res.bytes = changed, bytesWire
 	res.finishedAt = time.Now()
 	dur := time.Since(start)
-	log.Printf("%s sync complete: %d/%d blocks changed, %s on wire in %s (%.1f MiB/s)",
-		res.mode, changed, total, humanBytes(bytesWire), dur.Round(time.Millisecond),
+	verb := "sync"
+	if passConsistent {
+		verb = "crash-consistent sync"
+	}
+	log.Printf("%s %s complete: %d/%d blocks changed, %s on wire in %s (%.1f MiB/s)",
+		res.mode, verb, changed, total, humanBytes(bytesWire), dur.Round(time.Millisecond),
 		float64(bytesWire)/(1024*1024)/dur.Seconds())
-	return res, nil
+	return res, false, nil
 }
 
 func readBlockAt(dev *blockdiff.Device, p []byte, off int64) (int, error) {
@@ -331,22 +370,19 @@ func readBlockAt(dev *blockdiff.Device, p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-func expectAck(r *bufio.Reader) error {
+func expectAck(r *bufio.Reader) (protocol.HelloAck, error) {
+	var ack protocol.HelloAck
 	t, payload, err := protocol.ReadFrame(r)
 	if err != nil {
-		return fmt.Errorf("read hello ack: %w", err)
+		return ack, fmt.Errorf("read hello ack: %w", err)
 	}
 	if t != protocol.MsgHelloAck {
-		return fmt.Errorf("expected hello-ack, got frame type %d", t)
+		return ack, fmt.Errorf("expected hello-ack, got frame type %d", t)
 	}
-	var ack protocol.HelloAck
 	if err := jsonUnmarshal(payload, &ack); err != nil {
-		return err
+		return ack, err
 	}
-	if !ack.Accepted {
-		return fmt.Errorf("receiver rejected session: %s", ack.Message)
-	}
-	return nil
+	return ack, nil
 }
 
 func expectDoneAck(r *bufio.Reader) (protocol.DoneAck, error) {

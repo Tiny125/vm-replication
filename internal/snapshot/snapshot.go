@@ -50,6 +50,30 @@ type Options struct {
 	SnapName    string // LVM snapshot name; defaults to vmrepl-snap-<ts>
 }
 
+// DetectMode picks the best zero-input consistency strategy for device: an LVM
+// copy-on-write snapshot when device is an LVM logical volume (the source keeps
+// running, no downtime), otherwise fsfreeze (briefly pauses writes while the
+// point-in-time read runs). Both yield a single crash-consistent instant; LVM is
+// strongly preferred because it is non-disruptive. Used at cutover when the
+// operator hasn't pinned a -snapshot mode.
+func DetectMode(device string) Mode {
+	if isLVM(device) {
+		return ModeLVM
+	}
+	return ModeFsfreeze
+}
+
+// isLVM reports whether device is an LVM logical volume (so an LVM snapshot is
+// possible). It is best-effort: if lvs is absent or errors, we treat the device
+// as non-LVM and fall back to fsfreeze.
+func isLVM(device string) bool {
+	if _, err := exec.LookPath("lvs"); err != nil {
+		return false
+	}
+	out, err := run("lvs", "--noheadings", "-o", "lv_name", device)
+	return err == nil && strings.TrimSpace(out) != ""
+}
+
 // Prepare sets up the consistency point and returns the path to read from plus
 // a cleanup function that the caller must always invoke (e.g. via defer).
 func Prepare(o Options) (readPath string, cleanup func(), err error) {

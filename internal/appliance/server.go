@@ -54,8 +54,14 @@ type Server struct {
 	recMu     sync.Mutex
 	receivers map[int64]context.CancelFunc // migrationID -> stop receiver
 	finalizes map[int64]context.CancelFunc // migrationID -> cancel finalize run
-	progress  sync.Map                     // migrationID -> *syncProgress
-	ctx       context.Context
+	// Crash-consistent cutover coordination (keyed by disk ID, guarded by recMu):
+	// consistReq marks a disk whose agent we want to re-read from a point-in-time
+	// snapshot before launch; consistDone marks a disk that has since delivered
+	// such a crash-consistent sync.
+	consistReq  map[int64]bool
+	consistDone map[int64]bool
+	progress    sync.Map // migrationID -> *syncProgress
+	ctx         context.Context
 }
 
 // syncProgress is live block-apply progress for the console (percent + ETA).
@@ -78,9 +84,11 @@ func New(ctx context.Context, cfg Config) *Server {
 	}
 	s := &Server{
 		cfg: cfg, st: cfg.Store, mux: http.NewServeMux(),
-		receivers: map[int64]context.CancelFunc{},
-		finalizes: map[int64]context.CancelFunc{},
-		ctx:       ctx,
+		receivers:   map[int64]context.CancelFunc{},
+		finalizes:   map[int64]context.CancelFunc{},
+		consistReq:  map[int64]bool{},
+		consistDone: map[int64]bool{},
+		ctx:         ctx,
 	}
 	s.routes()
 	return s

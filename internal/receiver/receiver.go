@@ -37,11 +37,23 @@ type Stats struct {
 // count for a full sync; for deltas it is unknown until Done and reported as 0).
 type Progress func(writtenBlocks, totalBlocks int64, fullSync bool)
 
+// ConsistencyFunc decides, once the agent's Hello is in, whether to bounce this
+// pass and ask the agent to re-read from a point-in-time snapshot (crash-
+// consistent). It is consulted at cutover; returning false (or a nil func) lets
+// the pass proceed normally. It is given the Hello so it can avoid re-requesting
+// a pass the agent has already marked Consistent.
+type ConsistencyFunc func(hello protocol.Hello) bool
+
+// errConsistentResync is returned by Handle when it deliberately bounced a live
+// pass to request a crash-consistent resync. It is an expected control outcome,
+// not a failure, so Serve does not surface it via onError.
+var errConsistentResync = errors.New("receiver: crash-consistent resync requested")
+
 // Serve accepts connections on ln and applies each to devicePath until ctx is
 // cancelled or the listener closes. onComplete (if non-nil) is called after each
 // successful session; onProgress (if non-nil) is called periodically during a
 // session. If once is true, Serve returns after the first successful session.
-func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress, onError func(error)) error {
+func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress, onError func(error), requestConsistent ConsistencyFunc) error {
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
@@ -54,14 +66,20 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 			}
 			return err
 		}
-		stats, herr := Handle(conn, devicePath, manifestPath, onProgress)
-		if herr != nil {
+		stats, herr := Handle(conn, devicePath, manifestPath, onProgress, requestConsistent)
+		switch {
+		case errors.Is(herr, errConsistentResync):
+			// Expected: we asked the agent to re-read crash-consistently. Not an error.
+			log.Printf("receiver: asked %s to re-read crash-consistently for cutover", conn.RemoteAddr())
+		case herr != nil:
 			log.Printf("receiver: session from %s ended with error: %v", conn.RemoteAddr(), herr)
 			if onError != nil {
 				onError(herr)
 			}
-		} else if onComplete != nil {
-			onComplete(stats)
+		default:
+			if onComplete != nil {
+				onComplete(stats)
+			}
 		}
 		if once && herr == nil {
 			return nil
@@ -73,7 +91,7 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 // every block to devicePath, fsyncs, and writes the applied manifest.
 // onProgress (optional) is invoked at session start and every progressEvery
 // applied blocks.
-func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress) (Stats, error) {
+func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress, requestConsistent ConsistencyFunc) (Stats, error) {
 	defer conn.Close()
 	r := bufio.NewReaderSize(conn, 1<<20)
 	w := bufio.NewWriterSize(conn, 1<<16)
@@ -96,8 +114,21 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress)
 		_ = w.Flush()
 		return Stats{}, err
 	}
-	log.Printf("receiver: session job=%q source=%q device=%q size=%d block=%d full=%v",
-		hello.JobID, hello.SourceHostname, hello.DevicePath, hello.DeviceSize, hello.BlockSize, hello.FullSync)
+	// Cutover quiesce: if a crash-consistent snapshot is requested for this disk
+	// and the agent isn't already sending one, bounce the pass and ask it to
+	// re-read from a point-in-time snapshot. We reject (rather than apply) so the
+	// live "smear" never lands on the target right before we clone it.
+	if requestConsistent != nil && requestConsistent(hello) {
+		_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{
+			Accepted:         false,
+			ConsistentResync: true,
+			Message:          "crash-consistent resync requested for cutover",
+		})
+		_ = w.Flush()
+		return Stats{}, errConsistentResync
+	}
+	log.Printf("receiver: session job=%q source=%q device=%q size=%d block=%d full=%v consistent=%v",
+		hello.JobID, hello.SourceHostname, hello.DevicePath, hello.DeviceSize, hello.BlockSize, hello.FullSync, hello.Consistent)
 
 	dev, err := blockdiff.OpenDeviceWrite(devicePath, hello.DeviceSize)
 	if err != nil {

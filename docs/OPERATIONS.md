@@ -146,6 +146,32 @@ These modes need root + LVM2/util-linux and operate on real devices, so they are
 exercised on a real host; the default `--snapshot none` keeps the tool fully
 usable everywhere.
 
+### Automatic crash-consistent cutover (appliance console)
+
+When you cut over from the **appliance console**, you don't need to set
+`--snapshot` yourself: the appliance does it for you, the same way AWS MGN works.
+
+- **Steady-state replication stays live** (`--snapshot none`) so there is **no
+  downtime** while data is catching up — intermediate target states are never
+  launched, so a "smeared" in-progress copy doesn't matter.
+- **At cutover**, the appliance asks each disk's agent (over the receiver
+  hello-ack) for **one final point-in-time pass** before it clones and launches.
+  The agent re-reads from a snapshot it picks automatically:
+  - an **LVM snapshot** if the source root is an LVM logical volume (zero
+    downtime, the source keeps serving), or
+  - **`fsfreeze`** otherwise — writes pause only for that single final read,
+    which is the normal brief cutover window.
+- The cloned image is therefore a **single crash-consistent instant** (like
+  pulling the plug once): the target's journaling filesystem replays its journal
+  on first boot and comes up cleanly, instead of failing `fsck` on a
+  multi-minute "smear".
+
+If you pin `-snapshot lvm|fsfreeze` in the enrollment yourself, the appliance
+honors that choice for the cutover pass instead of auto-detecting. If no agent is
+checking in (or it's an older build that ignores the request), cutover proceeds
+on the current replicated data after a short wait, with a warning in the activity
+log.
+
 ---
 
 ## 5. Verify locally

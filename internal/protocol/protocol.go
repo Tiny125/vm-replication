@@ -82,12 +82,23 @@ type Hello struct {
 	DeviceSize      int64  `json:"device_size"` // total bytes the target must hold
 	BlockSize       int    `json:"block_size"`  // fixed block granularity
 	FullSync        bool   `json:"full_sync"`   // true if agent is sending every block
+	// Consistent reports that this pass was read from a point-in-time source
+	// snapshot (LVM/fsfreeze), so the blocks form a single crash-consistent
+	// instant rather than a multi-minute "smear". The receiver uses this at
+	// cutover to know it has captured a launchable, crash-consistent image.
+	Consistent bool `json:"consistent,omitempty"`
 }
 
 // HelloAck is the receiver's response to Hello.
 type HelloAck struct {
 	Accepted bool   `json:"accepted"`
 	Message  string `json:"message,omitempty"`
+	// ConsistentResync asks the agent to abandon this (live) pass and immediately
+	// re-read from a point-in-time snapshot, so the next applied image is
+	// crash-consistent. The appliance sets this at cutover (MGN-style): continuous
+	// replication stays live and disruption-free, and only the final pre-launch
+	// pass is quiesced. Old agents that don't understand it simply ignore it.
+	ConsistentResync bool `json:"consistent_resync,omitempty"`
 }
 
 // Done closes the stream and reports what the agent sent.

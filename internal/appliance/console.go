@@ -446,7 +446,7 @@ async function startMig(id,btn){
   const r=await confirmModal({
     title:'Cut over migration #'+id+'?',
     html:'<div class="warn" style="margin-bottom:8px">After cutover the source agent <b>stops replicating</b> — the migrated copy is frozen at this point.</div>'+
-      'This converts the boot disk and clones every disk into launchable <b>&lt;name&gt;-cutover</b> volumes. This is the final step.',
+      'First the appliance takes a <b>crash-consistent point-in-time snapshot</b> of the source (like AWS MGN) so the new instance boots cleanly, then it converts the boot disk and clones every disk into launchable <b>&lt;name&gt;-cutover</b> volumes. Keep the source agent connected so the snapshot can be taken. This is the final step.',
     okText:'Cut over',
     checkbox:{label:'Also launch a new <name>-cutover Linode now (boot=sda, data=sdb…). Leave unchecked to just create the cutover volumes.',checked:true}
   });

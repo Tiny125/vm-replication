@@ -16,6 +16,7 @@ import (
 
 	"github.com/tiny125/vm-replication/internal/api"
 	"github.com/tiny125/vm-replication/internal/blockdiff"
+	"github.com/tiny125/vm-replication/internal/protocol"
 	"github.com/tiny125/vm-replication/internal/receiver"
 	"github.com/tiny125/vm-replication/internal/transport"
 )
@@ -103,6 +104,12 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 			if err := s.st.RecordDiskSync(s.ctx, migID, diskID, st.Hello.FullSync, total, st.ChangedBlocks, bytes); err != nil {
 				log.Printf("appliance: record sync (migration %d disk %d): %v", migID, diskID, err)
 			}
+			// A crash-consistent pass landed: record it so a pending cutover can stop
+			// waiting and clone a point-in-time image.
+			if st.Hello.Consistent && s.wantDiskConsistency(diskID) {
+				s.markDiskConsistent(diskID)
+				_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("disk %d (%s): crash-consistent snapshot captured for cutover", diskIdx, dev0))
+			}
 			if st.Hello.FullSync && !wasBaselined {
 				_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("disk %d (%s): initial full sync complete (%s)", diskIdx, st.Hello.DevicePath, humanBytes(st.BlocksWritten*int64(st.Hello.BlockSize))))
 			} else if !wasBaselined {
@@ -111,12 +118,120 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 		}, onProgress, func(serr error) {
 			_ = s.st.RecordDiskError(s.ctx, diskID, serr.Error())
 			_ = s.st.AddEvent(s.ctx, migID, "error", fmt.Sprintf("disk %d (%s): replication attempt failed: %s", diskIdx, dev0, serr.Error()))
+		}, func(h protocol.Hello) bool {
+			// Bounce a live pass into a crash-consistent re-read while we're quiescing
+			// this disk for cutover (but never re-request a pass already consistent).
+			return s.wantDiskConsistency(diskID) && !h.Consistent
 		})
 		if err != nil && ctx.Err() == nil {
 			log.Printf("appliance: receiver (migration %d disk %d) stopped: %v", migID, diskID, err)
 		}
 	}()
 	return nil
+}
+
+// ---- crash-consistent cutover coordination ----
+//
+// AWS MGN replicates continuously with no source downtime, then at cutover
+// "launches" from a crash-consistent point-in-time snapshot so the new machine
+// boots cleanly. We do the same: steady-state replication stays live, and only
+// at cutover do we ask each disk's agent for ONE point-in-time (LVM/fsfreeze)
+// pass. These helpers track that request/acknowledgement per disk.
+
+// requestDiskConsistency flags a disk so its receiver bounces the next live pass
+// and asks the agent to re-read crash-consistently. Clears any prior "done" mark.
+func (s *Server) requestDiskConsistency(diskID int64) {
+	s.recMu.Lock()
+	s.consistReq[diskID] = true
+	s.consistDone[diskID] = false
+	s.recMu.Unlock()
+}
+
+// wantDiskConsistency reports whether we're still asking this disk's agent for a
+// crash-consistent pass.
+func (s *Server) wantDiskConsistency(diskID int64) bool {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	return s.consistReq[diskID]
+}
+
+// markDiskConsistent records that a crash-consistent sync landed for this disk.
+// It deliberately leaves the request set so any further (live) pass before we
+// stop the receiver is still bounced — the last applied image stays consistent.
+func (s *Server) markDiskConsistent(diskID int64) {
+	s.recMu.Lock()
+	s.consistDone[diskID] = true
+	s.recMu.Unlock()
+}
+
+// diskConsistencyDone reports whether a crash-consistent sync has landed.
+func (s *Server) diskConsistencyDone(diskID int64) bool {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	return s.consistDone[diskID]
+}
+
+// clearConsistency forgets all consistency state for a migration's disks.
+func (s *Server) clearConsistency(m api.Migration) {
+	s.recMu.Lock()
+	for _, d := range m.Disks {
+		delete(s.consistReq, d.ID)
+		delete(s.consistDone, d.ID)
+	}
+	s.recMu.Unlock()
+}
+
+// consistencyWait bounds how long cutover waits for a crash-consistent snapshot
+// from the source. The agent timer fires ~every 60s and the snapshot read takes
+// a little longer, so this comfortably covers a normal pass; on timeout we fall
+// back to cloning the current replicated data (with a clear warning).
+const consistencyWait = 6 * time.Minute
+
+// quiesceForCutover asks every disk's agent for one crash-consistent (point-in-
+// time) snapshot pass and waits for them to land, so the cloned image is a
+// single instant — the key to a clean boot, exactly like AWS MGN's crash-
+// consistent launch. If no agent is checking in, or the agents are an older
+// build that ignores the request, it warns and proceeds with the current data.
+func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) {
+	anyAgent := false
+	for _, d := range m.Disks {
+		if !d.AgentLastSeen.IsZero() && time.Since(d.AgentLastSeen) < 5*time.Minute {
+			anyAgent = true
+		}
+		s.requestDiskConsistency(d.ID)
+	}
+	if !anyAgent {
+		_ = s.st.AddEvent(s.ctx, m.ID, "warn", "cutover: no source agent has checked in recently, so a fresh crash-consistent snapshot can't be taken; cloning the current replicated data as-is (it may be inconsistent if the source was changing)")
+		return
+	}
+	_ = s.st.AddEvent(s.ctx, m.ID, "info", "cutover: quiescing the source for a crash-consistent point-in-time snapshot (like AWS MGN) before launch — this can take up to a minute")
+
+	deadline := time.Now().Add(consistencyWait)
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		allDone := true
+		for _, d := range m.Disks {
+			if !s.diskConsistencyDone(d.ID) {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			_ = s.st.AddEvent(s.ctx, m.ID, "info", "cutover: crash-consistent snapshot captured on all disks; converting and cloning the point-in-time image")
+			return
+		}
+		if time.Now().After(deadline) {
+			_ = s.st.AddEvent(s.ctx, m.ID, "warn", "cutover: timed out waiting for a crash-consistent snapshot from the source (the agent may be an older build, or offline); proceeding with the current replicated data, which may be inconsistent")
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
+	}
 }
 
 // stopReceivers stops every disk receiver for a migration.
@@ -341,7 +456,8 @@ func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.st.SetMigrateStarted(ctx, id)
-	s.stopReceivers(m) // quiesce all disks during finalize
+	// Receivers stay up so finalize can take a final crash-consistent snapshot
+	// from the source before it stops them and clones the image.
 
 	finCtx, cancel := context.WithCancel(s.ctx)
 	s.recMu.Lock()
@@ -374,6 +490,7 @@ func (s *Server) handleStopMigration(w http.ResponseWriter, r *http.Request) {
 	if cancel != nil {
 		cancel()
 	}
+	s.clearConsistency(m) // drop any pending crash-consistent cutover request
 	_ = s.st.SetAssessed(ctx, id, false)
 	_ = s.st.SetMigrationState(ctx, id, api.MigReplicating, "stopped by operator")
 	_ = s.st.AddEvent(ctx, id, "warn", "cutover stopped by operator; replication resumed")
@@ -487,6 +604,16 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	}()
 	canceled := func() bool { return ctx.Err() != nil }
 	sctx := s.ctx // store writes survive a Stop (which owns its own transition)
+
+	// 0) Quiesce for a crash-consistent cutover (MGN-style): ask each disk's agent
+	//    for one final point-in-time snapshot pass so the image we clone reflects a
+	//    single instant and boots cleanly, then stop the receivers.
+	s.quiesceForCutover(ctx, m)
+	if canceled() {
+		return
+	}
+	s.stopReceivers(m)
+	s.clearConsistency(m)
 
 	boot := m.Disks[0]
 	bootDevice := s.diskDevicePath(m, boot)
