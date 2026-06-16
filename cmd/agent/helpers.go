@@ -104,7 +104,9 @@ func prepareSource(c cfg, mode snapshot.Mode) (string, func(), error) {
 // operator's -snapshot flag (default none = live, no downtime). When the
 // receiver asks for a crash-consistent resync at cutover, we honor an explicit
 // -snapshot choice if one was pinned, otherwise auto-detect the least-disruptive
-// point-in-time strategy (LVM snapshot when possible, else fsfreeze).
+// point-in-time strategy: an LVM snapshot when possible, else ModeNone (read
+// live). We never auto-select fsfreeze — holding a freeze across a whole-device
+// read would block all writes and wedge the source.
 func chooseMode(c cfg, consistent bool) snapshot.Mode {
 	pinned := snapshot.Mode(c.snapMode)
 	if !consistent {

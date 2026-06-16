@@ -5,12 +5,16 @@
 // Modes:
 //
 //   - none:     read the live device directly (crash-consistent).
-//   - fsfreeze: FIFREEZE the filesystem for the duration of the read. Correct
-//     but holds writes frozen the whole time — use only for a short
-//     final cutover pass, not continuous replication.
+//   - fsfreeze: flush and *briefly* FIFREEZE the filesystem, then thaw
+//     immediately and read live. fsfreeze can only make an instantaneous
+//     snapshot consistent; holding the freeze across a whole-device read blocks
+//     every write on the filesystem (root included) and deadlocks the agent's
+//     own manifest write — so we never hold it. This mode is therefore a
+//     best-effort flush, not a true point-in-time image.
 //   - lvm:      take an LVM copy-on-write snapshot of the origin LV and read
-//     from that. The source keeps running while we replicate from a
-//     stable snapshot. This is the recommended app-consistent mode.
+//     from that. The freeze is held only for the instant the snapshot is
+//     created; the source keeps running while we replicate from the stable
+//     snapshot. This is the only true point-in-time (crash-consistent) mode.
 //
 // Application consistency comes from the optional pre/post hooks: run a pre-hook
 // to quiesce the app (e.g. `mysql -e 'FLUSH TABLES WITH READ LOCK'` or
@@ -27,6 +31,7 @@ import (
 	"log"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -51,21 +56,23 @@ type Options struct {
 }
 
 // DetectMode picks the best zero-input consistency strategy for device: an LVM
-// copy-on-write snapshot when device is an LVM logical volume (the source keeps
-// running, no downtime), otherwise fsfreeze (briefly pauses writes while the
-// point-in-time read runs). Both yield a single crash-consistent instant; LVM is
-// strongly preferred because it is non-disruptive. Used at cutover when the
-// operator hasn't pinned a -snapshot mode.
+// copy-on-write snapshot when device is an LVM logical volume (a true
+// point-in-time image with no source downtime), otherwise ModeNone. It
+// deliberately does NOT fall back to fsfreeze: fsfreeze cannot snapshot a
+// whole-device read, and holding a freeze for the duration would block all
+// writes and wedge the source (root filesystems included). Used at cutover when
+// the operator hasn't pinned a -snapshot mode; on ModeNone the caller reads live
+// and the appliance proceeds on the current data (with a warning).
 func DetectMode(device string) Mode {
 	if isLVM(device) {
 		return ModeLVM
 	}
-	return ModeFsfreeze
+	return ModeNone
 }
 
 // isLVM reports whether device is an LVM logical volume (so an LVM snapshot is
 // possible). It is best-effort: if lvs is absent or errors, we treat the device
-// as non-LVM and fall back to fsfreeze.
+// as non-LVM (no point-in-time snapshot available).
 func isLVM(device string) bool {
 	if _, err := exec.LookPath("lvs"); err != nil {
 		return false
@@ -124,6 +131,47 @@ func mountpointFor(o Options) (string, error) {
 	return mp, nil
 }
 
+// maxFreezeHold bounds how long a filesystem may stay frozen. A watchdog
+// force-thaws after this so that a hang between freeze and the intended thaw
+// (e.g. lvcreate stalls, or the process is killed) can never leave the source
+// filesystem — often root — frozen and wedge the entire box.
+const maxFreezeHold = 60 * time.Second
+
+// freeze FIFREEZEs mp and returns an idempotent thaw func. A watchdog
+// force-thaws after maxFreezeHold regardless, as a safety net against a hang
+// leaving the filesystem frozen. Callers must still call thaw() as soon as the
+// instantaneous work (e.g. snapshot creation) is done — the freeze must never be
+// held across a long device read.
+func freeze(mp string) (thaw func(), err error) {
+	if out, ferr := run("fsfreeze", "-f", mp); ferr != nil {
+		return func() {}, fmt.Errorf("fsfreeze freeze %s: %w (%s)", mp, ferr, out)
+	}
+	var once sync.Once
+	done := make(chan struct{})
+	thaw = func() {
+		once.Do(func() {
+			close(done)
+			if out, uerr := run("fsfreeze", "-u", mp); uerr != nil {
+				log.Printf("snapshot: WARNING thaw failed for %s: %v (%s)", mp, uerr, out)
+			}
+		})
+	}
+	go func() {
+		select {
+		case <-time.After(maxFreezeHold):
+			log.Printf("snapshot: WARNING freeze watchdog fired after %s; force-thawing %s to avoid wedging the source", maxFreezeHold, mp)
+			thaw()
+		case <-done:
+		}
+	}()
+	return thaw, nil
+}
+
+// prepareFsfreeze flushes the filesystem with a brief freeze, then thaws
+// immediately and reads the device live. It never holds the freeze across the
+// read (that would block all writes and self-deadlock on the manifest write), so
+// it is a best-effort flush rather than a true point-in-time snapshot — use
+// ModeLVM for crash-consistency.
 func prepareFsfreeze(o Options) (string, func(), error) {
 	mp, err := mountpointFor(o)
 	if err != nil {
@@ -132,22 +180,14 @@ func prepareFsfreeze(o Options) (string, func(), error) {
 	if err := runShell(o.PreHook); err != nil {
 		return "", func() {}, err
 	}
-	log.Printf("snapshot: freezing %s (writes blocked until read completes)", mp)
-	if out, err := run("fsfreeze", "-f", mp); err != nil {
-		return "", func() {}, fmt.Errorf("fsfreeze freeze: %w (%s)", err, out)
-	}
-	// Resume the app immediately; the freeze itself guarantees consistency.
-	if err := runShell(o.PostHook); err != nil {
-		_, _ = run("fsfreeze", "-u", mp) // best-effort thaw before bailing
+	log.Printf("snapshot: flushing %s with a brief freeze, then reading live (fsfreeze is not a point-in-time snapshot; use LVM for crash-consistency)", mp)
+	thaw, err := freeze(mp)
+	if err != nil {
 		return "", func() {}, err
 	}
-	cleanup := func() {
-		log.Printf("snapshot: thawing %s", mp)
-		if out, err := run("fsfreeze", "-u", mp); err != nil {
-			log.Printf("snapshot: WARNING thaw failed for %s: %v (%s)", mp, err, out)
-		}
-	}
-	return o.Device, cleanup, nil
+	thaw() // immediately — never hold the freeze across the read
+	_ = runShell(o.PostHook)
+	return o.Device, func() {}, nil
 }
 
 func prepareLVM(o Options) (string, func(), error) {
@@ -159,17 +199,19 @@ func prepareLVM(o Options) (string, func(), error) {
 		name = fmt.Sprintf("vmrepl-snap-%d", time.Now().Unix())
 	}
 
-	// Freeze just long enough to take the CoW snapshot, then thaw.
+	// Freeze just long enough to take the CoW snapshot, then thaw. The watchdog
+	// in freeze() force-thaws if lvcreate hangs, so the source can never stay
+	// frozen.
 	mp, mpErr := mountpointFor(o)
 	if err := runShell(o.PreHook); err != nil {
 		return "", func() {}, err
 	}
 	thaw := func() {}
 	if mpErr == nil {
-		if out, err := run("fsfreeze", "-f", mp); err != nil {
-			log.Printf("snapshot: WARNING could not freeze %s before snapshot: %v (%s)", mp, err, out)
+		if t, err := freeze(mp); err != nil {
+			log.Printf("snapshot: WARNING could not freeze %s before snapshot: %v", mp, err)
 		} else {
-			thaw = func() { _, _ = run("fsfreeze", "-u", mp) }
+			thaw = t
 		}
 	}
 

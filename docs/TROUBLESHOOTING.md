@@ -40,6 +40,16 @@ These appear in the activity log as
 | `dial receiver: ... connection refused / timeout` (agent log) | The source can't reach the appliance on the receiver port. | Open **TCP 5000–5100** from the source to the appliance (security group / Linode Cloud Firewall). Use the **Connection test** tab to confirm reachability. |
 | `block at N ... out of device bounds` / `block hash mismatch` | Corruption or a size mismatch mid-stream (rare). | Let the agent retry; if it persists, delete and recreate the migration. |
 
+### Source server unresponsive — `task ... blocked for more than N seconds`
+
+On the **source** Lish/console you see kernel hung-task warnings for
+`vmrepl-agent`, `systemd-journal`, `rsyslog`, etc., **reads work (`ls`) but every
+command that writes hangs**, and `Ctrl-C` does nothing.
+
+| What it means | Remediation |
+|---|---|
+| The source root **filesystem is frozen** (`fsfreeze`) and writes are blocked system-wide; the blocked processes are in uninterruptible (`D`) state, so they ignore signals. Older builds auto-`fsfreeze`d a non-LVM source for the whole cutover read and could deadlock without thawing. | **Thaw it:** from a fresh session run `fsfreeze -u /` (reads work, so this executes), or **reboot from Cloud Manager** (a freeze never survives reboot). Then `systemctl disable --now vmrepl-agent.timer` before re-running. **Current builds never hold a freeze across the read** — non-LVM sources replicate live (the appliance proceeds with a warning), and a watchdog force-thaws after 60s. For a true point-in-time cutover image, put the source root on **LVM**. |
+
 ---
 
 ## 2. Validation checks (migration card)
