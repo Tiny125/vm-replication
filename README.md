@@ -20,7 +20,8 @@ boots natively on Linode — with a near-zero-downtime cutover.
 > to produce a launchable Linode image.
 >
 > Prefer the manual/CLI workflow? The [step-by-step guide → `docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md).
-> Also: [`docs/CUTOVER.md`](docs/CUTOVER.md) (runbook),
+> Also: [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) (supported sources, prerequisites & limits),
+> [`docs/CUTOVER.md`](docs/CUTOVER.md) (runbook),
 > [`docs/OPERATIONS.md`](docs/OPERATIONS.md) (systemd/control plane),
 > [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) (error reference), and
 > [`docs/DESIGN.md`](docs/DESIGN.md) (architecture).
