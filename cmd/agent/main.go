@@ -138,7 +138,7 @@ type syncResult struct {
 // cutover the appliance can ask — via the receiver's hello-ack — for a crash-
 // consistent image; when that happens we transparently re-read this pass from a
 // point-in-time source snapshot (LVM/fsfreeze) and ship that instead, so the
-// launched instance boots from a single consistent instant (MGN-style).
+// launched instance boots from a single consistent instant.
 func run(c cfg) (syncResult, error) {
 	consistent := chooseMode(c, false) != snapshot.ModeNone
 	res, resync, err := replicate(c, consistent)
