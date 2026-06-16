@@ -12,6 +12,13 @@
 #
 #     sudo ./machine-convert.sh /dev/sda
 #
+# Optional console/SSH access for the migrated image (seeded into root) can be
+# supplied via the environment so it never appears on the command line:
+#
+#     sudo VMREPL_ROOT_PASSWORD='s3cret' \
+#          VMREPL_SSH_AUTHORIZED_KEY='ssh-ed25519 AAAA... you@host' \
+#          ./machine-convert.sh /dev/sda
+#
 # It is best-effort and supports Debian/Ubuntu (apt/grub/initramfs-tools) and
 # RHEL-family (dnf/grub2/dracut). Review the log; some source images need manual
 # tweaks. Always keep the source until you have booted and validated the target.
@@ -291,6 +298,30 @@ systemctl enable serial-getty@ttyS0.service 2>/dev/null || true
 # 7) Fresh machine-id so cloned hosts don't collide.
 : > /etc/machine-id 2>/dev/null || true
 rm -f /var/lib/dbus/machine-id 2>/dev/null || true
+
+# 8) Console/SSH access requested at cutover. Migrated disks carry the source's
+#    accounts, and cloud images usually keep root locked/password-less, so the
+#    Lish serial console has nothing to log in as. Seed whatever the operator
+#    provided (passed via the environment so it is never written to this script).
+if [ -n "\${VMREPL_ROOT_PASSWORD:-}" ]; then
+  log "Setting and unlocking the root password"
+  echo "root:\${VMREPL_ROOT_PASSWORD}" | chpasswd 2>/dev/null || log "WARNING: could not set root password"
+  passwd -u root >/dev/null 2>&1 || true
+fi
+if [ -n "\${VMREPL_SSH_AUTHORIZED_KEY:-}" ]; then
+  log "Installing the provided SSH public key for root"
+  mkdir -p /root/.ssh && chmod 700 /root/.ssh
+  printf '%s\n' "\${VMREPL_SSH_AUTHORIZED_KEY}" >> /root/.ssh/authorized_keys
+  chmod 600 /root/.ssh/authorized_keys
+  # Permit key-based root SSH if the source config forbids it outright.
+  if [ -f /etc/ssh/sshd_config ]; then
+    if grep -qiE '^[[:space:]]*PermitRootLogin[[:space:]]+no' /etc/ssh/sshd_config; then
+      sed -i 's/^[[:space:]]*PermitRootLogin[[:space:]]\+no/PermitRootLogin prohibit-password/I' /etc/ssh/sshd_config
+    elif ! grep -qiE '^[[:space:]]*PermitRootLogin' /etc/ssh/sshd_config; then
+      echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config
+    fi
+  fi
+fi
 
 log "Inner conversion complete"
 INNER

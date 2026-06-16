@@ -96,6 +96,7 @@ and you can **Retry cutover** (it cleans up the previous attempt first).
 |---|---|---|
 | `not logged in` / `invalid password` | Session expired or wrong password. | Sign in again. Forgot it? On the appliance run `sudo /usr/local/bin/applianced -data-dir /var/lib/vm-repl -show-password`. |
 | `token is required` / Linode calls failing with 401 | No/invalid Linode token. | Add a valid Personal Access Token (Linodes + Volumes read/write) in the console. |
+| **Can't log in as root on the launched instance (Lish)** | The migrated disk carries the **source's** accounts. Cloud images (Ubuntu, etc.) usually keep **root locked/password-less** and log in via SSH key or a sudo user — so the Lish *serial* console, which only does password login, has nothing to authenticate against. The instance booted fine; this is purely credentials. | **Set root access at cutover:** the Cutover dialog has optional **Root password** and **SSH public key** fields — fill them and the migrated image is reachable immediately (Retry cutover if you already cut over). Or log in over SSH with your original source key/user. Or fix it after the fact in **Rescue Mode**: mount the volume, `chroot`, `passwd root` + `passwd -u root`. |
 
 > Signing out of the console **does not** stop a migration — replication runs in
 > the `applianced` service independent of console sessions.

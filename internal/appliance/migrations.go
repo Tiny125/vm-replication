@@ -631,7 +631,18 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		// machine-convert.sh requires bash (set -o pipefail, etc). Run it under
 		// bash explicitly — invoking via /bin/sh would use dash on Debian/Ubuntu
 		// and fail with "Illegal option -o pipefail".
-		out, err := exec.CommandContext(ctx, bashPath(), s.cfg.ConvertScript, bootDevice).CombinedOutput()
+		cmd := exec.CommandContext(ctx, bashPath(), s.cfg.ConvertScript, bootDevice)
+		// Pass any console/SSH access the operator entered via the environment (not
+		// argv) so the secrets don't show up in `ps`. The script seeds them into the
+		// migrated image's root account inside the chroot.
+		cmd.Env = os.Environ()
+		if req.RootPassword != "" {
+			cmd.Env = append(cmd.Env, "VMREPL_ROOT_PASSWORD="+req.RootPassword)
+		}
+		if req.SSHAuthorizedKey != "" {
+			cmd.Env = append(cmd.Env, "VMREPL_SSH_AUTHORIZED_KEY="+req.SSHAuthorizedKey)
+		}
+		out, err := cmd.CombinedOutput()
 		if canceled() {
 			return
 		}
@@ -651,6 +662,9 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 			_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish, so the launched instance may not boot. Most often the replicated filesystem is inconsistent because the source kept changing during the copy — the reliable fix is a fresh full sync of a quiesced/idle source, then cut over again. The image volume is still created so you can also repair it manually in Rescue Mode (see docs/TROUBLESHOOTING.md). Detail: "+oneLine(trimOut(out)))
 		} else {
 			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("boot disk converted for Linode (virtio, network); boot kernel %s root %s", kernel, rootDevice))
+			if access := accessSeededNote(req); access != "" {
+				_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: "+access+" — you can log in to the launched instance without rescue mode")
+			}
 		}
 	} else {
 		log.Printf("appliance: migration %d: skipping machine-convert (no script or non-block device)", m.ID)
@@ -1047,6 +1061,21 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// accessSeededNote summarizes which console/SSH access was seeded into the image
+// at cutover, for the activity log. It never includes the secret itself.
+func accessSeededNote(req api.FinalizeRequest) string {
+	switch {
+	case req.RootPassword != "" && req.SSHAuthorizedKey != "":
+		return "set the root password and installed the SSH key for root"
+	case req.RootPassword != "":
+		return "set and unlocked the root password"
+	case req.SSHAuthorizedKey != "":
+		return "installed the SSH key for root"
+	default:
+		return ""
+	}
 }
 
 // convertField extracts the value of a "key: value" line emitted by

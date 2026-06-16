@@ -278,18 +278,29 @@ function fmtTime(t){try{return new Date(t).toLocaleTimeString([],{hour12:false})
 function uiDialog(opts){
   return new Promise(resolve=>{
     const ov=document.createElement('div');ov.className='modal-overlay';
+    // Optional text inputs (opts.fields:[{id,label,type,placeholder}]); their
+    // trimmed values are returned on confirm, keyed by id.
+    const fields=(opts.fields||[]).map(f=>
+      '<div style="margin-top:10px"><label style="display:block;margin-bottom:4px;font-size:13px">'+esc(f.label)+'</label>'+
+      '<input id="__f_'+f.id+'" type="'+(f.type||'text')+'" style="width:100%" placeholder="'+esc(f.placeholder||'')+'"></div>').join('');
     const check=opts.checkbox?'<label class="modal-check"><input type="checkbox" id="__mck"'+(opts.checkbox.checked?' checked':'')+'><span>'+esc(opts.checkbox.label)+'</span></label>':'';
     const cancelBtn=opts.cancel===false?'':'<button class="modal-cancel">'+esc(opts.cancelText||'Cancel')+'</button>';
     ov.innerHTML='<div class="modal'+(opts.wide?' wide':'')+'" role="dialog" aria-modal="true">'+
       '<h3>'+esc(opts.title||'')+'</h3>'+
-      '<div class="modal-body">'+(opts.html||'')+'</div>'+check+
+      '<div class="modal-body">'+(opts.html||'')+'</div>'+fields+check+
       '<div class="modal-actions">'+cancelBtn+
       '<button class="modal-ok '+(opts.okDanger?'danger':'primary')+'">'+esc(opts.okText||'OK')+'</button></div></div>';
     document.body.appendChild(ov);
     const ok=ov.querySelector('.modal-ok'),cancel=ov.querySelector('.modal-cancel');
     let done=false;
     const close=val=>{if(done)return;done=true;document.removeEventListener('keydown',onKey);ov.classList.add('closing');setTimeout(()=>ov.remove(),150);resolve(val)};
-    const confirm=()=>close(opts.checkbox?{checked:ov.querySelector('#__mck').checked}:true);
+    const confirm=()=>{
+      if(!opts.checkbox&&!(opts.fields&&opts.fields.length))return close(true);
+      const out={};
+      if(opts.checkbox)out.checked=ov.querySelector('#__mck').checked;
+      (opts.fields||[]).forEach(f=>out[f.id]=ov.querySelector('#__f_'+f.id).value.trim());
+      close(out);
+    };
     function onKey(e){if(e.key==='Escape')close(false);else if(e.key==='Enter'){e.preventDefault();confirm()}}
     ok.onclick=confirm;
     if(cancel)cancel.onclick=()=>close(false);
@@ -446,13 +457,18 @@ async function startMig(id,btn){
   const r=await confirmModal({
     title:'Cut over migration #'+id+'?',
     html:'<div class="warn" style="margin-bottom:8px">After cutover the source agent <b>stops replicating</b> — the migrated copy is frozen at this point.</div>'+
-      'First the appliance takes a <b>crash-consistent point-in-time snapshot</b> of the source (like AWS MGN) so the new instance boots cleanly, then it converts the boot disk and clones every disk into launchable <b>&lt;name&gt;-cutover</b> volumes. Keep the source agent connected so the snapshot can be taken. This is the final step.',
+      'First the appliance takes a <b>crash-consistent point-in-time snapshot</b> of the source so the new instance boots cleanly, then it converts the boot disk and clones every disk into launchable <b>&lt;name&gt;-cutover</b> volumes. Keep the source agent connected so the snapshot can be taken. This is the final step.'+
+      '<div class="muted" style="font-size:12px;margin-top:10px">Migrated disks keep the <b>source</b>’s logins, and cloud images usually leave root locked — so the Lish console may have no password to log in with. Optionally set root access below to reach the new instance without rescue mode.</div>',
     okText:'Cut over',
+    fields:[
+      {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
+      {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
+    ],
     checkbox:{label:'Also launch a new <name>-cutover Linode now (boot=sda, data=sdb…). Leave unchecked to just create the cutover volumes.',checked:true}
   });
   if(!r)return;
   busy(btn,true);
-  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:r.checked});await refreshMig(id)}
+  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:r.checked,root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||''});await refreshMig(id)}
   catch(e){alertModal({title:'Cannot cut over',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function stopMig(id,btn){

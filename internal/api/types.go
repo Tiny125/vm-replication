@@ -308,4 +308,12 @@ type FinalizeRequest struct {
 	Region         string `json:"region,omitempty"`
 	Type           string `json:"type,omitempty"`
 	Label          string `json:"label,omitempty"`
+	// Optional console/SSH access to seed into the migrated image at cutover, so
+	// the launched instance is reachable without rescue-mode surgery. Migrated
+	// disks carry the source's accounts, and cloud images usually keep root
+	// locked/password-less — leaving the Lish serial console with nothing to log
+	// in as. These are applied (best-effort) by the boot-conversion step and are
+	// never persisted.
+	RootPassword     string `json:"root_password,omitempty"`      // set+unlock root's password
+	SSHAuthorizedKey string `json:"ssh_authorized_key,omitempty"` // add to root's authorized_keys
 }
