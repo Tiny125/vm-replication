@@ -100,6 +100,14 @@ and you can **Retry cutover** (it cleans up the previous attempt first).
 | `create instance: ... / create boot config: ... / boot instance: ...` | A Linode API call failed during launch. | Read the quoted Linode error; common causes are account limits, region mismatch, or a volume not yet attachable. Retry cutover. |
 | `could not delete previous cutover Linode/volume (...)` (warn) | Cleanup of a prior attempt couldn't finish. | Remove the leftover `<name>-cutover` instance/volume in Cloud Manager, then retry. |
 
+### Launched instance has the wrong IP / no connectivity / very slow Lish
+
+After cutover the new instance can't be pinged, or **Lish login and every command lag ~10s**, and `ip -br a` shows the **source's** IP (e.g. `… proto static`) instead of its own.
+
+| What it means | Remediation |
+|---|---|
+| The migrated disk carried the source's **static** network config — either a netplan file (e.g. `01-netcfg.yaml`) **or a systemd-networkd file** (`/etc/systemd/network/05-eth0.network`) — which pins the **old IP/nameservers**. A static config sorts ahead of the appliance's generated DHCP config and wins, so the new instance comes up on the **source's** IP. With the wrong IP there's no working route, so `ping 8.8.8.8` fails, DNS lookups time out (~40s), and anything that resolves a name — the login MOTD, package tools — crawls. | **Current builds remove the source's network config** (netplan, `/etc/systemd/network/*.network`, interfaces.d, NetworkManager, ifcfg) and write a single DHCP config, so this is fixed for new cutovers. To fix an already-launched instance, in **Lish** check `networkctl status eth0` for the active `Network File:`, then move it aside and reboot — e.g. `mv /etc/systemd/network/05-eth0.network /root/ ; reboot` (and/or `mv /etc/netplan/01-netcfg.yaml /root/`). Confirm with `ip -br a` that eth0 now has the instance's **own** assigned IP (from Cloud Manager → Network). |
+
 ---
 
 ## 5. Console / auth errors
