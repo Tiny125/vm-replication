@@ -80,7 +80,8 @@ but get no automatic repair pass.
 - **Crash-consistent cutover** via LVM point-in-time snapshot (falls back to a live read + warning when no snapshot mechanism exists).
 - **Automated boot conversion** for Linode: virtio initramfs, GRUB reinstall (or Linode-kernel boot for partitionless disks), `fsck`, Lish serial console, fresh machine-id, and a **DHCP network reset** (strips the source's static IP/DNS config so the new instance gets its own Linode IP).
 - **Console/SSH access seeding** at cutover (set a root password and/or install an SSH key so the launched instance is reachable).
-- **Reboot-based cutover** that clones the replicated volume and launches a new Linode from it.
+- **Choice of boot target** at create time: a **separate Block Storage volume** (default), or the Linode's **local disk** (NVMe — faster and no separate volume cost; the appliance picks the closest Shared/Dedicated plan whose disk fits, single-disk only).
+- **Reboot-based cutover** that launches a new Linode from the replicated image.
 
 ## What it does **not** support
 
@@ -90,7 +91,7 @@ but get no automatic repair pass.
 - **Application- or database-aware migration.** It moves the whole disk image, not individual apps/DBs. Use the optional quiesce **pre/post hooks** for app-consistent snapshots if needed.
 - **Encrypted root (LUKS).** Encrypted blocks replicate, but the conversion can't unlock/mount the root to fix it up — needs manual handling.
 - **Automatic repair for btrfs / ZFS roots** (no `fsck` pass; replication still works, boot fixup is best-effort).
-- **Booting from a local Linode disk.** Cutover currently boots from a **Block Storage Volume** (billed separately from the plan); local-NVMe boot is not implemented.
+- **Multi-disk with local-disk boot.** Local-disk boot supports a **single disk**; multi-disk migrations must use Separate-volume boot.
 
 ---
 

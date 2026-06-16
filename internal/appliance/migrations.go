@@ -303,6 +303,10 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 		req.BootTarget = api.BootTargetVolume
 		req.PlanClass, req.LinodeType = "", ""
 	case api.BootTargetDisk:
+		if len(devices) > 1 {
+			writeErr(w, http.StatusBadRequest, "local-disk boot currently supports a single disk; use Separate-volume boot for multi-disk migrations")
+			return
+		}
 		if req.PlanClass != "dedicated" {
 			req.PlanClass = "shared"
 		}
@@ -538,13 +542,6 @@ func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "the initial full sync must finish on all disks before cutover")
 		return
 	}
-	// Local-disk boot cutover is not wired up yet (it ships in a follow-up). The
-	// create-time plan sizing and UI are in place; only the cutover engine is
-	// pending, so refuse here rather than silently producing a volume boot.
-	if m.BootTarget == api.BootTargetDisk {
-		writeErr(w, http.StatusNotImplemented, "local-disk boot cutover isn't available yet (it ships in the next update); to cut over now, recreate this migration with Boot target = Separate volume")
-		return
-	}
 	if m.State == api.MigFailed {
 		_ = s.st.AddEvent(ctx, id, "info", "retrying cutover on the already-replicated data")
 	}
@@ -739,6 +736,11 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		if req.SSHAuthorizedKey != "" {
 			cmd.Env = append(cmd.Env, "VMREPL_SSH_AUTHORIZED_KEY="+req.SSHAuthorizedKey)
 		}
+		if m.BootTarget == api.BootTargetDisk {
+			// Bake in the one-shot that, on the volume-boot phase, copies the image
+			// onto the instance's local disk (see finalizeDisk).
+			cmd.Env = append(cmd.Env, "VMREPL_DISK_INSTALL=1")
+		}
 		out, err := cmd.CombinedOutput()
 		if canceled() {
 			return
@@ -772,6 +774,14 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigImageReady,
 			"Linode automation not configured; migrated data is on the appliance volumes/files")
 		_ = s.st.SetMigrateFinished(sctx, m.ID)
+		return
+	}
+
+	// Local-disk boot diverges here: instead of launching from cloned volumes, it
+	// streams the image onto the instance's local disk. Steady-state replication
+	// and the boot conversion above are identical.
+	if m.BootTarget == api.BootTargetDisk {
+		s.finalizeDisk(ctx, m, cl, kernel, rootDevice)
 		return
 	}
 
@@ -861,6 +871,160 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	_ = s.st.SetMigrationState(sctx, m.ID, api.MigImageReady, "")
 	_ = s.st.SetMigrateFinished(sctx, m.ID)
 	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %d cutover volume(s) ready to launch", len(m.Disks)))
+}
+
+// finalizeDisk cuts a disk-mode migration over to a Linode that boots from its
+// local (plan) disk. Local Linode disks can't be attached to the appliance, so
+// instead of cloning a volume onto the instance we: clone the replicated volume,
+// create the target Linode plus a blank raw local disk, boot it ONCE from the
+// volume (raw disk attached as sdb) so the in-guest one-shot installed by
+// machine-convert copies the volume onto the local disk and powers off, then
+// boot the instance from that local disk and drop the volume. Single-disk only
+// (enforced at create time). The boot conversion already ran in finalize().
+func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.Client, kernel, rootDevice string) {
+	sctx := s.ctx
+	canceled := func() bool { return ctx.Err() != nil }
+	boot := m.Disks[0]
+
+	_ = s.st.AddEvent(sctx, m.ID, "info", "cutover (local disk) started: cloning the converted image")
+	s.cleanupCutoverArtifacts(sctx, m) // retry-safe
+
+	// 1) Clone the replication volume into the image we copy onto the local disk.
+	label := cutoverVolumeLabel(m.Name, boot.Index, len(m.Disks))
+	clone, err := cl.CloneVolume(ctx, boot.VolumeID, label)
+	if canceled() {
+		return
+	}
+	if err != nil {
+		s.fail(m.ID, "clone boot volume: "+err.Error())
+		return
+	}
+	if _, err := cl.WaitVolumeActive(ctx, clone.ID, 15*time.Minute); err != nil {
+		if canceled() {
+			return
+		}
+		s.fail(m.ID, "wait clone active: "+err.Error())
+		return
+	}
+	_ = s.st.SetDiskArtifact(sctx, boot.ID, fmt.Sprintf("volume:%d", clone.ID))
+
+	// 2) Create the target instance on the resolved plan (region = appliance's).
+	region := s.cfg.Region
+	if inst, err := cl.GetInstance(ctx, s.cfg.ApplianceLinodeID); err == nil && inst.Region != "" {
+		region = inst.Region
+	}
+	inst, err := cl.CreateInstance(ctx, cutoverName(m.Name), region, m.LinodeType)
+	if canceled() {
+		return
+	}
+	if err != nil {
+		s.fail(m.ID, "create instance: "+err.Error())
+		return
+	}
+	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", clone.ID), inst.ID)
+	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("created cutover Linode %q (id %d) on plan %s", cutoverName(m.Name), inst.ID, m.LinodeType))
+
+	// 3) Create a blank raw local disk sized to the plan's full storage.
+	diskMB := 0
+	if types, terr := cl.ListTypes(ctx); terr == nil {
+		diskMB = linode.TypeDiskMB(types, m.LinodeType)
+	}
+	if diskMB == 0 { // fallback: at least the image size, rounded up to MB
+		diskMB = int((boot.SizeBytes + (1 << 20) - 1) / (1 << 20))
+	}
+	rawDisk, err := cl.CreateDisk(ctx, inst.ID, "vmrepl-boot", diskMB, "raw")
+	if canceled() {
+		return
+	}
+	if err != nil {
+		s.fail(m.ID, "create local disk: "+err.Error())
+		return
+	}
+	if err := cl.WaitDiskReady(ctx, inst.ID, rawDisk.ID, 10*time.Minute); err != nil {
+		if canceled() {
+			return
+		}
+		s.fail(m.ID, "wait local disk ready: "+err.Error())
+		return
+	}
+
+	// 4) Boot once from the volume (sda) with the raw disk attached (sdb); the
+	//    in-guest one-shot copies sda->sdb and powers the instance off.
+	installCfg, err := cl.CreateConfig(ctx, inst.ID, "vmrepl-install", kernel, rootDevice,
+		map[string]any{"sda": map[string]any{"volume_id": clone.ID}, "sdb": map[string]any{"disk_id": rawDisk.ID}})
+	if err != nil {
+		if canceled() {
+			return
+		}
+		s.fail(m.ID, "create install config: "+err.Error())
+		return
+	}
+	if err := cl.Boot(ctx, inst.ID, installCfg); err != nil {
+		if canceled() {
+			return
+		}
+		s.fail(m.ID, "boot for install: "+err.Error())
+		return
+	}
+	_ = s.st.AddEvent(sctx, m.ID, "info", "booting from the volume to copy the image onto the local disk (several minutes)…")
+	if err := cl.WaitInstanceStatus(ctx, inst.ID, "running", 10*time.Minute); err != nil {
+		if canceled() {
+			return
+		}
+		s.fail(m.ID, "instance did not start the copy boot: "+err.Error())
+		return
+	}
+	if err := cl.WaitInstanceStatus(ctx, inst.ID, "offline", 60*time.Minute); err != nil {
+		if canceled() {
+			return
+		}
+		s.fail(m.ID, "local-disk copy did not finish (instance never powered off — check it in Lish): "+err.Error())
+		return
+	}
+	_ = s.st.AddEvent(sctx, m.ID, "info", "image copied onto the local disk; switching boot to the local disk")
+
+	// 5) Boot from the local disk (sda) and confirm it comes up.
+	bootCfg, err := cl.CreateConfig(ctx, inst.ID, "boot-migrated", kernel, rootDevice,
+		map[string]any{"sda": map[string]any{"disk_id": rawDisk.ID}})
+	if err != nil {
+		if canceled() {
+			return
+		}
+		s.fail(m.ID, "create boot config: "+err.Error())
+		return
+	}
+	if err := cl.Boot(ctx, inst.ID, bootCfg); err != nil {
+		if canceled() {
+			return
+		}
+		s.fail(m.ID, "boot from local disk: "+err.Error())
+		return
+	}
+	if err := cl.WaitInstanceStatus(ctx, inst.ID, "running", 10*time.Minute); err != nil {
+		if canceled() {
+			return
+		}
+		s.fail(m.ID, "instance did not boot from the local disk: "+err.Error())
+		return
+	}
+
+	// 6) Drop the now-unneeded cutover volume.
+	_ = cl.DetachVolume(ctx, clone.ID)
+	var derr error
+	for i := 0; i < 10; i++ {
+		if derr = cl.DeleteVolume(ctx, clone.ID); derr == nil {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if derr != nil {
+		_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf("local-disk boot is up, but temporary volume %d could not be deleted (remove it in Cloud Manager): %v", clone.ID, derr))
+	}
+	_ = s.st.SetDiskArtifact(sctx, boot.ID, fmt.Sprintf("disk:%d", rawDisk.ID))
+	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("disk:%d", rawDisk.ID), inst.ID)
+	_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
+	_ = s.st.SetMigrateFinished(sctx, m.ID)
+	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %q (id %d) is booting from its local disk on plan %s", cutoverName(m.Name), inst.ID, m.LinodeType))
 }
 
 // cleanupCutoverArtifacts deletes the Linode instance and cloned volumes created
