@@ -149,7 +149,7 @@ usable everywhere.
 ### Automatic crash-consistent cutover (appliance console)
 
 When you cut over from the **appliance console**, you don't need to set
-`--snapshot` yourself: the appliance does it for you, the same way AWS MGN works.
+`--snapshot` yourself: the appliance does it for you automatically.
 
 - **Steady-state replication stays live** (`--snapshot none`) so there is **no
   downtime** while data is catching up — intermediate target states are never
