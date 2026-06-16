@@ -365,7 +365,8 @@ async function loadSettings(){
     h+='<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span><span class="y">✔</span> Linode API token validated &amp; stored.'+
        (st.linode_account?(' Account: <b>'+esc(st.linode_account)+'</b>.'):'')+'<br>'+
        (st.linode_automation?('Appliance Linode '+esc(st.appliance_linode_id)+'; volumes created in its region.'):'(appliance Linode id unknown — file-fallback mode)')+'</span>'+
-       '<button class="danger" onclick="removeToken(this)">Remove token</button></div>';
+       '<button class="danger" onclick="removeToken(this)">Remove token</button></div>'+
+       '<div class="muted" style="margin-top:8px;font-size:12px">The token can only be removed once <b>no migrations exist</b> — deleting a migration uses it to remove that migration’s Linode volumes.</div>';
   }else{
     h+='<details><summary>What is this and how do I get a token?</summary><div class="muted" style="font-size:13px">'+
        'A Linode <b>Personal Access Token</b> lets the appliance create volumes, clone disks and launch instances. Stored <b>encrypted at rest</b>. '+
@@ -387,7 +388,7 @@ async function saveToken(btn){
 async function removeToken(btn){
   if(!await confirmModal({title:'⚠ Remove Linode API token?',
     html:'<div class="warn">Provisioning, cloning and launching will <b>stop working</b> until you add a valid token again.</div>'+
-      '<div class="muted" style="margin-top:8px;font-size:13px">Migrations already created keep their volumes, but you won’t be able to create new ones or cut over without a token. This does not delete anything in your Linode account.</div>',
+      '<div class="muted" style="margin-top:8px;font-size:13px">Only allowed when <b>no migrations exist</b> — otherwise removal is refused, because deleting a migration needs the token to remove its Linode volumes (removing it first would orphan them). This does not delete anything in your Linode account.</div>',
     okText:'Remove token',okDanger:true}))return;
   busy(btn,true);try{await api('DELETE','/api/v1/settings/linode-token');toast('Linode token removed','ok');loadSettings()}catch(e){alertModal({title:'Error',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
 

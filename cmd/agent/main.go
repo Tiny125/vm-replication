@@ -136,31 +136,40 @@ type syncResult struct {
 // run performs one replication pass. Normally that is a single attempt using the
 // operator's chosen consistency mode (default none = live, no downtime). At
 // cutover the appliance can ask — via the receiver's hello-ack — for a crash-
-// consistent image; when that happens we transparently re-read this pass from a
-// point-in-time source snapshot (LVM/fsfreeze) and ship that instead, so the
-// launched instance boots from a single consistent instant.
+// consistent image. We honor that only when the source actually has a
+// point-in-time mechanism (an LVM snapshot): we re-read from the snapshot and
+// ship that. When there is none we must NOT freeze the source for a whole-device
+// read — that blocks every write on the filesystem and wedges the box — so we
+// ship a normal live pass and let the appliance proceed on the current data
+// (with a warning).
 func run(c cfg) (syncResult, error) {
-	consistent := chooseMode(c, false) != snapshot.ModeNone
-	res, resync, err := replicate(c, consistent)
+	mode := chooseMode(c, false)
+	res, resync, err := replicate(c, mode, true)
 	if err != nil || !resync {
 		return res, err
 	}
-	log.Printf("agent: receiver requested a crash-consistent snapshot for cutover; re-reading from a point-in-time source snapshot")
-	res, _, err = replicate(c, true)
+	cmode := chooseMode(c, true)
+	if cmode == snapshot.ModeNone {
+		log.Printf("agent: crash-consistent snapshot requested, but the source has no LVM snapshot capability — replicating live without freezing (the appliance proceeds on the current data). Put the source root on LVM, or quiesce it at cutover, for a clean point-in-time image.")
+		res, _, err = replicate(c, mode, false)
+		return res, err
+	}
+	log.Printf("agent: receiver requested a crash-consistent snapshot for cutover; re-reading from a point-in-time %s snapshot", cmode)
+	res, _, err = replicate(c, cmode, false)
 	return res, err
 }
 
-// replicate runs one pass. If consistent is true it reads from a point-in-time
-// snapshot; otherwise it reads live. It returns resync=true (without streaming)
-// when the receiver asked for a crash-consistent re-read and this pass wasn't
-// already consistent — the caller then re-invokes with consistent=true.
-func replicate(c cfg, consistent bool) (_ syncResult, resync bool, _ error) {
+// replicate runs one pass reading from the given mode's source (the live device
+// or a point-in-time snapshot). passConsistent is true only for a real
+// point-in-time snapshot (LVM). When mayBail is true and the receiver asks for a
+// crash-consistent re-read this pass can't satisfy, it returns resync=true
+// without streaming so the caller can re-invoke in a consistent mode.
+func replicate(c cfg, mode snapshot.Mode, mayBail bool) (_ syncResult, resync bool, _ error) {
 	res := syncResult{mode: api.SyncDelta, startedAt: time.Now()}
 
 	// Establish the read source for this pass. The returned readPath is what we
 	// actually replicate from; cleanup releases it (snapshot/freeze).
-	mode := chooseMode(c, consistent)
-	passConsistent := mode != snapshot.ModeNone
+	passConsistent := mode == snapshot.ModeLVM
 	readPath, rawCleanup, err := prepareSource(c, mode)
 	if err != nil {
 		return res, false, fmt.Errorf("prepare source consistency: %w", err)
@@ -260,9 +269,10 @@ func replicate(c cfg, consistent bool) (_ syncResult, resync bool, _ error) {
 		return res, false, err
 	}
 	// The receiver can ask us to re-read this pass crash-consistently (cutover).
-	// If we weren't already consistent, bail out cleanly so the caller re-runs
-	// with consistent=true; the deferred cleanup releases this live attempt.
-	if ack.ConsistentResync && !passConsistent {
+	// If this pass isn't point-in-time and the caller still allows it, bail out
+	// cleanly so the caller can re-run from a snapshot; the deferred cleanup
+	// releases this attempt.
+	if mayBail && ack.ConsistentResync && !passConsistent {
 		return res, true, nil
 	}
 	if !ack.Accepted {

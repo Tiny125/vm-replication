@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -246,9 +247,22 @@ func (s *Server) handleSetLinodeToken(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "linode_account": account})
 }
 
-// handleDeleteLinodeToken removes the stored token (e.g. expired/rotated).
+// handleDeleteLinodeToken removes the stored token (e.g. expired/rotated). It is
+// refused while any migration still exists: deleting a migration uses the token
+// to remove its Linode volumes, so removing the token first would orphan those
+// volumes (the operator would have to clean them up by hand in Cloud Manager).
 func (s *Server) handleDeleteLinodeToken(w http.ResponseWriter, r *http.Request) {
-	if err := s.st.DeleteLinodeToken(r.Context()); err != nil {
+	ctx := r.Context()
+	migs, err := s.st.ListMigrations(ctx)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if n := len(migs); n > 0 {
+		writeErr(w, http.StatusConflict, fmt.Sprintf("cannot remove the Linode API token while %d migration(s) exist — deleting a migration uses the token to remove its Linode volumes, so removing it now would orphan those volumes (you'd have to delete them by hand in Cloud Manager). Delete all migrations first, then remove the token.", n))
+		return
+	}
+	if err := s.st.DeleteLinodeToken(ctx); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}

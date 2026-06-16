@@ -279,6 +279,21 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 	req.Devices = devices
 
 	ctx := r.Context()
+	// A migration provisions Linode volumes and later needs the token again to
+	// remove them on delete, so require a present, working token up front (in
+	// automation mode). This also fails fast on a revoked/insufficient token
+	// instead of half-creating a migration that can't provision storage.
+	if s.cfg.ApplianceLinodeID != 0 {
+		cl, ok := s.linodeClient(ctx)
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "add a valid Linode API token in Settings before creating a migration — the appliance needs it to provision storage now and to remove the volumes when you delete the migration")
+			return
+		}
+		if _, err := cl.GetProfile(ctx); err != nil {
+			writeErr(w, http.StatusBadGateway, "the stored Linode API token is not working (revoked, or missing Linodes + Volumes read/write) — update it in Settings before creating a migration: "+err.Error())
+			return
+		}
+	}
 	m, token, err := s.st.CreateMigration(ctx, req)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, friendlyCreateErr(err))
