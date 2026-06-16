@@ -304,6 +304,17 @@ if [ -d /etc/systemd/network ]; then
     [ -e "\$f" ] || continue
     mv "\$f" "\$NETBAK/" 2>/dev/null || rm -f "\$f"
   done
+  # If the distro has no netplan, networkd is the only manager — give it a DHCP
+  # config for eth0 so we don't leave the interface with no configuration.
+  if [ ! -d /etc/netplan ]; then
+    cat > /etc/systemd/network/10-vmrepl-eth0.network <<NET
+[Match]
+Name=eth0
+
+[Network]
+DHCP=yes
+NET
+  fi
 fi
 if [ -f /etc/network/interfaces ]; then
   printf 'auto lo\niface lo inet loopback\nauto eth0\niface eth0 inet dhcp\n' > /etc/network/interfaces
