@@ -99,6 +99,21 @@ func (c *Client) GetVolume(ctx context.Context, id int64) (Volume, error) {
 	return v, err
 }
 
+// Profile identifies the Linode account a token belongs to.
+type Profile struct {
+	Username string `json:"username"`
+	Email    string `json:"email"`
+}
+
+// GetProfile fetches the token owner's profile (GET /profile). It needs no
+// special scope, so it doubles as a token-validity check: an invalid, expired,
+// or revoked token returns an HTTP 401 error.
+func (c *Client) GetProfile(ctx context.Context) (Profile, error) {
+	var p Profile
+	err := c.do(ctx, http.MethodGet, "/profile", nil, &p)
+	return p, err
+}
+
 // AttachVolume attaches a volume to a Linode.
 func (c *Client) AttachVolume(ctx context.Context, volumeID, linodeID int64) error {
 	return c.do(ctx, http.MethodPost, fmt.Sprintf("/volumes/%d/attach", volumeID),

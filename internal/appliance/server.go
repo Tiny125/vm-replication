@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -193,8 +194,10 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	linodeSet, _ := s.st.LinodeTokenSet(r.Context())
+	account, _ := s.st.LinodeAccount(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"linode_token_set":    linodeSet,
+		"linode_account":      account,
 		"appliance_linode_id": s.cfg.ApplianceLinodeID,
 		"public_host":         s.cfg.PublicHost,
 		"region":              s.cfg.Region,
@@ -207,15 +210,32 @@ func (s *Server) handleSetLinodeToken(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &req) {
 		return
 	}
-	if req.Token == "" {
+	token := strings.TrimSpace(req.Token)
+	if token == "" {
 		writeErr(w, http.StatusBadRequest, "token is required")
 		return
 	}
-	if err := s.st.SetLinodeToken(r.Context(), req.Token); err != nil {
+	// Validate the token against the real Linode API before storing it, so a
+	// typo or revoked token is rejected immediately instead of failing later
+	// during provisioning. GET /profile also tells us which account it belongs to.
+	ctx := r.Context()
+	prof, err := linode.New(token).GetProfile(ctx)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "Linode rejected this token — check it is valid and has Linodes + Volumes read/write: "+err.Error())
+		return
+	}
+	if err := s.st.SetLinodeToken(ctx, token); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	account := prof.Username
+	if account != "" && prof.Email != "" {
+		account = prof.Username + " <" + prof.Email + ">"
+	} else if account == "" {
+		account = prof.Email
+	}
+	_ = s.st.SetLinodeAccount(ctx, account)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "linode_account": account})
 }
 
 // handleDeleteLinodeToken removes the stored token (e.g. expired/rotated).

@@ -521,7 +521,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		}
 		if err != nil {
 			log.Printf("appliance: migration %d: machine-convert failed (continuing best-effort): %v\n%s", m.ID, err, trimOut(out))
-			_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion did not complete ("+oneLine(err.Error())+"); the image volume is still being created — it may need manual GRUB/virtio fixup before it boots (see docs/CUTOVER.md). Detail: "+oneLine(trimOut(out)))
+			_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish, so the launched instance may not boot. Most often the replicated filesystem is inconsistent because the source kept changing during the copy — the reliable fix is a fresh full sync of a quiesced/idle source, then cut over again. The image volume is still created so you can also repair it manually in Rescue Mode (see docs/TROUBLESHOOTING.md). Detail: "+oneLine(trimOut(out)))
 		} else {
 			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("boot disk converted for Linode (virtio, network); boot kernel %s root %s", kernel, rootDevice))
 		}
