@@ -16,6 +16,7 @@ import (
 
 	"github.com/tiny125/vm-replication/internal/api"
 	"github.com/tiny125/vm-replication/internal/blockdiff"
+	"github.com/tiny125/vm-replication/internal/linode"
 	"github.com/tiny125/vm-replication/internal/protocol"
 	"github.com/tiny125/vm-replication/internal/receiver"
 	"github.com/tiny125/vm-replication/internal/transport"
@@ -294,6 +295,41 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Resolve the boot target. Volume mode (default) is unchanged. Disk mode
+	// picks the smallest Linode plan in the chosen class whose local disk fits
+	// the total replicated size, so the instance can later boot from that disk.
+	switch req.BootTarget {
+	case "", api.BootTargetVolume:
+		req.BootTarget = api.BootTargetVolume
+		req.PlanClass, req.LinodeType = "", ""
+	case api.BootTargetDisk:
+		if req.PlanClass != "dedicated" {
+			req.PlanClass = "shared"
+		}
+		cl, ok := s.linodeClient(ctx)
+		if !ok {
+			writeErr(w, http.StatusBadRequest, "local-disk boot needs a valid Linode API token (to size the plan) — add one in Settings")
+			return
+		}
+		types, err := cl.ListTypes(ctx)
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "could not load Linode plans: "+err.Error())
+			return
+		}
+		var total int64
+		for _, d := range devices {
+			total += d.SizeBytes
+		}
+		plan, ok := linode.ClosestType(types, req.PlanClass, total)
+		if !ok {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("no %s Linode plan has enough local disk for %s of data — choose a larger source or use Separate-volume boot", req.PlanClass, humanBytes(total)))
+			return
+		}
+		req.LinodeType = plan.ID
+	default:
+		writeErr(w, http.StatusBadRequest, "boot_target must be 'volume' or 'disk'")
+		return
+	}
 	m, token, err := s.st.CreateMigration(ctx, req)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, friendlyCreateErr(err))
@@ -318,12 +354,51 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("migration created with %d disk(s); waiting for the source agent", len(m.Disks)))
+	if m.BootTarget == api.BootTargetDisk {
+		_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("boot target: Linode local disk (%s plan %s)", m.PlanClass, m.LinodeType))
+	} else {
+		_ = s.st.AddEvent(ctx, m.ID, "info", "boot target: separate Block Storage volume")
+	}
 	_ = s.st.SetMigrationState(ctx, m.ID, api.MigAwaitingAgent, "")
 	m, _ = s.st.Migration(ctx, m.ID)
 	if err := s.ensureReceivers(m); err != nil {
 		log.Printf("appliance: ensureReceivers: %v", err)
 	}
 	writeJSON(w, http.StatusCreated, s.view(ctx, m, token))
+}
+
+// handleLinodePlans returns the Linode plans usable for local-disk boot, grouped
+// to "shared"/"dedicated", so the console can show the closest-fit plan for the
+// entered disk size.
+func (s *Server) handleLinodePlans(w http.ResponseWriter, r *http.Request) {
+	cl, ok := s.linodeClient(r.Context())
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "add a valid Linode API token in Settings to load plans")
+		return
+	}
+	types, err := cl.ListTypes(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "could not load Linode plans: "+err.Error())
+		return
+	}
+	plans := []api.LinodePlan{}
+	for _, t := range types {
+		var class string
+		switch {
+		case linode.PlanClasses("shared")[t.Class]:
+			class = "shared"
+		case linode.PlanClasses("dedicated")[t.Class]:
+			class = "dedicated"
+		default:
+			continue // skip gpu/highmem/premium for now
+		}
+		plans = append(plans, api.LinodePlan{
+			ID: t.ID, Label: t.Label, Class: class,
+			DiskGB: t.DiskMB / 1024, MemoryMB: t.MemoryMB, VCPUs: t.VCPUs,
+			PriceMonthly: t.Price.Monthly,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"plans": plans})
 }
 
 // provisionDiskStorage creates and attaches a Linode volume for one disk when
@@ -461,6 +536,13 @@ func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 	// gate it (so a previously-failed cutover can be retried).
 	if !cutoverReady(m) {
 		writeErr(w, http.StatusConflict, "the initial full sync must finish on all disks before cutover")
+		return
+	}
+	// Local-disk boot cutover is not wired up yet (it ships in a follow-up). The
+	// create-time plan sizing and UI are in place; only the cutover engine is
+	// pending, so refuse here rather than silently producing a volume boot.
+	if m.BootTarget == api.BootTargetDisk {
+		writeErr(w, http.StatusNotImplemented, "local-disk boot cutover isn't available yet (it ships in the next update); to cut over now, recreate this migration with Boot target = Separate volume")
 		return
 	}
 	if m.State == api.MigFailed {

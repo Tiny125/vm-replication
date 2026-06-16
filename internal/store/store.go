@@ -124,6 +124,9 @@ CREATE TABLE IF NOT EXISTS migrations (
   assessed_at     INTEGER NOT NULL DEFAULT 0,
   migrate_started INTEGER NOT NULL DEFAULT 0,
   migrate_finished INTEGER NOT NULL DEFAULT 0,
+  boot_target     TEXT NOT NULL DEFAULT 'volume',
+  plan_class      TEXT NOT NULL DEFAULT '',
+  linode_type     TEXT NOT NULL DEFAULT '',
   created_at      INTEGER NOT NULL
 );
 
@@ -169,6 +172,9 @@ CREATE INDEX IF NOT EXISTS idx_events_migration ON migration_events(migration_id
 		`ALTER TABLE migrations ADD COLUMN assessed_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE migrations ADD COLUMN migrate_started INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE migrations ADD COLUMN migrate_finished INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE migrations ADD COLUMN boot_target TEXT NOT NULL DEFAULT 'volume'`,
+		`ALTER TABLE migrations ADD COLUMN plan_class TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE migrations ADD COLUMN linode_type TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE migration_disks ADD COLUMN last_error TEXT NOT NULL DEFAULT ''`,
 	} {
 		_, _ = s.db.Exec(stmt)

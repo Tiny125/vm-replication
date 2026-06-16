@@ -211,6 +211,12 @@ type Migration struct {
 	// Disks (boot first). Authoritative per-disk state.
 	Disks []Disk `json:"disks"`
 
+	// Boot target chosen at create time (see CreateMigrationRequest). For disk
+	// mode PlanClass + LinodeType record the resolved Linode plan.
+	BootTarget string `json:"boot_target,omitempty"`
+	PlanClass  string `json:"plan_class,omitempty"`
+	LinodeType string `json:"linode_type,omitempty"`
+
 	// Finalize result.
 	ImageID    string `json:"image_id,omitempty"` // primary (boot) artifact, "volume:<id>"
 	LaunchedID int64  `json:"launched_linode_id,omitempty"`
@@ -241,6 +247,34 @@ type CreateMigrationRequest struct {
 	Devices        []DeviceSpec `json:"devices"`
 	SourceDevice   string       `json:"source_device,omitempty"`
 	SourceDiskSize int64        `json:"source_disk_size,omitempty"`
+
+	// Boot target for the launched instance: BootTargetVolume (default) boots
+	// from a Block Storage volume; BootTargetDisk boots from the Linode's local
+	// disk on a plan sized to fit. PlanClass ("shared"|"dedicated") and the
+	// resolved LinodeType apply only to disk mode (LinodeType is computed by the
+	// appliance from PlanClass + total disk size; clients leave it empty).
+	BootTarget string `json:"boot_target,omitempty"`
+	PlanClass  string `json:"plan_class,omitempty"`
+	LinodeType string `json:"linode_type,omitempty"`
+}
+
+// Boot targets for a migration's launched instance.
+const (
+	BootTargetVolume = "volume" // boot from a Block Storage volume (default)
+	BootTargetDisk   = "disk"   // boot from the Linode's local (plan) disk
+)
+
+// LinodePlan is one Linode type offered for local-disk boot sizing, surfaced to
+// the console so it can show the closest-fit plan. Class is grouped to the
+// user-facing "shared" or "dedicated".
+type LinodePlan struct {
+	ID           string  `json:"id"`    // e.g. "g6-standard-2"
+	Label        string  `json:"label"` // e.g. "Linode 4GB"
+	Class        string  `json:"class"` // "shared" | "dedicated"
+	DiskGB       int     `json:"disk_gb"`
+	MemoryMB     int     `json:"memory_mb"`
+	VCPUs        int     `json:"vcpus"`
+	PriceMonthly float64 `json:"price_monthly"`
 }
 
 // ValidationCheck is one pre-cutover gate shown in the console.

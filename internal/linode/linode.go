@@ -64,6 +64,56 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	return nil
 }
 
+// LinodeType is a plan from GET /linode/types.
+type LinodeType struct {
+	ID       string `json:"id"`     // e.g. "g6-standard-2"
+	Label    string `json:"label"`  // e.g. "Linode 4GB"
+	Class    string `json:"class"`  // nanode|standard|dedicated|highmem|gpu|premium
+	DiskMB   int    `json:"disk"`   // local disk, MB
+	MemoryMB int    `json:"memory"` // MB
+	VCPUs    int    `json:"vcpus"`
+	Price    struct {
+		Hourly  float64 `json:"hourly"`
+		Monthly float64 `json:"monthly"`
+	} `json:"price"`
+}
+
+// ListTypes returns the Linode plan catalog.
+func (c *Client) ListTypes(ctx context.Context) ([]LinodeType, error) {
+	var resp struct {
+		Data []LinodeType `json:"data"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/linode/types?page_size=500", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+// PlanClasses maps a user-facing class ("shared"|"dedicated") to the Linode type
+// classes that belong to it.
+func PlanClasses(group string) map[string]bool {
+	if group == "dedicated" {
+		return map[string]bool{"dedicated": true}
+	}
+	return map[string]bool{"nanode": true, "standard": true} // shared CPU
+}
+
+// ClosestType picks the smallest type in the given class group whose local disk
+// is >= requiredBytes (ties broken by lower monthly price). ok is false if no
+// plan in the group is large enough.
+func ClosestType(types []LinodeType, group string, requiredBytes int64) (best LinodeType, ok bool) {
+	want := PlanClasses(group)
+	for _, t := range types {
+		if !want[t.Class] || int64(t.DiskMB)*1024*1024 < requiredBytes {
+			continue
+		}
+		if !ok || t.DiskMB < best.DiskMB || (t.DiskMB == best.DiskMB && t.Price.Monthly < best.Price.Monthly) {
+			best, ok = t, true
+		}
+	}
+	return best, ok
+}
+
 // Volume is a Block Storage volume.
 type Volume struct {
 	ID             int64  `json:"id"`
