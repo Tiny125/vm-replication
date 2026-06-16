@@ -95,7 +95,7 @@ type HelloAck struct {
 	Message  string `json:"message,omitempty"`
 	// ConsistentResync asks the agent to abandon this (live) pass and immediately
 	// re-read from a point-in-time snapshot, so the next applied image is
-	// crash-consistent. The appliance sets this at cutover (MGN-style): continuous
+	// crash-consistent. The appliance sets this at cutover: continuous
 	// replication stays live and disruption-free, and only the final pre-launch
 	// pass is quiesced. Old agents that don't understand it simply ignore it.
 	ConsistentResync bool `json:"consistent_resync,omitempty"`

@@ -132,11 +132,11 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 
 // ---- crash-consistent cutover coordination ----
 //
-// AWS MGN replicates continuously with no source downtime, then at cutover
-// "launches" from a crash-consistent point-in-time snapshot so the new machine
-// boots cleanly. We do the same: steady-state replication stays live, and only
-// at cutover do we ask each disk's agent for ONE point-in-time (LVM/fsfreeze)
-// pass. These helpers track that request/acknowledgement per disk.
+// To boot cleanly, the launched instance must come from a crash-consistent
+// point-in-time image rather than a multi-minute "smear" of a live disk. So
+// steady-state replication stays live (no source downtime), and only at cutover
+// do we ask each disk's agent for ONE point-in-time (LVM/fsfreeze) pass. These
+// helpers track that request/acknowledgement per disk.
 
 // requestDiskConsistency flags a disk so its receiver bounces the next live pass
 // and asks the agent to re-read crash-consistently. Clears any prior "done" mark.
@@ -189,9 +189,9 @@ const consistencyWait = 6 * time.Minute
 
 // quiesceForCutover asks every disk's agent for one crash-consistent (point-in-
 // time) snapshot pass and waits for them to land, so the cloned image is a
-// single instant — the key to a clean boot, exactly like AWS MGN's crash-
-// consistent launch. If no agent is checking in, or the agents are an older
-// build that ignores the request, it warns and proceeds with the current data.
+// single instant — the key to a clean boot. If no agent is checking in, or the
+// agents are an older build that ignores the request, it warns and proceeds
+// with the current data.
 func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) {
 	anyAgent := false
 	for _, d := range m.Disks {
@@ -204,7 +204,7 @@ func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) {
 		_ = s.st.AddEvent(s.ctx, m.ID, "warn", "cutover: no source agent has checked in recently, so a fresh crash-consistent snapshot can't be taken; cloning the current replicated data as-is (it may be inconsistent if the source was changing)")
 		return
 	}
-	_ = s.st.AddEvent(s.ctx, m.ID, "info", "cutover: quiescing the source for a crash-consistent point-in-time snapshot (like AWS MGN) before launch — this can take up to a minute")
+	_ = s.st.AddEvent(s.ctx, m.ID, "info", "cutover: quiescing the source for a crash-consistent point-in-time snapshot before launch — this can take up to a minute")
 
 	deadline := time.Now().Add(consistencyWait)
 	for {
@@ -605,7 +605,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	canceled := func() bool { return ctx.Err() != nil }
 	sctx := s.ctx // store writes survive a Stop (which owns its own transition)
 
-	// 0) Quiesce for a crash-consistent cutover (MGN-style): ask each disk's agent
+	// 0) Quiesce for a crash-consistent cutover: ask each disk's agent
 	//    for one final point-in-time snapshot pass so the image we clone reflects a
 	//    single instant and boots cleanly, then stop the receivers.
 	s.quiesceForCutover(ctx, m)
@@ -631,7 +631,18 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		// machine-convert.sh requires bash (set -o pipefail, etc). Run it under
 		// bash explicitly — invoking via /bin/sh would use dash on Debian/Ubuntu
 		// and fail with "Illegal option -o pipefail".
-		out, err := exec.CommandContext(ctx, bashPath(), s.cfg.ConvertScript, bootDevice).CombinedOutput()
+		cmd := exec.CommandContext(ctx, bashPath(), s.cfg.ConvertScript, bootDevice)
+		// Pass any console/SSH access the operator entered via the environment (not
+		// argv) so the secrets don't show up in `ps`. The script seeds them into the
+		// migrated image's root account inside the chroot.
+		cmd.Env = os.Environ()
+		if req.RootPassword != "" {
+			cmd.Env = append(cmd.Env, "VMREPL_ROOT_PASSWORD="+req.RootPassword)
+		}
+		if req.SSHAuthorizedKey != "" {
+			cmd.Env = append(cmd.Env, "VMREPL_SSH_AUTHORIZED_KEY="+req.SSHAuthorizedKey)
+		}
+		out, err := cmd.CombinedOutput()
 		if canceled() {
 			return
 		}
@@ -651,6 +662,9 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 			_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish, so the launched instance may not boot. Most often the replicated filesystem is inconsistent because the source kept changing during the copy — the reliable fix is a fresh full sync of a quiesced/idle source, then cut over again. The image volume is still created so you can also repair it manually in Rescue Mode (see docs/TROUBLESHOOTING.md). Detail: "+oneLine(trimOut(out)))
 		} else {
 			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("boot disk converted for Linode (virtio, network); boot kernel %s root %s", kernel, rootDevice))
+			if access := accessSeededNote(req); access != "" {
+				_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: "+access+" — you can log in to the launched instance without rescue mode")
+			}
 		}
 	} else {
 		log.Printf("appliance: migration %d: skipping machine-convert (no script or non-block device)", m.ID)
@@ -1047,6 +1061,21 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// accessSeededNote summarizes which console/SSH access was seeded into the image
+// at cutover, for the activity log. It never includes the secret itself.
+func accessSeededNote(req api.FinalizeRequest) string {
+	switch {
+	case req.RootPassword != "" && req.SSHAuthorizedKey != "":
+		return "set the root password and installed the SSH key for root"
+	case req.RootPassword != "":
+		return "set and unlocked the root password"
+	case req.SSHAuthorizedKey != "":
+		return "installed the SSH key for root"
+	default:
+		return ""
+	}
 }
 
 // convertField extracts the value of a "key: value" line emitted by

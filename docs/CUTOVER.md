@@ -144,6 +144,20 @@ When you're ready and lag is small:
    This fixes virtio initramfs, GRUB, fstab, Lish serial console, and resets
    networking to DHCP/eth0. **Review its output.**
 
+   The migrated disk keeps the **source's** logins — and cloud images usually
+   leave root locked/password-less, so the Lish console has nothing to log in
+   as. To set root access (so you can reach the instance without rescue surgery),
+   pass it via the environment — it is never written to disk:
+
+   ```bash
+   VMREPL_ROOT_PASSWORD='s3cret' \
+   VMREPL_SSH_AUTHORIZED_KEY='ssh-ed25519 AAAA... you@host' \
+     ./machine-convert.sh /dev/sda
+   ```
+
+   From the **appliance console**, the Cutover dialog has the same two optional
+   fields, so you don't need to do this by hand.
+
 5. **Create a boot config profile** that boots the raw disk, then boot it:
 
    ```bash
