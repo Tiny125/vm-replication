@@ -293,6 +293,18 @@ network:
 NET
   chmod 600 /etc/netplan/01-linode.yaml || true
 fi
+# systemd-networkd: a hand-written/Linode-written .network file (e.g.
+# /etc/systemd/network/05-eth0.network) carries a static IP and, sorting before
+# netplan's generated /run/systemd/network/10-netplan-*.network, WINS over our
+# DHCP config. Source images that configure networking via networkd directly hit
+# exactly this — the new instance comes up on the source's IP. Move these aside
+# so netplan's DHCP config takes effect.
+if [ -d /etc/systemd/network ]; then
+  for f in /etc/systemd/network/*.network /etc/systemd/network/*.netdev; do
+    [ -e "\$f" ] || continue
+    mv "\$f" "\$NETBAK/" 2>/dev/null || rm -f "\$f"
+  done
+fi
 if [ -f /etc/network/interfaces ]; then
   printf 'auto lo\niface lo inet loopback\nauto eth0\niface eth0 inet dhcp\n' > /etc/network/interfaces
 fi
