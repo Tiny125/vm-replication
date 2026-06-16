@@ -233,6 +233,20 @@ const consoleHTML = `<!DOCTYPE html>
       <label style="margin-top:12px">Source disks (first = boot disk)</label>
       <div id="disks"></div>
       <div style="margin-top:8px"><button onclick="addDisk()">+ Add disk</button></div>
+
+      <label style="margin-top:14px">Boot target</label>
+      <div class="row">
+        <div><select id="m_boot" onchange="bootTargetChanged()">
+          <option value="volume">Separate Block Storage volume (default)</option>
+          <option value="disk">Linode local disk (NVMe)</option>
+        </select></div>
+        <div id="m_planclass_wrap" class="hide"><select id="m_planclass" onchange="updatePlanPreview()">
+          <option value="shared">Shared CPU</option>
+          <option value="dedicated">Dedicated CPU</option>
+        </select></div>
+      </div>
+      <div id="m_boot_help" class="muted" style="font-size:12px;margin-top:6px"></div>
+
       <div style="margin-top:16px;display:flex;align-items:center;gap:2px">
         <button id="createBtn" class="primary" onclick="createMig(this)">Create migration</button>
         <span class="info" data-tip="Registers this source server and its disks, provisions one replication volume per disk on the appliance, and generates the one-line agent enrollment command. No data is copied until you run that command on the source.">i</span>
@@ -397,9 +411,37 @@ function addDisk(dev,gb){
   diskSeq++;const id=diskSeq;
   const row=document.createElement('div');row.className='row';row.id='disk'+id;row.style.marginBottom='8px';
   row.innerHTML='<div><input class="d_dev" placeholder="/dev/sda'+(diskSeq===1?' (boot)':'')+'" value="'+(dev||'')+'"></div>'+
-    '<div style="display:flex;gap:8px"><input class="d_size" type="number" placeholder="Size (GB)" value="'+(gb||'')+'" style="flex:1">'+
-    '<button class="danger" title="Remove disk" onclick="this.closest(\'.row\').remove()">✕</button></div>';
+    '<div style="display:flex;gap:8px"><input class="d_size" type="number" placeholder="Size (GB)" value="'+(gb||'')+'" style="flex:1" oninput="diskSizeChanged()">'+
+    '<button class="danger" title="Remove disk" onclick="this.closest(\'.row\').remove();diskSizeChanged()">✕</button></div>';
   $('disks').appendChild(row);
+}
+
+// ---- boot target: separate volume (default) vs Linode local disk ----
+let _plansCache=null;
+async function loadPlans(){
+  if(_plansCache)return _plansCache;
+  const r=await api('GET','/api/v1/linode/plans');
+  _plansCache=(r&&r.plans)||[];
+  return _plansCache;
+}
+function totalDiskGB(){let g=0;document.querySelectorAll('#disks .d_size').forEach(i=>{const v=parseInt(i.value,10);if(v>0)g+=v;});return g;}
+function diskSizeChanged(){const b=$('m_boot');if(b&&b.value==='disk')updatePlanPreview();}
+function bootTargetChanged(){
+  const disk=$('m_boot').value==='disk';
+  $('m_planclass_wrap').classList.toggle('hide',!disk);
+  if(disk){updatePlanPreview();}
+  else{$('m_boot_help').innerHTML='Boots from a <b>Block Storage volume</b> sized to your input (the current default). The volume is billed separately (~$0.10/GB-month) on top of the plan, and the plan’s own included disk goes unused.';}
+}
+async function updatePlanPreview(){
+  const cls=$('m_planclass').value, gb=totalDiskGB(), help=$('m_boot_help');
+  help.innerHTML='Boots from the Linode’s <b>local NVMe disk</b> — faster, and no separate volume cost. The instance is created on the smallest <b>'+cls+'</b> plan whose disk fits your data; region follows the appliance.';
+  if(gb<=0){help.innerHTML+='<br>Enter disk size(s) above to see the chosen plan.';return;}
+  try{
+    const plans=(await loadPlans()).filter(p=>p.class===cls&&p.disk_gb>=gb).sort((a,b)=>a.disk_gb-b.disk_gb||a.price_monthly-b.price_monthly);
+    if(!plans.length){help.innerHTML+='<br><span class="x">No '+cls+' plan has a disk ≥ '+gb+' GB — use a smaller source or Separate-volume boot.</span>';return;}
+    const p=plans[0];
+    help.innerHTML+='<br>Closest plan: <b>'+esc(p.label)+'</b> — '+p.disk_gb+' GB disk, '+p.vcpus+' vCPU, '+(p.memory_mb/1024)+' GB RAM (~$'+p.price_monthly+'/mo).';
+  }catch(e){help.innerHTML+='<br><span class="muted">Add a Linode token in Settings to preview the plan.</span>';}
 }
 // IP addresses that passed the in-form connection test; only these may be used
 // to create a migration.
@@ -432,15 +474,16 @@ async function createMig(btn){
     if(!dev)continue; if(!gb||gb<=0){$('createErr').textContent='Each disk needs a positive size (GB): '+dev;return}
     devices.push({device:dev,size_bytes:gb*1073741824});}
   if(!devices.length){$('createErr').textContent='Add at least one disk';return}
+  const bootTarget=$('m_boot').value, planClass=$('m_planclass').value;
   busy(btn,true);
   // Show a loading placeholder at the BOTTOM of the list while provisioning runs
   // (new migrations are appended, newest last).
   $('migs').insertAdjacentHTML('beforeend','<div id="creating" class="mig"><div class="center"><div class="spinner"></div><div>Creating migration & provisioning volume(s)…</div></div></div>');
   $('creating').scrollIntoView({behavior:'smooth',block:'center'});
   try{
-    await api('POST','/api/v1/migrations',{name:name,source_hostname:host,source_ip:ip,devices:devices});
+    await api('POST','/api/v1/migrations',{name:name,source_hostname:host,source_ip:ip,devices:devices,boot_target:bootTarget,plan_class:planClass});
     $('m_name').value=$('m_host').value=$('m_ip').value='';$('m_ipstatus').classList.add('hide');
-    $('disks').innerHTML='';diskSeq=0;addDisk();
+    $('disks').innerHTML='';diskSeq=0;addDisk();$('m_boot').value='volume';bootTargetChanged();
     await refresh(true);
     const last=$('migs').lastElementChild;if(last)last.scrollIntoView({behavior:'smooth',block:'center'});
     toast('Migration "'+name+'" created — enroll the source agent to start replicating','ok');
@@ -682,6 +725,12 @@ function migCard(v){
     '<span class="muted" style="font-size:12px;flex:1">'+(collapsed?'collapsed — click ▸ to expand':'')+'</span>'+
     '<button class="mini" title="Refresh this migration" onclick="refreshMig('+m.id+',this)">↻ Refresh</button></div>';
 
+  // Boot-mode header banner: distinct colours so the mode is obvious at a glance
+  // (green = Linode local disk, blue = separate Block Storage volume).
+  h+=(m.boot_target==='disk')
+    ? '<div class="banner" style="border-color:#cde8d8;background:#f1faf4;color:#0f5c30;margin:0 0 10px">💽 <b>Boot: Linode local disk</b>'+((m.linode_type)?(' — '+esc((m.plan_class||'')+' plan '+m.linode_type)):'')+'</div>'
+    : '<div class="banner" style="border-color:#cdd6e8;background:#f3f6fc;color:#22408a;margin:0 0 10px">📦 <b>Boot: separate Block Storage volume</b></div>';
+
   h+='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+statusLegend()+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
     '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_ip||m.source_hostname||'-')+'</span></td>'+
     '<td><span class="pill '+stateClass(m.state)+'">'+esc(stateLabel(m.state))+'</span></td>'+
@@ -808,7 +857,7 @@ async function refresh(animate){
   }catch(e){/* 401 handled in api() */}
 }
 
-async function start(){show('app');if(!document.querySelector('#disks .row'))addDisk();refresh(false);}
+async function start(){show('app');if(!document.querySelector('#disks .row'))addDisk();bootTargetChanged();refresh(false);}
 async function init(){
   try{await api('GET','/api/v1/session');start();setInterval(()=>{if(!$('app').classList.contains('hide'))refresh(false)},10000);}
   catch(e){show('login')}

@@ -118,6 +118,7 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/v1/migrations/{id}/start", s.auth(s.handleStartMigration))
 	s.mux.Handle("POST /api/v1/migrations/{id}/stop", s.auth(s.handleStopMigration))
 	s.mux.Handle("POST /api/v1/diagnostics/connection", s.auth(s.handleConnTest))
+	s.mux.Handle("GET /api/v1/linode/plans", s.auth(s.handleLinodePlans))
 	s.mux.Handle("GET /api/v1/settings", s.auth(s.handleGetSettings))
 	s.mux.Handle("POST /api/v1/settings/linode-token", s.auth(s.handleSetLinodeToken))
 	s.mux.Handle("DELETE /api/v1/settings/linode-token", s.auth(s.handleDeleteLinodeToken))

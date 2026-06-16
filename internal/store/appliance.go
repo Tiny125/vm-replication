@@ -180,14 +180,16 @@ func (s *Store) LinodeAccount(ctx context.Context) (string, error) {
 // migration_disks and is loaded separately. (The legacy single-disk columns on
 // the migrations table remain for older databases but are no longer read.)
 const migCols = `id, name, state, source_hostname, source_ip, source_device, source_disk_size,
- image_id, launched_id, last_error, assessed_at, migrate_started, migrate_finished, created_at`
+ image_id, launched_id, last_error, assessed_at, migrate_started, migrate_finished,
+ boot_target, plan_class, linode_type, created_at`
 
 func scanMigration(row interface{ Scan(...any) error }) (api.Migration, error) {
 	var m api.Migration
 	var state string
 	var assessed, migStart, migFinish, created int64
 	if err := row.Scan(&m.ID, &m.Name, &state, &m.SourceHostname, &m.SourceIP, &m.SourceDevice, &m.SourceDiskSize,
-		&m.ImageID, &m.LaunchedID, &m.LastError, &assessed, &migStart, &migFinish, &created); err != nil {
+		&m.ImageID, &m.LaunchedID, &m.LastError, &assessed, &migStart, &migFinish,
+		&m.BootTarget, &m.PlanClass, &m.LinodeType, &created); err != nil {
 		return api.Migration{}, err
 	}
 	m.State = api.MigrationState(state)
@@ -221,11 +223,17 @@ func (s *Store) CreateMigration(ctx context.Context, r api.CreateMigrationReques
 	if len(devices) == 0 {
 		return api.Migration{}, "", fmt.Errorf("store: at least one source device is required")
 	}
+	bootTarget := r.BootTarget
+	if bootTarget == "" {
+		bootTarget = api.BootTargetVolume
+	}
 	now := time.Now()
 	res, err := s.db.ExecContext(ctx, `
-INSERT INTO migrations (name, state, source_hostname, source_ip, source_device, source_disk_size, enroll_token, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.Name, string(api.MigCreated), r.SourceHostname, r.SourceIP, devices[0].Device, devices[0].SizeBytes, token, unix(now))
+INSERT INTO migrations (name, state, source_hostname, source_ip, source_device, source_disk_size,
+  enroll_token, boot_target, plan_class, linode_type, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.Name, string(api.MigCreated), r.SourceHostname, r.SourceIP, devices[0].Device, devices[0].SizeBytes,
+		token, bootTarget, r.PlanClass, r.LinodeType, unix(now))
 	if err != nil {
 		return api.Migration{}, "", err
 	}
