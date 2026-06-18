@@ -91,7 +91,6 @@ func (s *Server) auditAction(level, msg string) { s.recordAudit(0, level, "conso
 // ensureAuditBucket creates (best-effort) the Object Storage bucket for audit
 // logs and records the outcome in settings for the console to show.
 func (s *Server) ensureAuditBucket(ctx context.Context, token string) {
-	name := s.auditBucketName(ctx)
 	cl := linode.New(token)
 	// Region precedence: an explicit -obj-region override, else the appliance's
 	// OWN region (so the bucket sits with the appliance — e.g. a Singapore
@@ -108,42 +107,73 @@ func (s *Server) ensureAuditBucket(ctx context.Context, token string) {
 		region = s.cfg.Region
 	}
 	if region == "" {
-		_ = s.st.SetSetting(ctx, keyAuditReady, "")
-		_ = s.st.SetSetting(ctx, keyAuditErr, "no region known for the appliance; cannot place the audit bucket")
+		s.setAuditErr("no region known for the appliance; cannot place the audit bucket")
 		return
 	}
-	b, err := cl.CreateBucket(ctx, name, region)
-	if err != nil {
-		// Re-saving a token, or a bucket we already made, surfaces as "already
-		// exists" — treat that as success (we can still address it by label+region).
-		if strings.Contains(strings.ToLower(err.Error()), "exist") {
-			b = linode.Bucket{Label: name, Region: region}
-		} else {
-			_ = s.st.SetSetting(ctx, keyAuditReady, "")
-			_ = s.st.SetSetting(ctx, keyAuditErr, err.Error())
+
+	// Reuse our previously-chosen bucket (stable across restarts), but only when
+	// it uses the current "vmrep-audit-NN" scheme. Older deployments stored a
+	// Linode-ID-based name and are migrated to a fresh NN on the next provision.
+	if name, ok, _ := s.st.GetSetting(ctx, keyAuditName); ok && auditNameRe.MatchString(name) {
+		b, err := cl.CreateBucket(ctx, name, region)
+		if err != nil && !isAlreadyExists(err) {
+			s.setAuditErr(err.Error())
 			return
 		}
+		if err != nil { // already exists = the bucket we made before
+			b = linode.Bucket{Label: name, Region: region}
+		}
+		s.saveAuditBucket(ctx, b)
+		return
 	}
+
+	// First provision (or migrating an old name): pick the lowest free
+	// vmrep-audit-NN, checking existing buckets across the account so multiple
+	// appliances on the same account never collide. Retry on a creation race.
+	taken := map[string]bool{}
+	if bs, err := cl.ListBuckets(ctx); err == nil {
+		for _, b := range bs {
+			taken[strings.ToLower(b.Label)] = true
+		}
+	}
+	for i := 1; i <= 99; i++ {
+		cand := fmt.Sprintf("vmrep-audit-%02d", i)
+		if taken[cand] {
+			continue
+		}
+		b, err := cl.CreateBucket(ctx, cand, region)
+		if err != nil {
+			if isAlreadyExists(err) { // lost a race with another appliance; try next
+				taken[cand] = true
+				continue
+			}
+			s.setAuditErr(err.Error())
+			return
+		}
+		_ = s.st.SetSetting(ctx, keyAuditName, cand)
+		s.saveAuditBucket(ctx, b)
+		return
+	}
+	s.setAuditErr("no free audit bucket name available (vmrep-audit-01..99 are all taken)")
+}
+
+var auditNameRe = regexp.MustCompile(`^vmrep-audit-\d{1,3}$`)
+
+func isAlreadyExists(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "exist")
+}
+
+func (s *Server) setAuditErr(msg string) {
+	_ = s.st.SetSetting(s.ctx, keyAuditReady, "")
+	_ = s.st.SetSetting(s.ctx, keyAuditErr, msg)
+}
+
+func (s *Server) saveAuditBucket(ctx context.Context, b linode.Bucket) {
 	bj, _ := json.Marshal(b)
 	_ = s.st.SetSetting(ctx, keyAuditBucket, string(bj))
 	_ = s.st.SetSetting(ctx, keyAuditReady, "1")
 	_ = s.st.SetSetting(ctx, keyAuditErr, "")
 	s.auditAction("info", "audit log bucket ready: "+b.Label)
-}
-
-// auditBucketName returns a stable bucket label for this appliance.
-func (s *Server) auditBucketName(ctx context.Context) string {
-	if v, ok, _ := s.st.GetSetting(ctx, keyAuditName); ok && v != "" {
-		return v
-	}
-	name := "vmrep-audit"
-	if s.cfg.ApplianceLinodeID != 0 {
-		name = fmt.Sprintf("vmrep-audit-%d", s.cfg.ApplianceLinodeID)
-	} else {
-		name = fmt.Sprintf("vmrep-audit-%d", time.Now().UnixNano()%1_000_000)
-	}
-	_ = s.st.SetSetting(ctx, keyAuditName, name)
-	return name
 }
 
 // auditBucket loads the provisioned bucket, ok=false if not ready.
