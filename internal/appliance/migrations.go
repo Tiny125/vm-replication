@@ -740,8 +740,14 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 
 	// 0) Quiesce for a crash-consistent cutover: ask each disk's agent
 	//    for one final point-in-time snapshot pass so the image we clone reflects a
-	//    single instant and boots cleanly, then stop the receivers.
-	s.quiesceForCutover(ctx, m)
+	//    single instant and boots cleanly, then stop the receivers. Skipped when
+	//    the operator has already stopped the source's apps/databases (the common
+	//    path) — the data is then already consistent and we avoid the long wait.
+	if req.SkipSnapshot {
+		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: skipping the point-in-time snapshot — the source's apps/databases are reported stopped, so the current replicated data is already consistent")
+	} else {
+		s.quiesceForCutover(ctx, m)
+	}
 	if canceled() {
 		return
 	}

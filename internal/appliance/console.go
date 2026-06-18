@@ -301,10 +301,13 @@ function uiDialog(opts){
       '<div style="margin-top:10px"><label style="display:block;margin-bottom:4px;font-size:13px">'+esc(f.label)+'</label>'+
       '<input id="__f_'+f.id+'" type="'+(f.type||'text')+'" style="width:100%" placeholder="'+esc(f.placeholder||'')+'"></div>').join('');
     const check=opts.checkbox?'<label class="modal-check"><input type="checkbox" id="__mck"'+(opts.checkbox.checked?' checked':'')+'><span>'+esc(opts.checkbox.label)+'</span></label>':'';
+    // Optional multiple checkboxes (opts.checkboxes:[{id,label,checked}]); each is
+    // returned as out[id]=bool on confirm.
+    const checks=(opts.checkboxes||[]).map(c=>'<label class="modal-check"><input type="checkbox" id="__c_'+c.id+'"'+(c.checked?' checked':'')+'><span>'+esc(c.label)+'</span></label>').join('');
     const cancelBtn=opts.cancel===false?'':'<button class="modal-cancel">'+esc(opts.cancelText||'Cancel')+'</button>';
     ov.innerHTML='<div class="modal'+(opts.wide?' wide':'')+'" role="dialog" aria-modal="true">'+
       '<h3>'+esc(opts.title||'')+'</h3>'+
-      '<div class="modal-body">'+(opts.html||'')+'</div>'+fields+check+
+      '<div class="modal-body">'+(opts.html||'')+'</div>'+fields+check+checks+
       '<div class="modal-actions">'+cancelBtn+
       '<button class="modal-ok '+(opts.okDanger?'danger':'primary')+'">'+esc(opts.okText||'OK')+'</button></div></div>';
     document.body.appendChild(ov);
@@ -312,9 +315,11 @@ function uiDialog(opts){
     let done=false;
     const close=val=>{if(done)return;done=true;document.removeEventListener('keydown',onKey);ov.classList.add('closing');setTimeout(()=>ov.remove(),150);resolve(val)};
     const confirm=()=>{
-      if(!opts.checkbox&&!(opts.fields&&opts.fields.length))return close(true);
+      const hasOut=opts.checkbox||(opts.checkboxes&&opts.checkboxes.length)||(opts.fields&&opts.fields.length);
+      if(!hasOut)return close(true);
       const out={};
       if(opts.checkbox)out.checked=ov.querySelector('#__mck').checked;
+      (opts.checkboxes||[]).forEach(c=>out[c.id]=ov.querySelector('#__c_'+c.id).checked);
       (opts.fields||[]).forEach(f=>out[f.id]=ov.querySelector('#__f_'+f.id).value.trim());
       close(out);
     };
@@ -535,27 +540,29 @@ async function startMig(id,btn){
   const planNote=meta.linode_type?(' on plan <b>'+esc(meta.linode_type)+'</b>'):'';
   const warn='<div class="warn" style="margin-bottom:8px">After cutover the source agent <b>stops replicating</b> — the migrated copy is frozen at this point.</div>';
   const access='<div class="muted" style="font-size:12px;margin-top:10px">Migrated disks keep the <b>source</b>’s logins, and cloud images usually leave root locked — so set a root password (and/or SSH key) below to reach the new instance via the Lish console without rescue mode.</div>';
+  const snapNote='<div class="muted" style="font-size:12px;margin-top:8px">Leave the snapshot box checked if you’ve <b>stopped the source’s apps/databases</b> — the replicated data is then already consistent and cutover is immediate. Uncheck it to instead ask the still-connected agent for a crash-consistent point-in-time snapshot first (can take several minutes).</div>';
   const opts={
     title:'Cut over migration #'+id+'?',
     okText:'Cut over',
     fields:[
       {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
       {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
-    ]
+    ],
+    checkboxes:[{id:'skip_snap',label:'Source apps/databases are already stopped — cut over from the current data (no snapshot).',checked:true}]
   };
   if(disk){
     // Local-disk boot always launches a new instance and keeps no volume.
     opts.html=warn+
-      'The appliance takes a <b>crash-consistent point-in-time snapshot</b> of the source, converts the boot disk, then creates a new Linode'+planNote+', copies the image onto its <b>local disk</b> and boots from that disk. The temporary volume is deleted afterwards — no separate Block Storage volume is kept. Keep the source agent connected so the snapshot can be taken. This is the final step.'+access;
+      'The appliance converts the boot disk, then creates a new Linode'+planNote+', copies the image onto its <b>local disk</b> and boots from that disk. The temporary volume is deleted afterwards — no separate Block Storage volume is kept. This is the final step.'+access+snapNote;
   }else{
     opts.html=warn+
-      'First the appliance takes a <b>crash-consistent point-in-time snapshot</b> of the source so the new instance boots cleanly, then it converts the boot disk and clones every disk into launchable <b>&lt;name&gt;-cutover</b> volumes'+(meta.linode_type?(', and launches a new Linode'+planNote):'')+'. Keep the source agent connected so the snapshot can be taken. This is the final step.'+access;
-    opts.checkbox={label:'Also launch a new <name>-cutover Linode now (boot=sda, data=sdb…). Leave unchecked to just create the cutover volumes.',checked:true};
+      'The appliance converts the boot disk and clones every disk into launchable <b>&lt;name&gt;-cutover</b> volumes'+(meta.linode_type?(', and launches a new Linode'+planNote):'')+'. This is the final step.'+access+snapNote;
+    opts.checkboxes.push({id:'launch',label:'Also launch a new <name>-cutover Linode now (boot=sda, data=sdb…). Uncheck to just create the cutover volumes.',checked:true});
   }
   const r=await confirmModal(opts);
   if(!r)return;
   busy(btn,true);
-  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:disk?true:r.checked,root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||''});await refreshMig(id)}
+  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:disk?true:r.launch,root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:r.skip_snap});await refreshMig(id)}
   catch(e){alertModal({title:'Cannot cut over',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function stopMig(id,btn){
