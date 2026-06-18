@@ -251,6 +251,14 @@ echo "Hostname : $(hostname)"; lsblk -b -d -n -o NAME,SIZE,TYPE | \
 Use the **whole disks** (e.g. `/dev/sda`, `/dev/sdb`), not partitions. For LVM,
 if a volume group spans multiple disks, add **all** of its member disks.
 
+**Boot target & plan.** Choose how the cutover instance boots — a **separate
+Block Storage volume** (default) or the Linode's **local disk** — and pick the
+**Linode plan** (Shared or Dedicated). The form lists each plan's vCPU/RAM/disk
+and price; for the volume option it also shows the estimated monthly Block
+Storage cost (≈ $0.10/GB) and an estimated total. For local-disk boot only
+plans whose disk fits your data are offered (single-disk migrations only). The
+launched instance uses this plan at cutover.
+
 The console then shows a **one-line command**, e.g.:
 
 ```bash
