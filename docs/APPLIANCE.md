@@ -183,11 +183,10 @@ server and is only ever sent to `api.linode.com`.
    |---|---|---|
    | **Linodes** | **Read/Write** | create the migrated instance, its boot config, and boot it |
    | **Volumes** | **Read/Write** | create, attach, and clone the replication volume |
+   | **Images** | **Read/Write** | used by the local-disk boot method |
+   | **Object Storage** | **Read/Write** | upload the audit logs (see below) |
 
-   (Leave Account, Images, NodeBalancers, Domains, etc. at **None** — they aren't
-   used. If you later want the appliance to build a Linode *Image* rather than a
-   cloned volume, add **Images: Read/Write**. For **audit logs** — see below —
-   add **Object Storage: Read/Write**.)
+   (Leave Account, NodeBalancers, Domains, etc. at **None** — they aren't used.)
 6. Click **Create Token** and **copy it immediately** — Linode shows the value
    only once.
 7. Paste it into the console's token field and **Save**. The console will show

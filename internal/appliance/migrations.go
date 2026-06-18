@@ -205,7 +205,7 @@ func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) {
 		_ = s.st.AddEvent(s.ctx, m.ID, "warn", "cutover: no source agent has checked in recently, so a fresh crash-consistent snapshot can't be taken; cloning the current replicated data as-is (it may be inconsistent if the source was changing)")
 		return
 	}
-	_ = s.st.AddEvent(s.ctx, m.ID, "info", "cutover: quiescing the source for a crash-consistent point-in-time snapshot before launch — this can take up to a minute")
+	_ = s.st.AddEvent(s.ctx, m.ID, "info", "cutover: quiescing the source for a crash-consistent point-in-time snapshot before launch — this can take a while (often several minutes, and longer for busy or large disks)")
 
 	deadline := time.Now().Add(consistencyWait)
 	for {

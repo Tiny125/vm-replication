@@ -334,13 +334,17 @@ func (c *Client) WaitDiskReady(ctx context.Context, linodeID, diskID int64, time
 	deadline := time.Now().Add(timeout)
 	for {
 		var d Disk
-		if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/linode/instances/%d/disks/%d", linodeID, diskID), nil, &d); err != nil {
-			return err
-		}
-		if d.Status == "ready" {
+		err := c.do(ctx, http.MethodGet, fmt.Sprintf("/linode/instances/%d/disks/%d", linodeID, diskID), nil, &d)
+		if err == nil && d.Status == "ready" {
 			return nil
 		}
+		// A just-created disk can briefly 404 (or report "not ready") while the
+		// create job propagates on Linode's side — keep polling rather than
+		// failing on the first transient error.
 		if time.Now().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("linode: disk %d not ready after %s: %v", diskID, timeout, err)
+			}
 			return fmt.Errorf("linode: disk %d not ready after %s (status %q)", diskID, timeout, d.Status)
 		}
 		select {

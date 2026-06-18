@@ -390,7 +390,7 @@ async function loadSettings(){
   }else{
     h+='<details><summary>What is this and how do I get a token?</summary><div class="muted" style="font-size:13px">'+
        'A Linode <b>Personal Access Token</b> lets the appliance create volumes, clone disks and launch instances. Stored <b>encrypted at rest</b>. '+
-       'Create one at <a href="https://cloud.linode.com/profile/tokens" target="_blank" rel="noopener">cloud.linode.com/profile/tokens</a> with scopes <b>Linodes: Read/Write</b>, <b>Volumes: Read/Write</b> and <b>Object Storage: Read/Write</b> (Object Storage is used for the audit logs).'+
+       'Create one at <a href="https://cloud.linode.com/profile/tokens" target="_blank" rel="noopener">cloud.linode.com/profile/tokens</a> with scopes <b>Linodes: Read/Write</b>, <b>Volumes: Read/Write</b>, <b>Images: Read/Write</b> and <b>Object Storage: Read/Write</b> (Images is used by the local-disk boot method; Object Storage for the audit logs).'+
        '</div></details>'+
        '<div style="display:flex;gap:8px;margin-top:10px"><input id="ltok" type="password" placeholder="Linode API token"><button onclick="saveToken(this)">Save</button></div>';
   }
