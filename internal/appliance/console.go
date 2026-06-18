@@ -617,12 +617,13 @@ async function checkStatus(id,btn){
 // auto-poll (which rebuilds the cards) can restore the log without a flicker.
 const logCache={};
 function ensureLog(id){if(logCache[id]===undefined)loadLog(id)}
-// logLines renders events newest-first as plain text lines inside a <pre>
-// ("HH:MM:SS  message"). A <pre> lays lines out top-to-bottom and wraps long
-// ones, so entries can never overlap. With limit set, only the latest N show.
+// logLines renders events as plain text lines inside a <pre> ("HH:MM:SS
+// message"), oldest first so the LATEST entry is at the bottom. Events arrive
+// newest-first; with a limit we keep the latest N, then reverse for display.
 function logLines(ev,limit){
   let rows=ev||[];
   if(limit&&rows.length>limit)rows=rows.slice(0,limit);
+  rows=rows.slice().reverse(); // oldest → newest (latest at the bottom)
   if(!rows.length)return 'No activity yet.';
   return rows.map(e=>{
     const line=esc(fmtTime(e.at)+'  '+e.message);
@@ -686,7 +687,7 @@ function progressLine(v,m){
   const st=m.state;let label,bar;
   if(st==='image_ready'||st==='launched'){label='completed in '+fmtDur(v.elapsed_seconds);bar=progBar(100,false);}
   else if(st==='failed'){label='failed';bar=progBar(0,false);}
-  else if(st==='migrating'){label='finalizing · running '+fmtDur(v.elapsed_seconds);bar=progBar(0,true);}
+  else if(st==='migrating'){label='finalizing · running '+liveDur(m.migrate_started,v.elapsed_seconds);bar=progBar(0,true);}
   else{
     const allBase=disks(m).length>0&&disks(m).every(d=>d.full_sync_done);
     if(allBase){label='initial sync completed · 100%';bar=progBar(100,false);}
@@ -709,8 +710,17 @@ function progressLine(v,m){
   const bps=replSpeed(v,m);
   let recv=fmtBytes(bytesTotal(m))+' transferred';
   if(bps>=0)recv+=' · '+fmtBytes(bps)+'/s';
-  return '<span class="muted">'+esc(label)+'</span>'+bar+
+  // label is built only from literals/numbers (no user data), so it's safe to
+  // render as HTML — needed for the live-ticking elapsed span.
+  return '<span class="muted">'+label+'</span>'+bar+
     '<div class="muted" style="font-size:12px;margin-top:3px">'+recv+'</div>';
+}
+// liveDur renders the elapsed time as a span that the 1s ticker keeps current
+// between server refreshes, so the timer counts up smoothly.
+function liveDur(sinceISO,fallbackSecs){
+  const t=Date.parse(sinceISO||'');
+  if(isNaN(t)||t<=0)return fmtDur(fallbackSecs);
+  return '<span class="livedur" data-since="'+t+'">'+fmtDur((Date.now()-t)/1000)+'</span>';
 }
 function diskTable(m){const d=disks(m);if(!d.length)return '';
   let h='<table><tr><th>Disk</th><th>Device</th><th>Size</th><th>Port</th><th>Baseline</th><th>Volume / note</th></tr>';
@@ -913,7 +923,10 @@ async function refresh(animate){
 
 async function start(){show('app');if(!document.querySelector('#disks .row'))addDisk();bootTargetChanged();refresh(false);}
 async function init(){
-  try{await api('GET','/api/v1/session');start();setInterval(()=>{if(!$('app').classList.contains('hide'))refresh(false)},10000);}
+  try{await api('GET','/api/v1/session');start();
+    setInterval(()=>{if(!$('app').classList.contains('hide'))refresh(false)},5000);
+    // Tick visible elapsed timers every second between server refreshes.
+    setInterval(()=>{document.querySelectorAll('.livedur[data-since]').forEach(s=>{const t=+s.dataset.since;if(t)s.textContent=fmtDur((Date.now()-t)/1000)})},1000);}
   catch(e){show('login')}
 }
 init();

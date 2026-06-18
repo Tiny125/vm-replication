@@ -387,14 +387,25 @@ if [ -n "\${VMREPL_DISK_INSTALL:-}" ]; then
   cat > /usr/local/sbin/vmrepl-diskinstall.sh <<'DISKINSTALL'
 #!/bin/sh
 # Copy the root Linode Volume onto the local disk, then power off. Runs only
-# during the disk-mode cutover's volume-boot phase (guarded below).
-log() { echo "vmrepl-diskinstall: \$*"; }
+# during the disk-mode cutover's volume-boot phase (guarded below). Logs to the
+# serial console so progress is visible over Lish.
+exec >>/var/log/vmrepl-diskinstall.log 2>&1
+log() { echo "vmrepl-diskinstall: \$*" > /dev/console 2>/dev/null; echo "vmrepl-diskinstall: \$*"; }
+# The Linode Volume by-id symlinks can lag early boot; wait for them to appear.
+i=0
+while [ \$i -lt 15 ]; do
+  ls /dev/disk/by-id/scsi-0Linode_Volume_* >/dev/null 2>&1 && break
+  i=\$((i+1)); sleep 2
+done
 rootsrc=\$(findmnt -no SOURCE / 2>/dev/null)
 rootdisk=\$(lsblk -no pkname "\$rootsrc" 2>/dev/null | head -1)
 [ -n "\$rootdisk" ] || rootdisk=\$(basename "\$rootsrc")
-# Guard: only act when the root filesystem is backed by a Linode Volume.
+log "boot: root=\$rootsrc disk=\$rootdisk"
+# Guard: only act when root is backed by a Linode Volume (the transient install
+# boot). On the final local-disk boot root is NOT a volume, so this no-ops and
+# can never re-fire.
 if ! ls -l /dev/disk/by-id/scsi-0Linode_Volume_* 2>/dev/null | grep -q "/\${rootdisk}\$"; then
-  log "root (\$rootdisk) is not a Linode Volume; nothing to do"
+  log "root is not a Linode Volume -> final boot, nothing to do"
   exit 0
 fi
 # Target = a whole local disk that is NOT a Linode Volume.
@@ -409,29 +420,41 @@ if [ -z "\$target" ]; then
   log "no local target disk found; leaving instance on the volume"
   exit 0
 fi
-log "copying /dev/\$rootdisk -> \$target"
+log "copying /dev/\$rootdisk -> \$target (this can take a few minutes)"
 sync
-dd if="/dev/\$rootdisk" of="\$target" bs=64M conv=fsync 2>/dev/null || { log "dd failed"; exit 1; }
+if ! dd if="/dev/\$rootdisk" of="\$target" bs=64M conv=fsync; then
+  log "dd failed"; exit 1
+fi
 sync
 log "copy complete; powering off so the appliance can switch to the local disk"
-systemctl poweroff || poweroff -f
+sleep 2
+systemctl poweroff -i 2>/dev/null || true
+sleep 5
+poweroff -f 2>/dev/null || halt -f 2>/dev/null || { echo o > /proc/sysrq-trigger 2>/dev/null; }
 DISKINSTALL
   chmod +x /usr/local/sbin/vmrepl-diskinstall.sh
   cat > /etc/systemd/system/vmrepl-diskinstall.service <<'DISKUNIT'
 [Unit]
 Description=vm-replication local-disk install (volume-boot only, one-shot)
-After=local-fs.target
-Before=multi-user.target
+After=local-fs.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=multi-user.target getty.target
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/vmrepl-diskinstall.sh
+StandardOutput=journal+console
+StandardError=journal+console
 
 [Install]
 WantedBy=multi-user.target
 DISKUNIT
-  systemctl enable vmrepl-diskinstall.service 2>/dev/null || \
-    ln -sf /etc/systemd/system/vmrepl-diskinstall.service /etc/systemd/system/multi-user.target.wants/vmrepl-diskinstall.service
+  # Enable by creating the wants symlink directly: this works offline in the
+  # convert chroot, whereas `systemctl enable` needs a running systemd and often
+  # fails here (the previous cause of the unit never running). Try systemctl too.
+  mkdir -p /etc/systemd/system/multi-user.target.wants
+  ln -sf /etc/systemd/system/vmrepl-diskinstall.service /etc/systemd/system/multi-user.target.wants/vmrepl-diskinstall.service
+  systemctl enable vmrepl-diskinstall.service 2>/dev/null || true
 fi
 
 log "Inner conversion complete"
