@@ -219,6 +219,12 @@ Read/Write** and Object Storage enabled on the account; if provisioning fails,
 the token card shows why and migrations still work — only audit upload is
 skipped.
 
+The bucket is created in the **appliance's own region** by default (so a
+Singapore appliance gets a Singapore bucket). Override with the
+`-obj-region <region>` flag if you want it elsewhere. If a bucket ended up in
+the wrong region, use **Re-create audit bucket** on the token card to provision
+it again in the current region (then delete the stray bucket in Cloud Manager).
+
 > The launched instance's own OS boot console isn't available through the Linode
 > API, so the per-migration log captures the instance's **status transitions**
 > (provisioning → booting → running) rather than raw kernel/boot text — view the

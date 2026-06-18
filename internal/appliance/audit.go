@@ -92,12 +92,20 @@ func (s *Server) auditAction(level, msg string) { s.recordAudit(0, level, "conso
 // logs and records the outcome in settings for the console to show.
 func (s *Server) ensureAuditBucket(ctx context.Context, token string) {
 	name := s.auditBucketName(ctx)
-	region := s.cfg.Region
 	cl := linode.New(token)
+	// Region precedence: an explicit -obj-region override, else the appliance's
+	// OWN region (so the bucket sits with the appliance — e.g. a Singapore
+	// appliance gets a Singapore bucket), else the -region default as a last
+	// resort. (Previously this used -region directly, which defaults to us-ord,
+	// so buckets wrongly landed in the US regardless of where the appliance ran.)
+	region := s.cfg.ObjRegion
 	if region == "" && s.cfg.ApplianceLinodeID != 0 {
-		if inst, err := cl.GetInstance(ctx, s.cfg.ApplianceLinodeID); err == nil {
+		if inst, err := cl.GetInstance(ctx, s.cfg.ApplianceLinodeID); err == nil && inst.Region != "" {
 			region = inst.Region
 		}
+	}
+	if region == "" {
+		region = s.cfg.Region
 	}
 	if region == "" {
 		_ = s.st.SetSetting(ctx, keyAuditReady, "")
