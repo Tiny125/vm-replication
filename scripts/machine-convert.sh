@@ -391,7 +391,26 @@ if [ -n "\${VMREPL_DISK_INSTALL:-}" ]; then
 # serial console so progress is visible over Lish.
 exec >>/var/log/vmrepl-diskinstall.log 2>&1
 log() { echo "vmrepl-diskinstall: \$*" > /dev/console 2>/dev/null; echo "vmrepl-diskinstall: \$*"; }
-# The Linode Volume by-id symlinks can lag early boot; wait for them to appear.
+# Fast no-op on a normal boot: the install phase has TWO real disks (the source
+# volume + the blank local disk); a normal boot of the migrated instance has only
+# one. This avoids any wait/delay on every later reboot. (Exclude zero-size nbd
+# devices, which show up as type "disk".)
+ndisks=\$(lsblk -dnbo NAME,TYPE,SIZE 2>/dev/null | awk '\$2=="disk" && \$3+0>0 {n++} END{print n+0}')
+if [ "\${ndisks:-0}" -lt 2 ]; then
+  # Normal boot of the migrated instance. The root filesystem may be smaller than
+  # its disk — we shrank it to fit the cutover, or a smaller image was copied onto
+  # a larger plan — so grow it to fill the disk. Online grow on the mounted root is
+  # safe and idempotent (a no-op once the fs already fills the device).
+  rootsrc=\$(findmnt -no SOURCE / 2>/dev/null)
+  rootfs=\$(findmnt -no FSTYPE / 2>/dev/null)
+  case "\$rootfs" in
+    ext2|ext3|ext4) [ -b "\$rootsrc" ] && resize2fs "\$rootsrc" >/dev/null 2>&1 && log "grew \$rootfs root (\$rootsrc) to fill the disk" || true ;;
+    xfs) command -v xfs_growfs >/dev/null 2>&1 && xfs_growfs / >/dev/null 2>&1 && log "grew xfs root to fill the disk" || true ;;
+  esac
+  log "only \${ndisks:-0} disk(s) -> normal boot, nothing else to do"
+  exit 0
+fi
+# Install phase: the Linode Volume by-id symlinks can lag early boot; wait for them.
 i=0
 while [ \$i -lt 15 ]; do
   ls /dev/disk/by-id/scsi-0Linode_Volume_* >/dev/null 2>&1 && break
@@ -420,10 +439,32 @@ if [ -z "\$target" ]; then
   log "no local target disk found; leaving instance on the volume"
   exit 0
 fi
-log "copying /dev/\$rootdisk -> \$target (this can take a few minutes)"
+srcsz=\$(blockdev --getsize64 "/dev/\$rootdisk" 2>/dev/null)
+tgtsz=\$(blockdev --getsize64 "\$target" 2>/dev/null)
+log "copying /dev/\$rootdisk (\${srcsz:-?} B) -> \$target (\${tgtsz:-?} B); this can take a few minutes"
 sync
-if ! dd if="/dev/\$rootdisk" of="\$target" bs=64M conv=fsync; then
-  log "dd failed"; exit 1
+rc=0
+if [ -n "\$srcsz" ] && [ -n "\$tgtsz" ] && [ "\$tgtsz" -lt "\$srcsz" ]; then
+  # The local disk is smaller than the source device. This is only safe if the
+  # FILESYSTEM fits (the appliance shrinks a whole-disk ext fs for exactly this);
+  # never truncate a filesystem that doesn't fit — that produces a broken boot.
+  blkcnt=\$(tune2fs -l "/dev/\$rootdisk" 2>/dev/null | awk -F: '/Block count/{gsub(/ /,"",\$2);print \$2}')
+  blksz=\$(tune2fs -l "/dev/\$rootdisk" 2>/dev/null | awk -F: '/Block size/{gsub(/ /,"",\$2);print \$2}')
+  fsbytes=0; [ -n "\$blkcnt" ] && [ -n "\$blksz" ] && fsbytes=\$((blkcnt*blksz))
+  if [ "\$fsbytes" -gt 0 ] && [ "\$fsbytes" -le "\$tgtsz" ]; then
+    cnt=\$((tgtsz/1048576))
+    log "filesystem is \$fsbytes B (fits); copying the first \${cnt} MiB onto the local disk"
+    derr=\$(dd if="/dev/\$rootdisk" of="\$target" bs=1M count=\$cnt conv=fsync 2>&1) || rc=\$?
+  else
+    log "ERROR: image filesystem (\${fsbytes} B) does not fit the local disk (\$tgtsz B) — recreate the migration on a larger plan"
+    exit 1
+  fi
+else
+  derr=\$(dd if="/dev/\$rootdisk" of="\$target" bs=64M conv=fsync 2>&1) || rc=\$?
+fi
+if [ "\$rc" -ne 0 ]; then
+  log "dd failed (rc=\$rc): \$(echo "\$derr" | tail -2 | tr '\n' ' ')"
+  exit 1
 fi
 sync
 log "copy complete; powering off so the appliance can switch to the local disk"
@@ -467,6 +508,40 @@ rm -f "$MNT/root/.convert-inner.sh"
 
 log "Syncing"
 sync
+
+# Disk-mode cutover: the launched Linode's local disk is slightly smaller than a
+# same-sized Block Storage volume (Linode reserves a sliver of the plan's disk),
+# so a 1:1 whole-disk copy of an image equal to the plan size won't fit. When the
+# caller asks (VMREPL_SHRINK_MB, the plan disk minus a margin), shrink a
+# whole-disk ext filesystem to that size so the in-guest copy fits. Only ext{2,3,4}
+# whole-disk roots are shrunk; other layouts leave it to the caller to require a
+# larger plan. The filesystem must be UNMOUNTED here, so tear the mounts down first.
+devmib=$(( $(blockdev --getsize64 "$DEV" 2>/dev/null || echo 0) / 1048576 ))
+if [ -n "${VMREPL_SHRINK_MB:-}" ] && [ "$PARTITIONED" -eq 0 ] && [ "$VMREPL_SHRINK_MB" -lt "$devmib" ]; then
+  # Only shrink when the target (plan disk minus margin) is smaller than the source
+  # device; a larger target needs no shrink (the copy does a full dd instead).
+  for m in dev/pts dev proc sys run boot; do
+    mountpoint -q "$MNT/$m" && umount -l "$MNT/$m" 2>/dev/null || true
+  done
+  umount "$MNT" 2>/dev/null || true
+  fstype="$(blkid -s TYPE -o value "$DEV" 2>/dev/null || true)"
+  case "$fstype" in
+    ext2|ext3|ext4)
+      log "Shrinking $fstype on $DEV to ${VMREPL_SHRINK_MB}MiB so it fits the smaller local disk"
+      rc=0; e2fsck -fy "$DEV" >/dev/null 2>&1 || rc=$?
+      if [ "$rc" -ge 4 ]; then
+        log "e2fsck could not clean $DEV (rc=$rc); skipping shrink"
+        echo "vmrepl-shrink: failed e2fsck"
+      elif resize2fs "$DEV" "${VMREPL_SHRINK_MB}M" 2>&1 | sed 's/^/   [resize2fs] /'; then
+        echo "vmrepl-shrink: ok ${VMREPL_SHRINK_MB}M"
+      else
+        echo "vmrepl-shrink: failed resize2fs"
+      fi ;;
+    *)
+      log "filesystem on $DEV is ${fstype:-unknown}, not ext — cannot shrink to fit a smaller local disk"
+      echo "vmrepl-shrink: skipped ${fstype:-unknown}" ;;
+  esac
+fi
 log "Conversion done. Next: in the Linode API/UI, create a config profile that"
 log "boots this disk (Kernel = GRUB 2, or Direct Disk) with the raw disk as sda,"
 log "then reboot out of rescue. See docs/CUTOVER.md."

@@ -785,6 +785,17 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 			// Bake in the one-shot that, on the volume-boot phase, copies the image
 			// onto the instance's local disk (see finalizeDisk).
 			cmd.Env = append(cmd.Env, "VMREPL_DISK_INSTALL=1")
+			// The plan's local disk is a little smaller than a same-sized volume
+			// (Linode reserves a sliver), so a 1:1 whole-disk copy of an image that
+			// equals the plan size won't fit. Tell convert to shrink a whole-disk
+			// ext filesystem to the plan disk minus a safety margin so it fits.
+			if cl, ok := s.linodeClient(sctx); ok {
+				if types, terr := cl.ListTypes(sctx); terr == nil {
+					if mb := linode.TypeDiskMB(types, m.LinodeType); mb > 256 {
+						cmd.Env = append(cmd.Env, fmt.Sprintf("VMREPL_SHRINK_MB=%d", mb-128))
+					}
+				}
+			}
 		}
 		out, err := cmd.CombinedOutput()
 		if canceled() {
