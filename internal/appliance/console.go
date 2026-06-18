@@ -378,7 +378,9 @@ async function loadSettings(){
   if(st.linode_token_set){
     h+='<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span><span class="y">✔</span> Linode API token validated &amp; stored.'+
        (st.linode_account?(' Account: <b>'+esc(st.linode_account)+'</b>.'):'')+'<br>'+
-       (st.linode_automation?('Appliance Linode '+esc(st.appliance_linode_id)+'; volumes created in its region.'):'(appliance Linode id unknown — file-fallback mode)')+'</span>'+
+       (st.linode_automation?('Appliance Linode '+esc(st.appliance_linode_id)+'; volumes created in its region.'):'(appliance Linode id unknown — file-fallback mode)')+'<br>'+
+       (st.audit_ready?('<span class="y">✔</span> Audit log bucket <b>'+esc(st.audit_bucket)+'</b> created — console &amp; per-migration logs upload to Object Storage (browse in Cloud Manager).')
+        :(st.audit_error?('<span class="x">✘</span> Audit log bucket not created: '+esc(st.audit_error)):'<span class="muted">Audit log bucket: provisioning…</span>'))+'</span>'+
        '<button class="danger" onclick="removeToken(this)">Remove token</button></div>'+
        '<div class="muted" style="margin-top:8px;font-size:12px">The token can only be removed once <b>no migrations exist</b> — deleting a migration uses it to remove that migration’s Linode volumes.</div>';
   }else{

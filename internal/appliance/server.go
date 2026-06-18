@@ -63,6 +63,8 @@ type Server struct {
 	consistDone map[int64]bool
 	progress    sync.Map // migrationID -> *syncProgress
 	ctx         context.Context
+
+	auditCh chan auditEntry // buffered audit entries -> DB (best-effort)
 }
 
 // syncProgress is live block-apply progress for the console (percent + ETA).
@@ -90,7 +92,10 @@ func New(ctx context.Context, cfg Config) *Server {
 		consistReq:  map[int64]bool{},
 		consistDone: map[int64]bool{},
 		ctx:         ctx,
+		auditCh:     make(chan auditEntry, 2048),
 	}
+	go s.auditDrain()
+	go s.auditUploader()
 	s.routes()
 	return s
 }
@@ -160,8 +165,45 @@ func (s *Server) auth(h http.HandlerFunc) http.Handler {
 			writeErr(w, http.StatusUnauthorized, "not logged in")
 			return
 		}
+		// Audit the console action. Skip read-only polling (GET) so the log
+		// records what the operator *did*, not the dashboard's refresh traffic.
+		if r.Method != http.MethodGet {
+			sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
+			h(sw, r)
+			s.auditAction(levelForStatus(sw.code), fmt.Sprintf("%s %s -> %d", r.Method, r.URL.Path, sw.code))
+			return
+		}
 		h(w, r)
 	})
+}
+
+// statusWriter captures the response status for the audit log.
+type statusWriter struct {
+	http.ResponseWriter
+	code    int
+	written bool
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if !w.written {
+		w.code, w.written = code, true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	w.written = true
+	return w.ResponseWriter.Write(b)
+}
+
+func levelForStatus(code int) string {
+	if code >= 500 {
+		return "error"
+	}
+	if code >= 400 {
+		return "warn"
+	}
+	return "info"
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -185,6 +227,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Name: sessionCookie, Value: id, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode,
 		MaxAge: int(sessionTTL.Seconds()),
 	})
+	s.auditAction("info", "admin logged in to the console")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -203,8 +246,12 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 // ---- settings ----
 
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
-	linodeSet, _ := s.st.LinodeTokenSet(r.Context())
-	account, _ := s.st.LinodeAccount(r.Context())
+	ctx := r.Context()
+	linodeSet, _ := s.st.LinodeTokenSet(ctx)
+	account, _ := s.st.LinodeAccount(ctx)
+	auditReady, _, _ := s.st.GetSetting(ctx, keyAuditReady)
+	auditErr, _, _ := s.st.GetSetting(ctx, keyAuditErr)
+	bucket, _ := s.auditBucket(ctx)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"linode_token_set":    linodeSet,
 		"linode_account":      account,
@@ -212,6 +259,9 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"public_host":         s.cfg.PublicHost,
 		"region":              s.cfg.Region,
 		"linode_automation":   s.cfg.ApplianceLinodeID != 0,
+		"audit_ready":         auditReady == "1",
+		"audit_bucket":        bucket.Label,
+		"audit_error":         auditErr,
 	})
 }
 
@@ -245,6 +295,9 @@ func (s *Server) handleSetLinodeToken(w http.ResponseWriter, r *http.Request) {
 		account = prof.Email
 	}
 	_ = s.st.SetLinodeAccount(ctx, account)
+	// Provision the audit-log bucket (best-effort: a failure here, e.g. the token
+	// lacks Object Storage scope, doesn't block using the token for migrations).
+	s.ensureAuditBucket(ctx, token)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "linode_account": account})
 }
 

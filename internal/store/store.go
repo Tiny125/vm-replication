@@ -160,6 +160,18 @@ CREATE TABLE IF NOT EXISTS migration_events (
   message      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_migration ON migration_events(migration_id, id DESC);
+
+-- Audit trail uploaded to Linode Object Storage. migration_id 0 is the global
+-- console log ("main"); >0 is a per-migration server log.
+CREATE TABLE IF NOT EXISTS audit_log (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  migration_id INTEGER NOT NULL DEFAULT 0,
+  at           INTEGER NOT NULL,
+  level        TEXT NOT NULL DEFAULT 'info',
+  source       TEXT NOT NULL DEFAULT '',
+  message      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_migration ON audit_log(migration_id, id);
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return err

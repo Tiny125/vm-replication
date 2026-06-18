@@ -1,0 +1,270 @@
+package appliance
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/tiny125/vm-replication/internal/linode"
+)
+
+// Audit logging. When a Linode token is saved we provision an Object Storage
+// bucket; thereafter we keep an audit trail in the DB and periodically upload it
+// to the bucket: "main.log" (every console action + system log) and one file per
+// migration ("migrations/<id>-<name>.log") capturing everything the appliance
+// did for that migration. Logs are kept authoritatively in SQLite and the full
+// file is re-uploaded on change (S3 has no append), via Linode-minted presigned
+// URLs so we never sign requests ourselves.
+
+const (
+	keyAuditBucket = "audit_bucket"      // JSON of linode.Bucket
+	keyAuditName   = "audit_bucket_name" // stable chosen label
+	keyAuditReady  = "audit_ready"       // "1" when the bucket exists
+	keyAuditErr    = "audit_error"       // last provisioning error (for the console)
+)
+
+type auditEntry struct {
+	migID         int64
+	level, source string
+	msg           string
+}
+
+var migIDRe = regexp.MustCompile(`migration (\d+)`)
+
+// recordAudit queues an audit entry (non-blocking; drops if the buffer is full
+// so logging never stalls the caller). It must never call log.* (the global
+// logger is teed back into here).
+func (s *Server) recordAudit(migID int64, level, source, msg string) {
+	if s.auditCh == nil || msg == "" {
+		return
+	}
+	select {
+	case s.auditCh <- auditEntry{migID, level, source, msg}:
+	default:
+	}
+}
+
+func (s *Server) auditDrain() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case e := <-s.auditCh:
+			_ = s.st.AddAudit(s.ctx, e.migID, e.level, e.source, e.msg)
+		}
+	}
+}
+
+// StartAudit tees the process logger into the audit trail so system messages and
+// errors are captured (and tagged to a migration when the line mentions one).
+// Called from main once, since it changes the global logger.
+func (s *Server) StartAudit() {
+	log.SetOutput(io.MultiWriter(os.Stderr, auditLogWriter{s}))
+}
+
+type auditLogWriter struct{ s *Server }
+
+func (w auditLogWriter) Write(p []byte) (int, error) {
+	line := strings.TrimRight(string(p), "\n")
+	if line != "" {
+		var migID int64
+		if m := migIDRe.FindStringSubmatch(line); m != nil {
+			fmt.Sscan(m[1], &migID)
+		}
+		w.s.recordAudit(migID, "info", "system", line)
+	}
+	return len(p), nil
+}
+
+// auditAction records a console action (queued for the "main" log).
+func (s *Server) auditAction(level, msg string) { s.recordAudit(0, level, "console", msg) }
+
+// ---- bucket provisioning ----
+
+// ensureAuditBucket creates (best-effort) the Object Storage bucket for audit
+// logs and records the outcome in settings for the console to show.
+func (s *Server) ensureAuditBucket(ctx context.Context, token string) {
+	name := s.auditBucketName(ctx)
+	region := s.cfg.Region
+	cl := linode.New(token)
+	if region == "" && s.cfg.ApplianceLinodeID != 0 {
+		if inst, err := cl.GetInstance(ctx, s.cfg.ApplianceLinodeID); err == nil {
+			region = inst.Region
+		}
+	}
+	if region == "" {
+		_ = s.st.SetSetting(ctx, keyAuditReady, "")
+		_ = s.st.SetSetting(ctx, keyAuditErr, "no region known for the appliance; cannot place the audit bucket")
+		return
+	}
+	b, err := cl.CreateBucket(ctx, name, region)
+	if err != nil {
+		// Re-saving a token, or a bucket we already made, surfaces as "already
+		// exists" — treat that as success (we can still address it by label+region).
+		if strings.Contains(strings.ToLower(err.Error()), "exist") {
+			b = linode.Bucket{Label: name, Region: region}
+		} else {
+			_ = s.st.SetSetting(ctx, keyAuditReady, "")
+			_ = s.st.SetSetting(ctx, keyAuditErr, err.Error())
+			return
+		}
+	}
+	bj, _ := json.Marshal(b)
+	_ = s.st.SetSetting(ctx, keyAuditBucket, string(bj))
+	_ = s.st.SetSetting(ctx, keyAuditReady, "1")
+	_ = s.st.SetSetting(ctx, keyAuditErr, "")
+	s.auditAction("info", "audit log bucket ready: "+b.Label)
+}
+
+// auditBucketName returns a stable bucket label for this appliance.
+func (s *Server) auditBucketName(ctx context.Context) string {
+	if v, ok, _ := s.st.GetSetting(ctx, keyAuditName); ok && v != "" {
+		return v
+	}
+	name := "vmrep-audit"
+	if s.cfg.ApplianceLinodeID != 0 {
+		name = fmt.Sprintf("vmrep-audit-%d", s.cfg.ApplianceLinodeID)
+	} else {
+		name = fmt.Sprintf("vmrep-audit-%d", time.Now().UnixNano()%1_000_000)
+	}
+	_ = s.st.SetSetting(ctx, keyAuditName, name)
+	return name
+}
+
+// auditBucket loads the provisioned bucket, ok=false if not ready.
+func (s *Server) auditBucket(ctx context.Context) (linode.Bucket, bool) {
+	if v, ok, _ := s.st.GetSetting(ctx, keyAuditReady); !ok || v != "1" {
+		return linode.Bucket{}, false
+	}
+	raw, ok, _ := s.st.GetSetting(ctx, keyAuditBucket)
+	if !ok {
+		return linode.Bucket{}, false
+	}
+	var b linode.Bucket
+	if json.Unmarshal([]byte(raw), &b) != nil || b.Label == "" {
+		return linode.Bucket{}, false
+	}
+	return b, true
+}
+
+// ---- uploader ----
+
+func (s *Server) auditUploader() {
+	t := time.NewTicker(20 * time.Second)
+	defer t.Stop()
+	seen := map[int64]int64{} // stream -> last uploaded watermark
+	for {
+		select {
+		case <-s.ctx.Done():
+			s.flushAudit(seen)
+			return
+		case <-t.C:
+			s.flushAudit(seen)
+		}
+	}
+}
+
+func (s *Server) flushAudit(seen map[int64]int64) {
+	ctx := s.ctx
+	b, ok := s.auditBucket(ctx)
+	if !ok {
+		return
+	}
+	cl, ok := s.linodeClient(ctx)
+	if !ok {
+		return
+	}
+	// Streams: 0 (console main) + every migration.
+	ids := []int64{0}
+	if migs, err := s.st.ListMigrations(ctx); err == nil {
+		for _, m := range migs {
+			ids = append(ids, m.ID)
+		}
+	}
+	for _, id := range ids {
+		wm, err := s.st.AuditWatermark(ctx, id)
+		if err != nil || wm == seen[id] {
+			continue
+		}
+		name, content := s.renderAudit(ctx, id)
+		if content == "" {
+			seen[id] = wm
+			continue
+		}
+		if err := cl.PutObject(ctx, b, name, "text/plain; charset=utf-8", []byte(content)); err != nil {
+			continue // leave watermark unchanged so we retry next tick
+		}
+		seen[id] = wm
+	}
+}
+
+// renderAudit builds the object name and full text for a stream.
+func (s *Server) renderAudit(ctx context.Context, migID int64) (name, content string) {
+	type line struct {
+		at            time.Time
+		level, source string
+		msg           string
+	}
+	var lines []line
+
+	if migID > 0 {
+		if evs, err := s.st.Events(ctx, migID, 100000); err == nil {
+			for _, e := range evs { // Events is newest-first
+				lines = append(lines, line{e.At, e.Level, "event", e.Message})
+			}
+		}
+	}
+	if rows, err := s.st.AuditRows(ctx, migID); err == nil {
+		for _, r := range rows {
+			lines = append(lines, line{r.At, r.Level, r.Source, r.Message})
+		}
+	}
+	sort.SliceStable(lines, func(i, j int) bool { return lines[i].at.Before(lines[j].at) })
+
+	var sb strings.Builder
+	if migID == 0 {
+		sb.WriteString("vm-replication — console & system audit log\n")
+		sb.WriteString("Every console action and system message on this appliance.\n")
+	} else {
+		m, _ := s.st.Migration(ctx, migID)
+		fmt.Fprintf(&sb, "vm-replication — migration #%d (%s) server log\n", migID, m.Name)
+		sb.WriteString("Everything the appliance did for this migration.\n")
+		name = fmt.Sprintf("migrations/%d-%s.log", migID, sanitizeName(m.Name))
+	}
+	if migID == 0 {
+		name = "main.log"
+	}
+	fmt.Fprintf(&sb, "Generated %s\n\n", time.Now().UTC().Format(time.RFC3339))
+	for _, l := range lines {
+		src := l.source
+		if src == "" {
+			src = "info"
+		}
+		fmt.Fprintf(&sb, "%s [%s] (%s) %s\n", l.at.UTC().Format(time.RFC3339), l.level, src, l.msg)
+	}
+	return name, sb.String()
+}
+
+func sanitizeName(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		out = "migration"
+	}
+	return out
+}
