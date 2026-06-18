@@ -743,7 +743,11 @@ function migCard(v){
   if(m.last_error)b+='<div class="resultbox bad">'+esc(m.last_error)+'</div>';
   else if(err)b+='<div class="resultbox bad">Last replication attempt failed: '+esc(err)+'</div>';
 
-  if(['image_ready','launched'].includes(m.state)){
+  if(['image_ready','launched'].includes(m.state) && m.boot_target==='disk'){
+    b+='<div class="banner">✔ <b>Migration completed.</b> '+
+       (m.launched_linode_id?('Launched Linode '+esc(m.launched_linode_id)+' booting from its <b>local disk</b> ('+esc(m.linode_type||'plan')+') — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a> and connect via Lish. No separate volume is kept.')
+       :'The image is ready to boot from the instance’s local disk.')+'</div>';
+  } else if(['image_ready','launched'].includes(m.state)){
     const arts=disks(m).map(d=>esc(d.artifact_id||('vmrep-'+m.name+'-img'))).join(', ');
     b+='<div class="banner">✔ <b>Migration completed.</b> '+disks(m).length+' image volume(s) in your Linode account ('+
        '<a href="https://cloud.linode.com/volumes" target="_blank" rel="noopener">cloud.linode.com/volumes</a>): <code style="display:inline;padding:1px 5px">'+arts+'</code>. '+

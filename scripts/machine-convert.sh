@@ -377,6 +377,63 @@ if [ -n "\${VMREPL_SSH_AUTHORIZED_KEY:-}" ]; then
   fi
 fi
 
+# 9) Local-disk boot installer (disk-mode cutover only; gated by env). Installs a
+#    one-shot service that runs ONLY while booted from a Linode Volume: it copies
+#    the volume onto the instance's blank local disk and powers off, so the
+#    appliance can then boot the instance from that local disk. On a normal
+#    (local-disk) boot the guard makes it a no-op, so it never fires again.
+if [ -n "\${VMREPL_DISK_INSTALL:-}" ]; then
+  log "Installing local-disk boot one-shot service"
+  cat > /usr/local/sbin/vmrepl-diskinstall.sh <<'DISKINSTALL'
+#!/bin/sh
+# Copy the root Linode Volume onto the local disk, then power off. Runs only
+# during the disk-mode cutover's volume-boot phase (guarded below).
+log() { echo "vmrepl-diskinstall: \$*"; }
+rootsrc=\$(findmnt -no SOURCE / 2>/dev/null)
+rootdisk=\$(lsblk -no pkname "\$rootsrc" 2>/dev/null | head -1)
+[ -n "\$rootdisk" ] || rootdisk=\$(basename "\$rootsrc")
+# Guard: only act when the root filesystem is backed by a Linode Volume.
+if ! ls -l /dev/disk/by-id/scsi-0Linode_Volume_* 2>/dev/null | grep -q "/\${rootdisk}\$"; then
+  log "root (\$rootdisk) is not a Linode Volume; nothing to do"
+  exit 0
+fi
+# Target = a whole local disk that is NOT a Linode Volume.
+target=
+for d in \$(lsblk -dno NAME,TYPE | awk '\$2=="disk"{print \$1}'); do
+  [ "\$d" = "\$rootdisk" ] && continue
+  if ! ls -l /dev/disk/by-id/scsi-0Linode_Volume_* 2>/dev/null | grep -q "/\${d}\$"; then
+    target="/dev/\$d"; break
+  fi
+done
+if [ -z "\$target" ]; then
+  log "no local target disk found; leaving instance on the volume"
+  exit 0
+fi
+log "copying /dev/\$rootdisk -> \$target"
+sync
+dd if="/dev/\$rootdisk" of="\$target" bs=64M conv=fsync 2>/dev/null || { log "dd failed"; exit 1; }
+sync
+log "copy complete; powering off so the appliance can switch to the local disk"
+systemctl poweroff || poweroff -f
+DISKINSTALL
+  chmod +x /usr/local/sbin/vmrepl-diskinstall.sh
+  cat > /etc/systemd/system/vmrepl-diskinstall.service <<'DISKUNIT'
+[Unit]
+Description=vm-replication local-disk install (volume-boot only, one-shot)
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vmrepl-diskinstall.sh
+
+[Install]
+WantedBy=multi-user.target
+DISKUNIT
+  systemctl enable vmrepl-diskinstall.service 2>/dev/null || \
+    ln -sf /etc/systemd/system/vmrepl-diskinstall.service /etc/systemd/system/multi-user.target.wants/vmrepl-diskinstall.service
+fi
+
 log "Inner conversion complete"
 INNER
 chmod +x "$MNT/root/.convert-inner.sh"

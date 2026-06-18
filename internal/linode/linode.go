@@ -304,6 +304,109 @@ func (c *Client) Boot(ctx context.Context, linodeID, configID int64) error {
 		map[string]any{"config_id": configID}, nil)
 }
 
+// Shutdown powers off a Linode (used between the copy boot and the final
+// local-disk boot in disk-mode cutover).
+func (c *Client) Shutdown(ctx context.Context, linodeID int64) error {
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("/linode/instances/%d/shutdown", linodeID), nil, nil)
+}
+
+// Disk is a Linode local disk (lives on the instance's plan storage).
+type Disk struct {
+	ID         int64  `json:"id"`
+	Label      string `json:"label"`
+	Status     string `json:"status"` // "not ready" | "ready"
+	Size       int    `json:"size"`   // MB
+	Filesystem string `json:"filesystem"`
+}
+
+// CreateDisk creates a local disk on an instance. filesystem "raw" gives an
+// unformatted block device we can write a full disk image onto.
+func (c *Client) CreateDisk(ctx context.Context, linodeID int64, label string, sizeMB int, filesystem string) (Disk, error) {
+	var d Disk
+	err := c.do(ctx, http.MethodPost, fmt.Sprintf("/linode/instances/%d/disks", linodeID),
+		map[string]any{"label": label, "size": sizeMB, "filesystem": filesystem}, &d)
+	return d, err
+}
+
+// WaitDiskReady polls until the disk is "ready" or ctx/timeout expires (disk
+// creation/format is asynchronous).
+func (c *Client) WaitDiskReady(ctx context.Context, linodeID, diskID int64, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		var d Disk
+		if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/linode/instances/%d/disks/%d", linodeID, diskID), nil, &d); err != nil {
+			return err
+		}
+		if d.Status == "ready" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("linode: disk %d not ready after %s (status %q)", diskID, timeout, d.Status)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+}
+
+// CreateConfig creates a config profile with an explicit device map (each slot
+// is {"disk_id":N} or {"volume_id":N}). Returns the config id.
+func (c *Client) CreateConfig(ctx context.Context, linodeID int64, label, kernel, rootDevice string, devices map[string]any) (int64, error) {
+	if kernel == "" {
+		kernel = "linode/grub2"
+	}
+	if rootDevice == "" {
+		rootDevice = "/dev/sda"
+	}
+	var cfg struct {
+		ID int64 `json:"id"`
+	}
+	err := c.do(ctx, http.MethodPost, fmt.Sprintf("/linode/instances/%d/configs", linodeID),
+		map[string]any{
+			"label":       label,
+			"kernel":      kernel,
+			"devices":     devices,
+			"root_device": rootDevice,
+			"helpers":     map[string]any{"network": true, "distro": false},
+		}, &cfg)
+	return cfg.ID, err
+}
+
+// WaitInstanceStatus polls until the instance reaches status (e.g. "offline" or
+// "running") or ctx/timeout expires.
+func (c *Client) WaitInstanceStatus(ctx context.Context, id int64, status string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		inst, err := c.GetInstance(ctx, id)
+		if err != nil {
+			return err
+		}
+		if inst.Status == status {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("linode: instance %d not %q after %s (status %q)", id, status, timeout, inst.Status)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// TypeDiskMB returns the local-disk size (MB) of a type id, or 0 if unknown.
+func TypeDiskMB(types []LinodeType, id string) int {
+	for _, t := range types {
+		if t.ID == id {
+			return t.DiskMB
+		}
+	}
+	return 0
+}
+
 // ApplianceLinodeID asks the Linode Metadata Service for the id of the instance
 // this process runs on (so the appliance can attach volumes to itself). Returns
 // 0 if the metadata service is unavailable (e.g. running off-Linode).
