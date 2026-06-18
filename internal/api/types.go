@@ -342,6 +342,13 @@ type FinalizeRequest struct {
 	Region         string `json:"region,omitempty"`
 	Type           string `json:"type,omitempty"`
 	Label          string `json:"label,omitempty"`
+
+	// SkipSnapshot cuts over from the current replicated data without asking the
+	// source agent for a crash-consistent point-in-time snapshot first. Safe (and
+	// the common path) when the operator has already stopped the source's
+	// apps/databases, so the data is quiescent and the long snapshot wait is
+	// unnecessary.
+	SkipSnapshot bool `json:"skip_snapshot,omitempty"`
 	// Optional console/SSH access to seed into the migrated image at cutover, so
 	// the launched instance is reachable without rescue-mode surgery. Migrated
 	// disks carry the source's accounts, and cloud images usually keep root

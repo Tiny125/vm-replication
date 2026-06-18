@@ -348,6 +348,15 @@ So **a multi-disk migration produces multiple image volumes** — one per source
 disk. When it finishes, the completed banner lists them and links to
 **cloud.linode.com/volumes**.
 
+> **Stop the source's apps/databases before cutting over.** The recommended
+> workflow is to stop the application/database on the source first, so the
+> replicated disk is already in a consistent state. The cutover dialog's
+> **"Source apps/databases are already stopped"** box (checked by default) then
+> cuts over immediately. Leave it unchecked only if the source is still live —
+> the appliance will instead ask the still-connected agent for a crash-consistent
+> point-in-time snapshot first (which needs a snapshot-capable agent and can take
+> several minutes).
+
 ### Launching later / manually from the image volumes
 
 If you didn't auto-launch (or want more copies):
