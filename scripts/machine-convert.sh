@@ -397,7 +397,17 @@ log() { echo "vmrepl-diskinstall: \$*" > /dev/console 2>/dev/null; echo "vmrepl-
 # devices, which show up as type "disk".)
 ndisks=\$(lsblk -dnbo NAME,TYPE,SIZE 2>/dev/null | awk '\$2=="disk" && \$3+0>0 {n++} END{print n+0}')
 if [ "\${ndisks:-0}" -lt 2 ]; then
-  log "only \${ndisks:-0} disk(s) -> normal boot, nothing to do"
+  # Normal boot of the migrated instance. The root filesystem may be smaller than
+  # its disk — we shrank it to fit the cutover, or a smaller image was copied onto
+  # a larger plan — so grow it to fill the disk. Online grow on the mounted root is
+  # safe and idempotent (a no-op once the fs already fills the device).
+  rootsrc=\$(findmnt -no SOURCE / 2>/dev/null)
+  rootfs=\$(findmnt -no FSTYPE / 2>/dev/null)
+  case "\$rootfs" in
+    ext2|ext3|ext4) [ -b "\$rootsrc" ] && resize2fs "\$rootsrc" >/dev/null 2>&1 && log "grew \$rootfs root (\$rootsrc) to fill the disk" || true ;;
+    xfs) command -v xfs_growfs >/dev/null 2>&1 && xfs_growfs / >/dev/null 2>&1 && log "grew xfs root to fill the disk" || true ;;
+  esac
+  log "only \${ndisks:-0} disk(s) -> normal boot, nothing else to do"
   exit 0
 fi
 # Install phase: the Linode Volume by-id symlinks can lag early boot; wait for them.
