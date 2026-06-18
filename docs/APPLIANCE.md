@@ -186,7 +186,8 @@ server and is only ever sent to `api.linode.com`.
 
    (Leave Account, Images, NodeBalancers, Domains, etc. at **None** — they aren't
    used. If you later want the appliance to build a Linode *Image* rather than a
-   cloned volume, add **Images: Read/Write**.)
+   cloned volume, add **Images: Read/Write**. For **audit logs** — see below —
+   add **Object Storage: Read/Write**.)
 6. Click **Create Token** and **copy it immediately** — Linode shows the value
    only once.
 7. Paste it into the console's token field and **Save**. The console will show
@@ -197,6 +198,31 @@ server and is only ever sent to `api.linode.com`.
 > token like a password — anyone holding it can create/delete resources (and
 > incur charges) on your account. You can revoke it anytime from the same API
 > Tokens page; provisioning/finalize will then fail until you save a new one.
+
+### Audit logs (Linode Object Storage)
+
+When you save a token, the appliance also provisions a **Linode Object Storage
+bucket** (`vmrep-audit-<id>`) and shows a tick beside the token card once it's
+created. From then on it keeps an audit trail there:
+
+- **`main.log`** — every action taken in the console (logins, connection tests,
+  migration create/start/delete, token changes) plus appliance system messages,
+  so you can review *what was done* on the console.
+- **`migrations/<id>-<name>.log`** — one file per migration capturing everything
+  the appliance did for it: activity events, machine-convert output, receiver/
+  agent activity, the cutover steps, and Linode instance status transitions.
+
+Browse and download these in **Cloud Manager → Object Storage**. The trail is
+kept in the appliance database and re-uploaded on change, so the files are
+always the full current log. This needs the token to have **Object Storage:
+Read/Write** and Object Storage enabled on the account; if provisioning fails,
+the token card shows why and migrations still work — only audit upload is
+skipped.
+
+> The launched instance's own OS boot console isn't available through the Linode
+> API, so the per-migration log captures the instance's **status transitions**
+> (provisioning → booting → running) rather than raw kernel/boot text — view the
+> latter via **Lish** in Cloud Manager.
 
 ---
 

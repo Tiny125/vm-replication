@@ -144,6 +144,7 @@ func main() {
 		RPOTargetSec:      *rpoTarget,
 	})
 	srv.StartActiveReceivers()
+	srv.StartAudit() // tee system logs into the audit trail (changes the global logger)
 
 	httpSrv := &http.Server{Addr: *listen, Handler: srv.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
