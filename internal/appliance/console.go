@@ -525,21 +525,32 @@ function bytesTotal(m){return disks(m).reduce((a,d)=>a+(d.bytes_on_wire||0),0)}
 function anyDiskError(m){return disks(m).map(d=>d.last_error).filter(Boolean)[0]||''}
 
 async function startMig(id,btn){
-  const r=await confirmModal({
+  const meta=migMeta[id]||{};
+  const disk=meta.boot_target==='disk';
+  const planNote=meta.linode_type?(' on plan <b>'+esc(meta.linode_type)+'</b>'):'';
+  const warn='<div class="warn" style="margin-bottom:8px">After cutover the source agent <b>stops replicating</b> — the migrated copy is frozen at this point.</div>';
+  const access='<div class="muted" style="font-size:12px;margin-top:10px">Migrated disks keep the <b>source</b>’s logins, and cloud images usually leave root locked — so set a root password (and/or SSH key) below to reach the new instance via the Lish console without rescue mode.</div>';
+  const opts={
     title:'Cut over migration #'+id+'?',
-    html:'<div class="warn" style="margin-bottom:8px">After cutover the source agent <b>stops replicating</b> — the migrated copy is frozen at this point.</div>'+
-      'First the appliance takes a <b>crash-consistent point-in-time snapshot</b> of the source so the new instance boots cleanly, then it converts the boot disk and clones every disk into launchable <b>&lt;name&gt;-cutover</b> volumes. Keep the source agent connected so the snapshot can be taken. This is the final step.'+
-      '<div class="muted" style="font-size:12px;margin-top:10px">Migrated disks keep the <b>source</b>’s logins, and cloud images usually leave root locked — so the Lish console may have no password to log in with. Optionally set root access below to reach the new instance without rescue mode.</div>',
     okText:'Cut over',
     fields:[
       {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
       {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
-    ],
-    checkbox:{label:'Also launch a new <name>-cutover Linode now (boot=sda, data=sdb…). Leave unchecked to just create the cutover volumes.',checked:true}
-  });
+    ]
+  };
+  if(disk){
+    // Local-disk boot always launches a new instance and keeps no volume.
+    opts.html=warn+
+      'The appliance takes a <b>crash-consistent point-in-time snapshot</b> of the source, converts the boot disk, then creates a new Linode'+planNote+', copies the image onto its <b>local disk</b> and boots from that disk. The temporary volume is deleted afterwards — no separate Block Storage volume is kept. Keep the source agent connected so the snapshot can be taken. This is the final step.'+access;
+  }else{
+    opts.html=warn+
+      'First the appliance takes a <b>crash-consistent point-in-time snapshot</b> of the source so the new instance boots cleanly, then it converts the boot disk and clones every disk into launchable <b>&lt;name&gt;-cutover</b> volumes'+(meta.linode_type?(', and launches a new Linode'+planNote):'')+'. Keep the source agent connected so the snapshot can be taken. This is the final step.'+access;
+    opts.checkbox={label:'Also launch a new <name>-cutover Linode now (boot=sda, data=sdb…). Leave unchecked to just create the cutover volumes.',checked:true};
+  }
+  const r=await confirmModal(opts);
   if(!r)return;
   busy(btn,true);
-  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:r.checked,root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||''});await refreshMig(id)}
+  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:disk?true:r.checked,root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||''});await refreshMig(id)}
   catch(e){alertModal({title:'Cannot cut over',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function stopMig(id,btn){
@@ -742,7 +753,7 @@ function cleanupCard(id){
 function dismissCleanup(id){delete pendingCleanup[id];const c=$('mig'+id);if(c)c.remove();}
 function migCard(v){
   const m=v.migration;const err=anyDiskError(m);
-  migMeta[m.id]={uninstall:v.uninstall_cmd||'',source:m.source_hostname||'',name:m.name};
+  migMeta[m.id]={uninstall:v.uninstall_cmd||'',source:m.source_hostname||'',name:m.name,boot_target:m.boot_target,plan_class:m.plan_class,linode_type:m.linode_type};
   const collapsed=collapsedMigs.has(m.id);
   const firstSeen=!seenMigs.has(m.id);seenMigs.add(m.id);
 
