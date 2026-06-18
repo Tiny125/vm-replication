@@ -936,7 +936,16 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 func retryBusy(ctx context.Context, fn func() error) error {
 	var err error
 	for i := 0; i < 15; i++ {
-		if err = fn(); err == nil || !strings.Contains(strings.ToLower(err.Error()), "busy") {
+		err = fn()
+		if err == nil {
+			return err
+		}
+		// Stop immediately if our own context is done (the operator canceled or the
+		// overall deadline passed) — the error is terminal, not transient.
+		if ctx.Err() != nil {
+			return err
+		}
+		if !retryableLinodeErr(err) {
 			return err
 		}
 		select {
@@ -946,6 +955,25 @@ func retryBusy(ctx context.Context, fn func() error) error {
 		}
 	}
 	return err
+}
+
+// retryableLinodeErr reports whether a Linode API call is worth retrying: either
+// the instance was transiently "busy", or the request timed out / dropped at the
+// HTTP layer (e.g. "Client.Timeout exceeded while awaiting headers", connection
+// reset, EOF). These are safe to retry only alongside an idempotent operation —
+// see CreateDiskIfAbsent — so a request that timed out after succeeding isn't
+// performed twice.
+func retryableLinodeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	for _, sub := range []string{"busy", "client.timeout", "deadline exceeded", "timeout", "connection reset", "connection refused", "eof", "no such host", "temporary"} {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // finalizeDisk cuts a disk-mode migration over to a Linode that boots from its
@@ -1021,7 +1049,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	var rawDisk linode.Disk
 	err = retryBusy(ctx, func() error {
 		var e error
-		rawDisk, e = cl.CreateDisk(ctx, inst.ID, "vmrepl-boot", diskMB, "raw")
+		rawDisk, e = cl.CreateDiskIfAbsent(ctx, inst.ID, "vmrepl-boot", diskMB, "raw")
 		return e
 	})
 	if canceled() {

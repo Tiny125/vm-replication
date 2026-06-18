@@ -29,7 +29,10 @@ type Client struct {
 
 // New returns a client for the given token.
 func New(token string) *Client {
-	return &Client{token: token, http: &http.Client{Timeout: 60 * time.Second}}
+	// Some mutating calls (e.g. creating a full-plan local disk) can be slow to
+	// return headers; give them generous headroom. Long-running operations are
+	// driven by polling helpers, not by holding a single request open.
+	return &Client{token: token, http: &http.Client{Timeout: 180 * time.Second}}
 }
 
 func (c *Client) do(ctx context.Context, method, path string, in, out any) error {
@@ -326,6 +329,34 @@ func (c *Client) CreateDisk(ctx context.Context, linodeID int64, label string, s
 	err := c.do(ctx, http.MethodPost, fmt.Sprintf("/linode/instances/%d/disks", linodeID),
 		map[string]any{"label": label, "size": sizeMB, "filesystem": filesystem}, &d)
 	return d, err
+}
+
+// ListDisks returns the instance's local disks.
+func (c *Client) ListDisks(ctx context.Context, linodeID int64) ([]Disk, error) {
+	var resp struct {
+		Data []Disk `json:"data"`
+	}
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/linode/instances/%d/disks?page_size=500", linodeID), nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+// CreateDiskIfAbsent creates a disk, but first reuses an existing disk with the
+// same label if one is present. Disk creation is not idempotent on Linode's side,
+// and the POST can time out *client-side after the disk was actually created* —
+// so a blind retry would make a duplicate. Looking up by label first makes the
+// create safe to retry: a timed-out-but-successful create is picked up instead of
+// duplicated.
+func (c *Client) CreateDiskIfAbsent(ctx context.Context, linodeID int64, label string, sizeMB int, filesystem string) (Disk, error) {
+	if disks, err := c.ListDisks(ctx, linodeID); err == nil {
+		for _, d := range disks {
+			if d.Label == label {
+				return d, nil
+			}
+		}
+	}
+	return c.CreateDisk(ctx, linodeID, label, sizeMB, filesystem)
 }
 
 // WaitDiskReady polls until the disk is "ready" or ctx/timeout expires (disk
