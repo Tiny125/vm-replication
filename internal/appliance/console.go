@@ -240,11 +240,14 @@ const consoleHTML = `<!DOCTYPE html>
           <option value="volume">Separate Block Storage volume (default)</option>
           <option value="disk">Linode local disk (NVMe)</option>
         </select></div>
-        <div id="m_planclass_wrap" class="hide"><select id="m_planclass" onchange="updatePlanPreview()">
+        <div><select id="m_planclass" onchange="reloadPlanOptions()">
           <option value="shared">Shared CPU</option>
           <option value="dedicated">Dedicated CPU</option>
         </select></div>
       </div>
+      <label style="margin-top:10px">Linode plan</label>
+      <select id="m_plan" onchange="updatePlanInfo()"></select>
+      <div id="m_plan_help" class="muted" style="font-size:12px;margin-top:6px"></div>
       <div id="m_boot_help" class="muted" style="font-size:12px;margin-top:6px"></div>
 
       <div style="margin-top:16px;display:flex;align-items:center;gap:2px">
@@ -386,7 +389,7 @@ async function loadSettings(){
   }else{
     h+='<details><summary>What is this and how do I get a token?</summary><div class="muted" style="font-size:13px">'+
        'A Linode <b>Personal Access Token</b> lets the appliance create volumes, clone disks and launch instances. Stored <b>encrypted at rest</b>. '+
-       'Create one at <a href="https://cloud.linode.com/profile/tokens" target="_blank" rel="noopener">cloud.linode.com/profile/tokens</a> with scopes <b>Linodes: Read/Write</b> and <b>Volumes: Read/Write</b>.'+
+       'Create one at <a href="https://cloud.linode.com/profile/tokens" target="_blank" rel="noopener">cloud.linode.com/profile/tokens</a> with scopes <b>Linodes: Read/Write</b>, <b>Volumes: Read/Write</b> and <b>Object Storage: Read/Write</b> (Object Storage is used for the audit logs).'+
        '</div></details>'+
        '<div style="display:flex;gap:8px;margin-top:10px"><input id="ltok" type="password" placeholder="Linode API token"><button onclick="saveToken(this)">Save</button></div>';
   }
@@ -426,24 +429,44 @@ async function loadPlans(){
   _plansCache=(r&&r.plans)||[];
   return _plansCache;
 }
+function validHostname(h){return !!h&&h.length<=253&&/^[A-Za-z0-9.-]+$/.test(h)&&h[0]!=='-';}
 function totalDiskGB(){let g=0;document.querySelectorAll('#disks .d_size').forEach(i=>{const v=parseInt(i.value,10);if(v>0)g+=v;});return g;}
-function diskSizeChanged(){const b=$('m_boot');if(b&&b.value==='disk')updatePlanPreview();}
+function diskSizeChanged(){reloadPlanOptions();}
 function bootTargetChanged(){
   const disk=$('m_boot').value==='disk';
-  $('m_planclass_wrap').classList.toggle('hide',!disk);
-  if(disk){updatePlanPreview();}
-  else{$('m_boot_help').innerHTML='Boots from a <b>Block Storage volume</b> sized to your input (the current default). The volume is billed separately (~$0.10/GB-month) on top of the plan, and the plan’s own included disk goes unused.';}
+  $('m_boot_help').innerHTML=disk
+    ? 'Boots from the Linode’s <b>local NVMe disk</b> — faster, and no separate volume cost. Pick a plan whose disk fits your data; region follows the appliance.'
+    : 'Boots from a <b>Block Storage volume</b> sized to your data and attached to the chosen plan. The volume is billed separately (~$0.10/GB-month) on top of the plan.';
+  reloadPlanOptions();
 }
-async function updatePlanPreview(){
-  const cls=$('m_planclass').value, gb=totalDiskGB(), help=$('m_boot_help');
-  help.innerHTML='Boots from the Linode’s <b>local NVMe disk</b> — faster, and no separate volume cost. The instance is created on the smallest <b>'+cls+'</b> plan whose disk fits your data; region follows the appliance.';
-  if(gb<=0){help.innerHTML+='<br>Enter disk size(s) above to see the chosen plan.';return;}
-  try{
-    const plans=(await loadPlans()).filter(p=>p.class===cls&&p.disk_gb>=gb).sort((a,b)=>a.disk_gb-b.disk_gb||a.price_monthly-b.price_monthly);
-    if(!plans.length){help.innerHTML+='<br><span class="x">No '+cls+' plan has a disk ≥ '+gb+' GB — use a smaller source or Separate-volume boot.</span>';return;}
-    const p=plans[0];
-    help.innerHTML+='<br>Closest plan: <b>'+esc(p.label)+'</b> — '+p.disk_gb+' GB disk, '+p.vcpus+' vCPU, '+(p.memory_mb/1024)+' GB RAM (~$'+p.price_monthly+'/mo).';
-  }catch(e){help.innerHTML+='<br><span class="muted">Add a Linode token in Settings to preview the plan.</span>';}
+// Populate the plan dropdown from the chosen class + boot target. In disk mode
+// only plans whose local disk fits the data are offered; the default selection
+// is the closest fit. The user's explicit choice is preserved across refreshes.
+async function reloadPlanOptions(){
+  const sel=$('m_plan'); if(!sel)return;
+  const cls=$('m_planclass').value, disk=$('m_boot').value==='disk', gb=totalDiskGB();
+  let plans;
+  try{plans=await loadPlans();}
+  catch(e){sel.innerHTML='<option value="">add a Linode token in Settings to load plans</option>';$('m_plan_help').innerHTML='';return;}
+  let list=plans.filter(p=>p.class===cls);
+  if(disk)list=list.filter(p=>p.disk_gb>=gb);
+  list.sort((a,b)=>a.disk_gb-b.disk_gb||a.price_monthly-b.price_monthly);
+  if(!list.length){sel.innerHTML='<option value="">'+(disk?('no '+cls+' plan has a disk ≥ '+gb+' GB'):('no '+cls+' plans available'))+'</option>';updatePlanInfo();return;}
+  const def=(list.find(p=>p.disk_gb>=gb)||list[0]).id, prev=sel.value;
+  sel.innerHTML=list.map(p=>'<option value="'+p.id+'">'+esc(p.label)+' — '+p.vcpus+' vCPU, '+(p.memory_mb/1024)+' GB, '+p.disk_gb+' GB disk ($'+p.price_monthly+'/mo)</option>').join('');
+  sel.value=(prev&&list.some(p=>p.id===prev))?prev:def;
+  updatePlanInfo();
+}
+function updatePlanInfo(){
+  const sel=$('m_plan'), help=$('m_plan_help'); if(!sel||!help)return;
+  const p=(_plansCache||[]).find(x=>x.id===sel.value);
+  if(!p){help.innerHTML='';return;}
+  let h='Instance: <b>'+esc(p.label)+'</b> — '+p.vcpus+' vCPU, '+(p.memory_mb/1024)+' GB RAM (~$'+p.price_monthly+'/mo).';
+  if($('m_boot').value!=='disk'){
+    const gb=totalDiskGB(), vol=gb*0.10;
+    h+=' Block Storage volume'+(gb>0?(' ('+gb+' GB)'):'')+': ~$'+vol.toFixed(2)+'/mo'+(gb>0?'':' — enter disk size(s)')+'. <b>Est. total ~$'+(p.price_monthly+vol).toFixed(2)+'/mo.</b>';
+  }
+  help.innerHTML=h;
 }
 // IP addresses that passed the in-form connection test; only these may be used
 // to create a migration.
@@ -469,21 +492,23 @@ async function createMig(btn){
   const name=$('m_name').value.trim(),host=$('m_host').value.trim(),ip=$('m_ip').value.trim();
   if(!name){$('createErr').textContent='Enter a migration name.';return}
   if(!host){$('createErr').textContent='Enter the source hostname.';return}
+  if(!validHostname(host)){$('createErr').textContent='“'+host+'” is not a valid hostname (letters, digits, dots and hyphens only — no spaces). Fix it and try again.';return}
   if(!ip){$('createErr').textContent='Enter the source IP address.';return}
   if(!testedOkIPs.has(ip)){$('createErr').textContent='Run and pass the connection test for '+ip+' first (click “Test connection”).';return}
   const rows=document.querySelectorAll('#disks .row');const devices=[];
-  for(const r of rows){const dev=r.querySelector('.d_dev').value.trim();const gb=parseInt(r.querySelector('.d_size').value,10);
-    if(!dev)continue; if(!gb||gb<=0){$('createErr').textContent='Each disk needs a positive size (GB): '+dev;return}
+  for(const r of rows){const dev=r.querySelector('.d_dev').value.trim();const gbRaw=r.querySelector('.d_size').value.trim();const gb=parseInt(gbRaw,10);
+    if(!dev||!gbRaw){$('createErr').textContent='Fill in every disk row (device path and size) or remove the empty one before creating.';return}
+    if(!gb||gb<=0){$('createErr').textContent='Each disk needs a positive size (GB): '+dev;return}
     devices.push({device:dev,size_bytes:gb*1073741824});}
   if(!devices.length){$('createErr').textContent='Add at least one disk';return}
-  const bootTarget=$('m_boot').value, planClass=$('m_planclass').value;
+  const bootTarget=$('m_boot').value, planClass=$('m_planclass').value, planType=$('m_plan').value;
   busy(btn,true);
   // Show a loading placeholder at the BOTTOM of the list while provisioning runs
   // (new migrations are appended, newest last).
   $('migs').insertAdjacentHTML('beforeend','<div id="creating" class="mig"><div class="center"><div class="spinner"></div><div>Creating migration & provisioning volume(s)…</div></div></div>');
   $('creating').scrollIntoView({behavior:'smooth',block:'center'});
   try{
-    await api('POST','/api/v1/migrations',{name:name,source_hostname:host,source_ip:ip,devices:devices,boot_target:bootTarget,plan_class:planClass});
+    await api('POST','/api/v1/migrations',{name:name,source_hostname:host,source_ip:ip,devices:devices,boot_target:bootTarget,plan_class:planClass,linode_type:planType});
     $('m_name').value=$('m_host').value=$('m_ip').value='';$('m_ipstatus').classList.add('hide');
     $('disks').innerHTML='';diskSeq=0;addDisk();$('m_boot').value='volume';bootTargetChanged();
     await refresh(true);
@@ -730,8 +755,8 @@ function migCard(v){
   // Boot-mode header banner: distinct colours so the mode is obvious at a glance
   // (green = Linode local disk, blue = separate Block Storage volume).
   h+=(m.boot_target==='disk')
-    ? '<div class="banner" style="border-color:#cde8d8;background:#f1faf4;color:#0f5c30;margin:0 0 10px">💽 <b>Boot: Linode local disk</b>'+((m.linode_type)?(' — '+esc((m.plan_class||'')+' plan '+m.linode_type)):'')+'</div>'
-    : '<div class="banner" style="border-color:#cdd6e8;background:#f3f6fc;color:#22408a;margin:0 0 10px">📦 <b>Boot: separate Block Storage volume</b></div>';
+    ? '<div class="banner" style="border-color:#cde8d8;background:#f1faf4;color:#0f5c30;margin:0 0 10px"><b>Boot: Linode local disk</b>'+((m.linode_type)?(' — '+esc((m.plan_class||'')+' plan '+m.linode_type)):'')+'</div>'
+    : '<div class="banner" style="border-color:#cdd6e8;background:#f3f6fc;color:#22408a;margin:0 0 10px"><b>Boot: separate Block Storage volume</b>'+((m.linode_type)?(' — plan '+esc(m.linode_type)):'')+'</div>';
 
   h+='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+statusLegend()+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
     '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_ip||m.source_hostname||'-')+'</span></td>'+

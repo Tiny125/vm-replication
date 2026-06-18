@@ -80,7 +80,7 @@ but get no automatic repair pass.
 - **Crash-consistent cutover** via LVM point-in-time snapshot (falls back to a live read + warning when no snapshot mechanism exists).
 - **Automated boot conversion** for Linode: virtio initramfs, GRUB reinstall (or Linode-kernel boot for partitionless disks), `fsck`, Lish serial console, fresh machine-id, and a **DHCP network reset** (strips the source's static IP/DNS config so the new instance gets its own Linode IP).
 - **Console/SSH access seeding** at cutover (set a root password and/or install an SSH key so the launched instance is reachable).
-- **Choice of boot target** at create time: a **separate Block Storage volume** (default), or the Linode's **local disk** (NVMe — faster and no separate volume cost; the appliance picks the closest Shared/Dedicated plan whose disk fits, single-disk only).
+- **Choice of boot target and plan** at create time: a **separate Block Storage volume** (default), or the Linode's **local disk** (NVMe — faster, no separate volume cost, single-disk only). Either way you pick the launch plan from a Shared/Dedicated list (local-disk offers only plans whose disk fits); the volume option shows the estimated monthly Block Storage cost alongside the plan price.
 - **Reboot-based cutover** that launches a new Linode from the replicated image.
 
 ## What it does **not** support

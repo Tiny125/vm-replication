@@ -277,6 +277,11 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "source IP is not a valid IP address or hostname")
 		return
 	}
+	req.SourceHostname = strings.TrimSpace(req.SourceHostname)
+	if req.SourceHostname == "" || !validHost(req.SourceHostname) {
+		writeErr(w, http.StatusBadRequest, "source hostname is not a valid hostname (letters, digits, dots and hyphens only) — fix it and create again")
+		return
+	}
 	req.Devices = devices
 
 	ctx := r.Context()
@@ -295,20 +300,37 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Resolve the boot target. Volume mode (default) is unchanged. Disk mode
-	// picks the smallest Linode plan in the chosen class whose local disk fits
-	// the total replicated size, so the instance can later boot from that disk.
+	// Resolve the boot target and chosen plan. The console offers a plan picker
+	// for both modes; if it sends an explicit linode_type we validate it, else we
+	// fall back (volume: launch default at cutover; disk: smallest plan that fits).
+	if req.PlanClass != "dedicated" {
+		req.PlanClass = "shared"
+	}
+	var total int64
+	for _, d := range devices {
+		total += d.SizeBytes
+	}
 	switch req.BootTarget {
 	case "", api.BootTargetVolume:
 		req.BootTarget = api.BootTargetVolume
-		req.PlanClass, req.LinodeType = "", ""
+		// Validate the picked plan exists, when we have a token to check against.
+		if req.LinodeType != "" {
+			if cl, ok := s.linodeClient(ctx); ok {
+				types, err := cl.ListTypes(ctx)
+				if err != nil {
+					writeErr(w, http.StatusBadGateway, "could not load Linode plans: "+err.Error())
+					return
+				}
+				if linode.TypeDiskMB(types, req.LinodeType) == 0 {
+					writeErr(w, http.StatusBadRequest, "the selected Linode plan is not valid — pick one from the list")
+					return
+				}
+			}
+		}
 	case api.BootTargetDisk:
 		if len(devices) > 1 {
 			writeErr(w, http.StatusBadRequest, "local-disk boot currently supports a single disk; use Separate-volume boot for multi-disk migrations")
 			return
-		}
-		if req.PlanClass != "dedicated" {
-			req.PlanClass = "shared"
 		}
 		cl, ok := s.linodeClient(ctx)
 		if !ok {
@@ -320,16 +342,31 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadGateway, "could not load Linode plans: "+err.Error())
 			return
 		}
-		var total int64
-		for _, d := range devices {
-			total += d.SizeBytes
+		if req.LinodeType != "" {
+			// Honour the explicit pick, but it must be in-class and large enough.
+			var chosen *linode.LinodeType
+			for i := range types {
+				if types[i].ID == req.LinodeType {
+					chosen = &types[i]
+					break
+				}
+			}
+			if chosen == nil || !linode.PlanClasses(req.PlanClass)[chosen.Class] {
+				writeErr(w, http.StatusBadRequest, "the selected plan is not a "+req.PlanClass+" plan — pick one from the list")
+				return
+			}
+			if int64(chosen.DiskMB)*1024*1024 < total {
+				writeErr(w, http.StatusBadRequest, fmt.Sprintf("the selected plan's %d GB disk is too small for %s of data — pick a larger plan", chosen.DiskMB/1024, humanBytes(total)))
+				return
+			}
+		} else {
+			plan, ok := linode.ClosestType(types, req.PlanClass, total)
+			if !ok {
+				writeErr(w, http.StatusBadRequest, fmt.Sprintf("no %s Linode plan has enough local disk for %s of data — choose a larger source or use Separate-volume boot", req.PlanClass, humanBytes(total)))
+				return
+			}
+			req.LinodeType = plan.ID
 		}
-		plan, ok := linode.ClosestType(types, req.PlanClass, total)
-		if !ok {
-			writeErr(w, http.StatusBadRequest, fmt.Sprintf("no %s Linode plan has enough local disk for %s of data — choose a larger source or use Separate-volume boot", req.PlanClass, humanBytes(total)))
-			return
-		}
-		req.LinodeType = plan.ID
 	default:
 		writeErr(w, http.StatusBadRequest, "boot_target must be 'volume' or 'disk'")
 		return
@@ -360,6 +397,8 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 	_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("migration created with %d disk(s); waiting for the source agent", len(m.Disks)))
 	if m.BootTarget == api.BootTargetDisk {
 		_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("boot target: Linode local disk (%s plan %s)", m.PlanClass, m.LinodeType))
+	} else if m.LinodeType != "" {
+		_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("boot target: separate Block Storage volume; launch plan %s", m.LinodeType))
 	} else {
 		_ = s.st.AddEvent(ctx, m.ID, "info", "boot target: separate Block Storage volume")
 	}
@@ -829,7 +868,9 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 				region = s.cfg.Region
 			}
 		}
-		typ := orDefault(req.Type, "g6-standard-2")
+		// Plan: the one chosen on the create form (stored on the migration), then
+		// an explicit finalize override, then a safe default.
+		typ := orDefault(m.LinodeType, orDefault(req.Type, "g6-standard-2"))
 		label := orDefault(req.Label, cutoverName(m.Name))
 		inst, err := cl.CreateInstance(ctx, label, region, typ)
 		if canceled() {
