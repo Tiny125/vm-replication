@@ -420,10 +420,19 @@ if [ -z "\$target" ]; then
   log "no local target disk found; leaving instance on the volume"
   exit 0
 fi
-log "copying /dev/\$rootdisk -> \$target (this can take a few minutes)"
+srcsz=\$(blockdev --getsize64 "/dev/\$rootdisk" 2>/dev/null)
+tgtsz=\$(blockdev --getsize64 "\$target" 2>/dev/null)
+log "copying /dev/\$rootdisk (\${srcsz:-?} bytes) -> \$target (\${tgtsz:-?} bytes); this can take a few minutes"
+if [ -n "\$srcsz" ] && [ -n "\$tgtsz" ] && [ "\$tgtsz" -lt "\$srcsz" ]; then
+  log "ERROR: local disk (\$tgtsz B) is smaller than the image (\$srcsz B) — the plan's disk can't hold it; pick a larger plan"
+  exit 1
+fi
 sync
-if ! dd if="/dev/\$rootdisk" of="\$target" bs=64M conv=fsync; then
-  log "dd failed"; exit 1
+derr=\$(dd if="/dev/\$rootdisk" of="\$target" bs=64M conv=fsync 2>&1)
+rc=\$?
+if [ \$rc -ne 0 ]; then
+  log "dd failed (rc=\$rc): \$(echo "\$derr" | tail -2 | tr '\n' ' ')"
+  exit 1
 fi
 sync
 log "copy complete; powering off so the appliance can switch to the local disk"
