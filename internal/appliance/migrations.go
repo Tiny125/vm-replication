@@ -914,6 +914,23 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %d cutover volume(s) ready to launch", len(m.Disks)))
 }
 
+// retryBusy retries fn while Linode reports the instance is busy (a transient
+// state during provisioning/cloning/booting), backing off between attempts.
+func retryBusy(ctx context.Context, fn func() error) error {
+	var err error
+	for i := 0; i < 15; i++ {
+		if err = fn(); err == nil || !strings.Contains(strings.ToLower(err.Error()), "busy") {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(time.Duration(2+i) * time.Second):
+		}
+	}
+	return err
+}
+
 // finalizeDisk cuts a disk-mode migration over to a Linode that boots from its
 // local (plan) disk. Local Linode disks can't be attached to the appliance, so
 // instead of cloning a volume onto the instance we: clone the replicated volume,
@@ -965,6 +982,17 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", clone.ID), inst.ID)
 	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("created cutover Linode %q (id %d) on plan %s", cutoverName(m.Name), inst.ID, m.LinodeType))
 
+	// A brand-new Linode is still "provisioning" for a short while, during which
+	// disk operations are rejected with "Linode busy". Wait until it settles to
+	// "offline" before adding the local disk.
+	if err := cl.WaitInstanceStatus(ctx, inst.ID, "offline", 10*time.Minute); err != nil {
+		if canceled() {
+			return
+		}
+		s.fail(m.ID, "wait for instance to finish provisioning: "+err.Error())
+		return
+	}
+
 	// 3) Create a blank raw local disk sized to the plan's full storage.
 	diskMB := 0
 	if types, terr := cl.ListTypes(ctx); terr == nil {
@@ -973,7 +1001,12 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	if diskMB == 0 { // fallback: at least the image size, rounded up to MB
 		diskMB = int((boot.SizeBytes + (1 << 20) - 1) / (1 << 20))
 	}
-	rawDisk, err := cl.CreateDisk(ctx, inst.ID, "vmrepl-boot", diskMB, "raw")
+	var rawDisk linode.Disk
+	err = retryBusy(ctx, func() error {
+		var e error
+		rawDisk, e = cl.CreateDisk(ctx, inst.ID, "vmrepl-boot", diskMB, "raw")
+		return e
+	})
 	if canceled() {
 		return
 	}
@@ -1000,7 +1033,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		s.fail(m.ID, "create install config: "+err.Error())
 		return
 	}
-	if err := cl.Boot(ctx, inst.ID, installCfg); err != nil {
+	if err := retryBusy(ctx, func() error { return cl.Boot(ctx, inst.ID, installCfg) }); err != nil {
 		if canceled() {
 			return
 		}
@@ -1034,7 +1067,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		s.fail(m.ID, "create boot config: "+err.Error())
 		return
 	}
-	if err := cl.Boot(ctx, inst.ID, bootCfg); err != nil {
+	if err := retryBusy(ctx, func() error { return cl.Boot(ctx, inst.ID, bootCfg) }); err != nil {
 		if canceled() {
 			return
 		}
