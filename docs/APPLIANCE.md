@@ -203,10 +203,11 @@ server and is only ever sent to `api.linode.com`.
 
 When you save a token, the appliance also provisions a **Linode Object Storage
 bucket** and shows a tick beside the token card once it's created. The bucket is
-named `vmrep-audit-NN` (`vmrep-audit-01`, `-02`, …): the appliance lists the
-account's existing buckets and claims the lowest free number, so **multiple
-appliances on the same account each get their own bucket without colliding**.
-From then on it keeps an audit trail there:
+named `vmrep-audit-<appliance-id>-NN` (e.g. `vmrep-audit-99334138-01`): it keeps
+the appliance's Linode id and adds a number — the appliance lists the account's
+existing buckets and claims the lowest free one, so **multiple appliances on the
+same account each get their own bucket without colliding**. From then on it
+keeps an audit trail there:
 
 - **`main.log`** — every action taken in the console (logins, connection tests,
   migration create/start/delete, token changes) plus appliance system messages,

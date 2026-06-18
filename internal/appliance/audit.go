@@ -112,9 +112,10 @@ func (s *Server) ensureAuditBucket(ctx context.Context, token string) {
 	}
 
 	// Reuse our previously-chosen bucket (stable across restarts), but only when
-	// it uses the current "vmrep-audit-NN" scheme. Older deployments stored a
-	// Linode-ID-based name and are migrated to a fresh NN on the next provision.
-	if name, ok, _ := s.st.GetSetting(ctx, keyAuditName); ok && auditNameRe.MatchString(name) {
+	// it uses the current "<prefix>-NN" scheme. Older deployments stored a name
+	// without the -NN suffix and are migrated to a fresh NN on the next provision.
+	prefix := s.auditPrefix()
+	if name, ok, _ := s.st.GetSetting(ctx, keyAuditName); ok && isAuditName(prefix, name) {
 		b, err := cl.CreateBucket(ctx, name, region)
 		if err != nil && !isAlreadyExists(err) {
 			s.setAuditErr(err.Error())
@@ -127,9 +128,9 @@ func (s *Server) ensureAuditBucket(ctx context.Context, token string) {
 		return
 	}
 
-	// First provision (or migrating an old name): pick the lowest free
-	// vmrep-audit-NN, checking existing buckets across the account so multiple
-	// appliances on the same account never collide. Retry on a creation race.
+	// First provision (or migrating an old name): keep the appliance id and pick
+	// the lowest free "<prefix>-NN", checking existing buckets across the account
+	// so deployments never collide. Retry on a creation race.
 	taken := map[string]bool{}
 	if bs, err := cl.ListBuckets(ctx); err == nil {
 		for _, b := range bs {
@@ -137,7 +138,7 @@ func (s *Server) ensureAuditBucket(ctx context.Context, token string) {
 		}
 	}
 	for i := 1; i <= 99; i++ {
-		cand := fmt.Sprintf("vmrep-audit-%02d", i)
+		cand := fmt.Sprintf("%s-%02d", prefix, i)
 		if taken[cand] {
 			continue
 		}
@@ -154,10 +155,35 @@ func (s *Server) ensureAuditBucket(ctx context.Context, token string) {
 		s.saveAuditBucket(ctx, b)
 		return
 	}
-	s.setAuditErr("no free audit bucket name available (vmrep-audit-01..99 are all taken)")
+	s.setAuditErr("no free audit bucket name available (" + prefix + "-01..99 are all taken)")
 }
 
-var auditNameRe = regexp.MustCompile(`^vmrep-audit-\d{1,3}$`)
+// auditPrefix is the bucket-name prefix for this appliance: it keeps the
+// appliance's Linode id (so buckets are tied to the instance) and a -NN suffix
+// is added for uniqueness. Falls back to "vmrep-audit" with no id off-Linode.
+func (s *Server) auditPrefix() string {
+	if s.cfg.ApplianceLinodeID != 0 {
+		return fmt.Sprintf("vmrep-audit-%d", s.cfg.ApplianceLinodeID)
+	}
+	return "vmrep-audit"
+}
+
+// isAuditName reports whether name is "<prefix>-NN" (1–3 digits).
+func isAuditName(prefix, name string) bool {
+	if !strings.HasPrefix(name, prefix+"-") {
+		return false
+	}
+	suf := name[len(prefix)+1:]
+	if len(suf) < 1 || len(suf) > 3 {
+		return false
+	}
+	for _, c := range suf {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
 
 func isAlreadyExists(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "exist")
