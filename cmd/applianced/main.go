@@ -36,6 +36,7 @@ func main() {
 		dataDir       = flag.String("data-dir", "/var/lib/vm-repl", "state directory (db, keys, file-fallback volumes)")
 		publicHost    = flag.String("public-host", "", "IP/DNS source agents reach this server at (auto-detected if empty)")
 		region        = flag.String("region", "us-ord", "default Linode region for volumes/instances")
+		objRegion     = flag.String("obj-region", "", "Object Storage region for audit logs (empty = follow the appliance's own region)")
 		baseRecvPort  = flag.Int("base-receiver-port", 5000, "first TCP port for per-migration receivers")
 		certFile      = flag.String("cert", "", "data-plane (receiver) certificate PEM")
 		keyFile       = flag.String("key", "", "data-plane (receiver) key PEM")
@@ -134,6 +135,7 @@ func main() {
 		PublicKeyPin:      pin,
 		BaseReceiverPort:  *baseRecvPort,
 		Region:            *region,
+		ObjRegion:         *objRegion,
 		TLS:               transport.Files{CertFile: *certFile, KeyFile: *keyFile, CAFile: *caFile},
 		AgentCert:         *agentCert,
 		AgentKey:          *agentKey,

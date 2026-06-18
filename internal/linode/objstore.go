@@ -25,6 +25,18 @@ func (b Bucket) pathSeg() string {
 	return b.Region
 }
 
+// ListBuckets returns every Object Storage bucket in the account (across all
+// regions), used to pick a non-colliding audit-bucket name.
+func (c *Client) ListBuckets(ctx context.Context) ([]Bucket, error) {
+	var resp struct {
+		Data []Bucket `json:"data"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/object-storage/buckets?page_size=500", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
 // CreateBucket creates an Object Storage bucket in the given region. Requires a
 // token with Object Storage read/write and Object Storage enabled on the account.
 func (c *Client) CreateBucket(ctx context.Context, label, region string) (Bucket, error) {

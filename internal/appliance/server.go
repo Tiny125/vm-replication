@@ -34,6 +34,7 @@ type Config struct {
 	PublicKeyPin      string          // base64 SPKI SHA-256 for curl --pinnedpubkey (empty = no pin)
 	BaseReceiverPort  int             // first port for per-migration receivers
 	Region            string          // default Linode region for volumes/instances
+	ObjRegion         string          // explicit Object Storage region for audit logs (empty = follow the appliance's region)
 	TLS               transport.Files // appliance data-plane (receiver) cert/key/ca
 	AgentCert         string          // agent.crt handed to sources during enrollment
 	AgentKey          string          // agent.key handed to sources
@@ -127,6 +128,7 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/settings", s.auth(s.handleGetSettings))
 	s.mux.Handle("POST /api/v1/settings/linode-token", s.auth(s.handleSetLinodeToken))
 	s.mux.Handle("DELETE /api/v1/settings/linode-token", s.auth(s.handleDeleteLinodeToken))
+	s.mux.Handle("POST /api/v1/settings/audit-bucket", s.auth(s.handleProvisionAuditBucket))
 }
 
 // Handler returns the root HTTP handler.
@@ -261,6 +263,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"linode_automation":   s.cfg.ApplianceLinodeID != 0,
 		"audit_ready":         auditReady == "1",
 		"audit_bucket":        bucket.Label,
+		"audit_region":        bucket.Region,
 		"audit_error":         auditErr,
 	})
 }
@@ -321,6 +324,27 @@ func (s *Server) handleDeleteLinodeToken(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleProvisionAuditBucket (re-)creates the audit-log Object Storage bucket
+// using the current region rules, without removing the token. Useful to move the
+// bucket to the appliance's region after changing -obj-region.
+func (s *Server) handleProvisionAuditBucket(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	tok, err := s.st.LinodeToken(ctx)
+	if err != nil || tok == "" {
+		writeErr(w, http.StatusBadRequest, "add a Linode API token first")
+		return
+	}
+	s.ensureAuditBucket(ctx, tok)
+	ready, _, _ := s.st.GetSetting(ctx, keyAuditReady)
+	if ready != "1" {
+		aerr, _, _ := s.st.GetSetting(ctx, keyAuditErr)
+		writeErr(w, http.StatusBadGateway, "could not create the audit bucket: "+aerr)
+		return
+	}
+	b, _ := s.auditBucket(ctx)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "audit_bucket": b.Label, "audit_region": b.Region})
 }
 
 // ---- helpers ----

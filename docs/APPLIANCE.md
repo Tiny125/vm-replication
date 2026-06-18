@@ -202,8 +202,12 @@ server and is only ever sent to `api.linode.com`.
 ### Audit logs (Linode Object Storage)
 
 When you save a token, the appliance also provisions a **Linode Object Storage
-bucket** (`vmrep-audit-<id>`) and shows a tick beside the token card once it's
-created. From then on it keeps an audit trail there:
+bucket** and shows a tick beside the token card once it's created. The bucket is
+named `vmrep-audit-<appliance-id>-NN` (e.g. `vmrep-audit-99334138-01`): it keeps
+the appliance's Linode id and adds a number — the appliance lists the account's
+existing buckets and claims the lowest free one, so **multiple appliances on the
+same account each get their own bucket without colliding**. From then on it
+keeps an audit trail there:
 
 - **`main.log`** — every action taken in the console (logins, connection tests,
   migration create/start/delete, token changes) plus appliance system messages,
@@ -218,6 +222,12 @@ always the full current log. This needs the token to have **Object Storage:
 Read/Write** and Object Storage enabled on the account; if provisioning fails,
 the token card shows why and migrations still work — only audit upload is
 skipped.
+
+The bucket is created in the **appliance's own region** by default (so a
+Singapore appliance gets a Singapore bucket). Override with the
+`-obj-region <region>` flag if you want it elsewhere. If a bucket ended up in
+the wrong region, use **Re-create audit bucket** on the token card to provision
+it again in the current region (then delete the stray bucket in Cloud Manager).
 
 > The launched instance's own OS boot console isn't available through the Linode
 > API, so the per-migration log captures the instance's **status transitions**
