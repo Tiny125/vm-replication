@@ -738,20 +738,20 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	canceled := func() bool { return ctx.Err() != nil }
 	sctx := s.ctx // store writes survive a Stop (which owns its own transition)
 
-	// 0) Quiesce for a crash-consistent cutover: ask each disk's agent
-	//    for one final point-in-time snapshot pass so the image we clone reflects a
-	//    single instant and boots cleanly, then stop the receivers. "Skip snapshot"
-	//    is honoured ONLY when the source agent is no longer checked in — i.e. the
-	//    source is actually powered off, so the replicated data is already a
-	//    consistent point-in-time. If the agent is still active the source OS is
-	//    live and writing (journald, etc.), so a block copy without a snapshot would
-	//    be a torn, unbootable image — take the snapshot regardless of the flag.
-	if req.SkipSnapshot && !s.sourceAgentActive(m) {
-		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: skipping the point-in-time snapshot — the source agent is not checked in (the source appears powered off), so the current replicated data is already consistent")
+	// 0) Quiesce for a crash-consistent cutover: ask each disk's agent for one
+	//    final point-in-time snapshot pass so the cloned image reflects a single
+	//    instant and boots cleanly, then stop the receivers.
+	//
+	//    "Skip snapshot" is the operator's explicit promise that the replicated data
+	//    is ALREADY consistent — the source is powered off, or its root filesystem
+	//    has been quiesced (e.g. `mount -o remount,ro /`). We honour it as given.
+	//    Note: the automatic snapshot only works when the source root is on LVM; a
+	//    plain whole-disk source (a typical cloud image) has no point-in-time
+	//    mechanism, so quiesceForCutover will warn and proceed on live data. For such
+	//    sources, quiesce the source first and use skip — see docs/CUTOVER.md.
+	if req.SkipSnapshot {
+		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: skipping the point-in-time snapshot at the operator's request — the source is reported powered off or quiesced, so the current replicated data is treated as consistent. (If the source was still running and writing, the image may be inconsistent.)")
 	} else {
-		if req.SkipSnapshot {
-			_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: 'skip snapshot' was requested, but the source agent is still active — the source OS is running and writing to disk, so copying without a snapshot would yield an inconsistent, unbootable image. Taking a crash-consistent snapshot anyway. (To genuinely skip, power the source off first.)")
-		}
 		s.quiesceForCutover(ctx, m)
 	}
 	if canceled() {
@@ -1204,20 +1204,47 @@ func (s *Server) cleanupCutoverArtifacts(ctx context.Context, m api.Migration) {
 			continue
 		}
 		_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("removing previous cutover volume %d (disk %d) before retrying", vid, d.Index))
-		_ = cl.DetachVolume(ctx, vid)
-		var derr error
-		for i := 0; i < 10; i++ {
-			if derr = cl.DeleteVolume(ctx, vid); derr == nil {
-				break
-			}
-			time.Sleep(2 * time.Second)
-		}
-		if derr != nil {
-			_ = s.st.AddEvent(ctx, m.ID, "warn", fmt.Sprintf("could not delete previous cutover volume %d: %v", vid, derr))
+		if err := s.detachAndDeleteVolume(ctx, cl, vid); err != nil {
+			_ = s.st.AddEvent(ctx, m.ID, "warn", fmt.Sprintf("could not delete previous cutover volume %d (detach it and delete in Cloud Manager, or the next clone may fail on a duplicate label): %v", vid, err))
 		}
 		_ = s.st.SetDiskArtifact(ctx, d.ID, "")
 	}
 	_ = s.st.SetMigrationImage(ctx, m.ID, "", 0)
+}
+
+// detachAndDeleteVolume detaches a volume and waits for the detach to actually
+// complete before deleting it. Detach is asynchronous on Linode: deleting while
+// the volume is still attached (e.g. right after deleting the instance it was on)
+// fails with "must be detached", which then leaves the stale clone in place and
+// makes the next clone fail with "Label must be unique". Poll until the volume is
+// no longer attached to any Linode, then delete (with retries).
+func (s *Server) detachAndDeleteVolume(ctx context.Context, cl *linode.Client, vid int64) error {
+	_ = cl.DetachVolume(ctx, vid)
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		v, err := cl.GetVolume(ctx, vid)
+		if err != nil {
+			break // gone (404) or unreachable — fall through to delete, which no-ops if absent
+		}
+		if v.LinodeID == 0 && v.Status == "active" {
+			break // fully detached
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
+	var derr error
+	for i := 0; i < 10; i++ {
+		if derr = cl.DeleteVolume(ctx, vid); derr == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return derr
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return derr
 }
 
 // artifactVolumeID parses "volume:<id>" → id (0 if not a volume artifact).
@@ -1241,18 +1268,6 @@ func cutoverVolumeLabel(name string, idx, total int) string {
 		suffix = fmt.Sprintf("-cutover-%d", idx)
 	}
 	return fitLabel("", sanitizeLabel(name), suffix)
-}
-
-// sourceAgentActive reports whether any disk's agent has checked in recently —
-// i.e. the source OS is still running. Used to decide whether "skip snapshot" is
-// safe: it only is when the source is actually powered off (no recent check-in).
-func (s *Server) sourceAgentActive(m api.Migration) bool {
-	for _, d := range m.Disks {
-		if !d.AgentLastSeen.IsZero() && time.Since(d.AgentLastSeen) < 3*time.Minute {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Server) fail(id int64, msg string) {
