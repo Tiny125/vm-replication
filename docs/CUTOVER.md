@@ -152,6 +152,15 @@ When you're ready and lag is small:
    > `remount,ro` reports the device is busy, stop more services or do it from
    > single-user mode. Alternatively, power the source off and use skip-snapshot —
    > but then no further delta sync is possible.)
+   >
+   > **Console: Guided shutdown (recommended for non-LVM sources).** In the cutover
+   > dialog, tick **"Guided shutdown"**. Phase 1 quiesces the source for you (the
+   > agent remounts its root read-only for one consistent pass), then the migration
+   > **pauses** in state `awaiting_cutover`. Power off the source, then click
+   > **Complete cutover** to convert, clone and launch. This needs the up-to-date
+   > agent, so **re-enroll the source** (re-run the install one-liner) after
+   > upgrading the appliance — older agents lack the `-cutover-quiesce` capability
+   > and the quiesce will time out.
 2. **Final delta sync.** Run the agent once more so the target is fully current.
 3. **Stop the receiver** on the Linode (Ctrl-C) so the disk is idle.
 4. **Convert the disk to boot on Linode** (still in Rescue Mode):

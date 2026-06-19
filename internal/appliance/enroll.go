@@ -48,7 +48,7 @@ func (s *Server) handleAgentInstaller(w http.ResponseWriter, r *http.Request) {
 		// would never complete.
 		manifest := fmt.Sprintf("/var/lib/vmrepl-source-mig%d-disk%d.cbt", m.ID, d.Index)
 		fmt.Fprintf(&checks, "[ -e %q ] || { echo \"source device %s not found — re-check the device in the console\"; exit 1; }\n", d.SourceDevice, d.SourceDevice)
-		fmt.Fprintf(&execs, "ExecStart=$BIN -device %s -target %s -server-name $SERVER_NAME -manifest %s -cert $ETC/agent.crt -key $ETC/agent.key -ca $ETC/ca.crt\n",
+		fmt.Fprintf(&execs, "ExecStart=$BIN -device %s -target %s -server-name $SERVER_NAME -manifest %s -cert $ETC/agent.crt -key $ETC/agent.key -ca $ETC/ca.crt -cutover-quiesce=remountro\n",
 			d.SourceDevice, target, manifest)
 	}
 

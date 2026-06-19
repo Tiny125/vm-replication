@@ -55,6 +55,9 @@ func main() {
 		preHook  = flag.String("pre-hook", "", "command to quiesce the app before snapshot (e.g. DB flush)")
 		postHook = flag.String("post-hook", "", "command to resume the app after snapshot")
 		lvSize   = flag.String("lvm-snapshot-size", "5G", "size of the LVM snapshot when --snapshot=lvm")
+		// At cutover, when the source has no LVM, optionally remount the root
+		// read-only for one consistent pass (the source is being decommissioned).
+		cutoverQuiesce = flag.String("cutover-quiesce", "none", "how to make the final cutover read consistent on a non-LVM source: none|remountro")
 
 		// Change-block tracking backend (see internal/cbt).
 		cbtMode       = flag.String("cbt", "hashdiff", "change tracking: hashdiff (rescan+hash) | dmera (device-mapper era)")
@@ -78,20 +81,21 @@ func main() {
 	}
 
 	c := cfg{
-		device:     *device,
-		target:     *target,
-		serverName: sni,
-		manifest:   *manifest,
-		jobID:      *jobID,
-		blockSize:  *blockSize,
-		full:       *full,
-		compress:   *compress,
-		tls:        transport.Files{CertFile: *certFile, KeyFile: *keyFile, CAFile: *caFile},
-		snapMode:   *snapMode,
-		preHook:    *preHook,
-		postHook:   *postHook,
-		lvSize:     *lvSize,
-		cbtMode:    *cbtMode,
+		device:         *device,
+		target:         *target,
+		serverName:     sni,
+		manifest:       *manifest,
+		jobID:          *jobID,
+		blockSize:      *blockSize,
+		full:           *full,
+		compress:       *compress,
+		tls:            transport.Files{CertFile: *certFile, KeyFile: *keyFile, CAFile: *caFile},
+		snapMode:       *snapMode,
+		cutoverQuiesce: *cutoverQuiesce,
+		preHook:        *preHook,
+		postHook:       *postHook,
+		lvSize:         *lvSize,
+		cbtMode:        *cbtMode,
 		dmera: dmeraCfg{
 			name:        *dmeraName,
 			meta:        *dmeraMeta,
@@ -117,6 +121,7 @@ type cfg struct {
 	tls                                         transport.Files
 	snapMode, preHook, postHook, lvSize         string
 	cbtMode                                     string
+	cutoverQuiesce                              string
 	dmera                                       dmeraCfg
 }
 
@@ -150,6 +155,15 @@ func run(c cfg) (syncResult, error) {
 	}
 	cmode := chooseMode(c, true)
 	if cmode == snapshot.ModeNone {
+		// No LVM. If the operator opted into remount-ro quiesce (cutover of a source
+		// that will be powered off), do one consistent read with the root remounted
+		// read-only; otherwise replicate live and let the appliance proceed on the
+		// current data (with a warning).
+		if c.cutoverQuiesce == string(snapshot.ModeRemountRO) {
+			log.Printf("agent: crash-consistent snapshot requested and no LVM — remounting the source filesystem read-only for one consistent cutover pass")
+			res, _, err = replicate(c, snapshot.ModeRemountRO, false)
+			return res, err
+		}
 		log.Printf("agent: crash-consistent snapshot requested, but the source has no LVM snapshot capability — replicating live without freezing (the appliance proceeds on the current data). Put the source root on LVM, or quiesce it at cutover, for a clean point-in-time image.")
 		res, _, err = replicate(c, mode, false)
 		return res, err
@@ -169,7 +183,7 @@ func replicate(c cfg, mode snapshot.Mode, mayBail bool) (_ syncResult, resync bo
 
 	// Establish the read source for this pass. The returned readPath is what we
 	// actually replicate from; cleanup releases it (snapshot/freeze).
-	passConsistent := mode == snapshot.ModeLVM
+	passConsistent := mode == snapshot.ModeLVM || mode == snapshot.ModeRemountRO
 	readPath, rawCleanup, err := prepareSource(c, mode)
 	if err != nil {
 		return res, false, fmt.Errorf("prepare source consistency: %w", err)

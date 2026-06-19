@@ -528,7 +528,7 @@ async function createMig(btn){
   finally{busy(btn,false)}
 }
 
-function stateClass(s){return ({created:'warn',awaiting_agent:'warn',replicating:'warn',ready:'ok',migrating:'warn',image_ready:'ok',launched:'ok',failed:'bad'})[s]||'muted'}
+function stateClass(s){return ({created:'warn',awaiting_agent:'warn',replicating:'warn',ready:'ok',awaiting_cutover:'warn',migrating:'warn',image_ready:'ok',launched:'ok',failed:'bad'})[s]||'muted'}
 function disks(m){return m.disks||[]}
 function allDone(m){const d=disks(m);return d.length>0&&d.every(x=>x.full_sync_done)}
 function bytesTotal(m){return disks(m).reduce((a,d)=>a+(d.bytes_on_wire||0),0)}
@@ -540,7 +540,7 @@ async function startMig(id,btn){
   const planNote=meta.linode_type?(' on plan <b>'+esc(meta.linode_type)+'</b>'):'';
   const warn='<div class="warn" style="margin-bottom:8px">After cutover the source agent <b>stops replicating</b> — the migrated copy is frozen at this point.</div>';
   const access='<div class="muted" style="font-size:12px;margin-top:10px">Migrated disks keep the <b>source</b>’s logins, and cloud images usually leave root locked — so set a root password (and/or SSH key) below to reach the new instance via the Lish console without rescue mode.</div>';
-  const snapNote='<div class="muted" style="font-size:12px;margin-top:8px">Leave the snapshot box checked if you’ve <b>stopped the source’s apps/databases</b> — the replicated data is then already consistent and cutover is immediate. Uncheck it to instead ask the still-connected agent for a crash-consistent point-in-time snapshot first (can take several minutes).</div>';
+  const snapNote='<div class="muted" style="font-size:12px;margin-top:8px">Leave the snapshot box checked if you’ve <b>stopped the source’s apps/databases</b> — the replicated data is then already consistent and cutover is immediate. Uncheck it to instead ask the still-connected agent for a crash-consistent point-in-time snapshot first (can take several minutes). <b>Guided shutdown</b> quiesces the source for you (remount root read-only) and then waits while you power it off — best for a plain (non-LVM) source that can’t be auto-snapshotted; it overrides the snapshot box.</div>';
   const opts={
     title:'Cut over migration #'+id+'?',
     okText:'Cut over',
@@ -548,7 +548,10 @@ async function startMig(id,btn){
       {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
       {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
     ],
-    checkboxes:[{id:'skip_snap',label:'Source apps/databases are already stopped — cut over from the current data (no snapshot).',checked:true}]
+    checkboxes:[
+      {id:'skip_snap',label:'Source apps/databases are already stopped — cut over from the current data (no snapshot).',checked:true},
+      {id:'guided',label:'Guided shutdown: capture a consistent image (quiescing the source), then PAUSE so I can power off the source before completing. Recommended for non-LVM sources.',checked:false}
+    ]
   };
   if(disk){
     // Local-disk boot always launches a new instance and keeps no volume.
@@ -562,8 +565,12 @@ async function startMig(id,btn){
   const r=await confirmModal(opts);
   if(!r)return;
   busy(btn,true);
-  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:disk?true:r.launch,root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:r.skip_snap});await refreshMig(id)}
+  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:disk?true:r.launch,root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:r.guided?false:r.skip_snap,guided_shutdown:r.guided});await refreshMig(id)}
   catch(e){alertModal({title:'Cannot cut over',html:esc(e.message),danger:true})}finally{busy(btn,false)}
+}
+async function completeCutover(id,btn){
+  if(!await confirmModal({title:'Complete cutover #'+id+'?',html:'The consistent image is already captured. Make sure the source is <b>powered off</b>, then this converts the boot disk, clones every disk, and launches. This is the final step.',okText:'Complete cutover'}))return;
+  busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/complete',{});await refreshMig(id)}catch(e){alertModal({title:'Cannot complete',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function stopMig(id,btn){
   if(!await confirmModal({title:'Stop cutover #'+id+'?',html:'The finalize run is cancelled and replication resumes.',okText:'Stop cutover',okDanger:true}))return;
@@ -688,6 +695,7 @@ function progressLine(v,m){
   if(st==='image_ready'||st==='launched'){label='completed in '+fmtDur(v.elapsed_seconds);bar=progBar(100,false);}
   else if(st==='failed'){label='failed';bar=progBar(0,false);}
   else if(st==='migrating'){label='finalizing · running '+liveDur(m.migrate_started,v.elapsed_seconds);bar=progBar(0,true);}
+  else if(st==='awaiting_cutover'){label='consistent image captured — power off the source, then Complete cutover';bar=progBar(100,false);}
   else{
     const allBase=disks(m).length>0&&disks(m).every(d=>d.full_sync_done);
     if(allBase){label='initial sync completed · 100%';bar=progBar(100,false);}
@@ -731,12 +739,13 @@ function diskTable(m){const d=disks(m);if(!d.length)return '';
   return h+'</table>';
 }
 function infoIcon(tip){return '<span class="info" data-tip="'+esc(tip)+'">i</span>'}
-function stateLabel(s){return ({created:'created',awaiting_agent:'waiting for agent',replicating:'replicating',ready:'ready to cut over',migrating:'finalizing',image_ready:'image ready',launched:'launched',failed:'failed'})[s]||s}
+function stateLabel(s){return ({created:'created',awaiting_agent:'waiting for agent',replicating:'replicating',ready:'ready to cut over',awaiting_cutover:'power off source, then complete',migrating:'finalizing',image_ready:'image ready',launched:'launched',failed:'failed'})[s]||s}
 // statusLegend renders a hover legend that shows each status as its ACTUAL
 // colored pill (so you can match what you see in the table to its meaning).
 const STATE_DESCS=[['awaiting_agent','enrolled; the agent has not connected yet'],
   ['replicating','agent connected; copying the baseline, then ongoing changes'],
   ['ready','baseline done and lag is low — safe to cut over'],
+  ['awaiting_cutover','guided cutover: consistent image captured — power off the source, then Complete cutover'],
   ['migrating','converting the boot disk and cloning volumes'],
   ['image_ready','image volume(s) ready to launch'],
   ['launched','a new Linode was launched from the image'],
@@ -860,6 +869,11 @@ function migCard(v){
     b+='<button class="primary done" onclick="completeMig('+m.id+')">✓ Migration complete — remove source agent</button>';
   }else if(m.state==='migrating'){
     b+='<button class="danger" onclick="stopMig('+m.id+',this)">Stop</button>';
+  }else if(m.state==='awaiting_cutover'){
+    // Guided cutover: phase 1 done, paused for the operator to power off the source.
+    b+='<button class="primary" onclick="completeCutover('+m.id+',this)">Complete cutover</button>'+
+      infoIcon('A consistent point-in-time image has been captured and frozen. Power off the source server, then click to convert, clone and launch. This is the final step.')+
+      '<button class="danger" onclick="stopMig('+m.id+',this)">Cancel</button>';
   }else if(m.state==='failed' && allDone(m)){
     // A cutover failed but the data is fully replicated — retry re-runs it.
     b+='<button class="primary" onclick="startMig('+m.id+',this)">Retry cutover</button>'+
