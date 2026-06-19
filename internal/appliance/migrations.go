@@ -740,12 +740,18 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 
 	// 0) Quiesce for a crash-consistent cutover: ask each disk's agent
 	//    for one final point-in-time snapshot pass so the image we clone reflects a
-	//    single instant and boots cleanly, then stop the receivers. Skipped when
-	//    the operator has already stopped the source's apps/databases (the common
-	//    path) — the data is then already consistent and we avoid the long wait.
-	if req.SkipSnapshot {
-		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: skipping the point-in-time snapshot — the source's apps/databases are reported stopped, so the current replicated data is already consistent")
+	//    single instant and boots cleanly, then stop the receivers. "Skip snapshot"
+	//    is honoured ONLY when the source agent is no longer checked in — i.e. the
+	//    source is actually powered off, so the replicated data is already a
+	//    consistent point-in-time. If the agent is still active the source OS is
+	//    live and writing (journald, etc.), so a block copy without a snapshot would
+	//    be a torn, unbootable image — take the snapshot regardless of the flag.
+	if req.SkipSnapshot && !s.sourceAgentActive(m) {
+		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: skipping the point-in-time snapshot — the source agent is not checked in (the source appears powered off), so the current replicated data is already consistent")
 	} else {
+		if req.SkipSnapshot {
+			_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: 'skip snapshot' was requested, but the source agent is still active — the source OS is running and writing to disk, so copying without a snapshot would yield an inconsistent, unbootable image. Taking a crash-consistent snapshot anyway. (To genuinely skip, power the source off first.)")
+		}
 		s.quiesceForCutover(ctx, m)
 	}
 	if canceled() {
@@ -765,6 +771,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	//    (via "vmrepl-layout:") when the disk is a partitionless whole-disk root,
 	//    which must boot via a Linode-supplied kernel instead.
 	kernel, rootDevice := "linode/grub2", "/dev/sda"
+	convertFailed := false
 	if s.cfg.ConvertScript != "" && isBlockDevice(bootDevice) {
 		log.Printf("appliance: migration %d: machine conversion on boot disk %s", m.ID, bootDevice)
 		// machine-convert.sh requires bash (set -o pipefail, etc). Run it under
@@ -819,6 +826,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 			rootDevice = rd
 		}
 		if err != nil {
+			convertFailed = true
 			log.Printf("appliance: migration %d: machine-convert failed (continuing best-effort): %v\n%s", m.ID, err, trimOut(out))
 			_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish, so the launched instance may not boot. Most often the replicated filesystem is inconsistent because the source kept changing during the copy — the reliable fix is a fresh full sync of a quiesced/idle source, then cut over again. The image volume is still created so you can also repair it manually in Rescue Mode (see docs/TROUBLESHOOTING.md). Detail: "+oneLine(trimOut(out)))
 		} else {
@@ -856,6 +864,17 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	// streams the image onto the instance's local disk. Steady-state replication
 	// and the boot conversion above are identical.
 	if m.BootTarget == api.BootTargetDisk {
+		// Disk-boot streams the converted image onto the instance's local disk and
+		// boots from it. If the conversion failed (e.g. the root filesystem couldn't
+		// be located because the replicated copy is inconsistent), proceeding would
+		// boot an unconverted image — which drops to a grub> prompt and then hangs
+		// the cutover for an hour waiting for a power-off that never comes. Abort
+		// with a clear, actionable error instead. (The replication volume is left
+		// intact for manual inspection in Rescue Mode.)
+		if convertFailed {
+			s.fail(m.ID, "boot disk conversion failed, so the local-disk image would not boot (you'd see a grub> prompt and a stuck cutover). This almost always means the replicated filesystem is inconsistent — retry the cutover and let it take the crash-consistent snapshot (do not skip it; power the source off if you want to skip). See the conversion detail above for the fsck output.")
+			return
+		}
 		s.finalizeDisk(ctx, m, cl, kernel, rootDevice)
 		return
 	}
@@ -1222,6 +1241,18 @@ func cutoverVolumeLabel(name string, idx, total int) string {
 		suffix = fmt.Sprintf("-cutover-%d", idx)
 	}
 	return fitLabel("", sanitizeLabel(name), suffix)
+}
+
+// sourceAgentActive reports whether any disk's agent has checked in recently —
+// i.e. the source OS is still running. Used to decide whether "skip snapshot" is
+// safe: it only is when the source is actually powered off (no recent check-in).
+func (s *Server) sourceAgentActive(m api.Migration) bool {
+	for _, d := range m.Disks {
+		if !d.AgentLastSeen.IsZero() && time.Since(d.AgentLastSeen) < 3*time.Minute {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) fail(id int64, msg string) {
