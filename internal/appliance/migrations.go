@@ -789,12 +789,18 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 			// (Linode reserves a sliver), so a 1:1 whole-disk copy of an image that
 			// equals the plan size won't fit. Tell convert to shrink a whole-disk
 			// ext filesystem to the plan disk minus a safety margin so it fits.
+			shrinkReq := false
 			if cl, ok := s.linodeClient(sctx); ok {
 				if types, terr := cl.ListTypes(sctx); terr == nil {
 					if mb := linode.TypeDiskMB(types, m.LinodeType); mb > 256 {
 						cmd.Env = append(cmd.Env, fmt.Sprintf("VMREPL_SHRINK_MB=%d", mb-128))
+						shrinkReq = true
+						_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: requesting whole-disk ext shrink to %d MiB so the image fits the %s local disk (%d MiB)", mb-128, m.LinodeType, mb))
 					}
 				}
+			}
+			if !shrinkReq {
+				_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: could not determine the plan's local disk size, so the image filesystem will not be shrunk — if the copy reports it does not fit, retry once the appliance can reach the Linode API, or use a larger plan")
 			}
 		}
 		out, err := cmd.CombinedOutput()
@@ -819,6 +825,19 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("boot disk converted for Linode (virtio, network); boot kernel %s root %s", kernel, rootDevice))
 			if access := accessSeededNote(req); access != "" {
 				_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: "+access+" — you can log in to the launched instance without rescue mode")
+			}
+			// Surface what the shrink step did (or didn't do) — otherwise a skipped or
+			// failed shrink is invisible until the in-guest copy reports "does not fit".
+			if m.BootTarget == api.BootTargetDisk {
+				if sr := convertField(string(out), "vmrepl-shrink:"); sr != "" {
+					lvl := "info"
+					if strings.Contains(sr, "failed") || strings.Contains(sr, "skipped") {
+						lvl = "warn"
+					}
+					_ = s.st.AddEvent(sctx, m.ID, lvl, "cutover: filesystem shrink "+sr)
+				} else {
+					_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: convert did not report a filesystem-shrink result (the shrink step did not run); if the copy reports it does not fit, the running appliance may predate the shrink fix — restart applianced after deploying, then retry")
+				}
 			}
 		}
 	} else {

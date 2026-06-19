@@ -520,27 +520,50 @@ devmib=$(( $(blockdev --getsize64 "$DEV" 2>/dev/null || echo 0) / 1048576 ))
 if [ -n "${VMREPL_SHRINK_MB:-}" ] && [ "$PARTITIONED" -eq 0 ] && [ "$VMREPL_SHRINK_MB" -lt "$devmib" ]; then
   # Only shrink when the target (plan disk minus margin) is smaller than the source
   # device; a larger target needs no shrink (the copy does a full dd instead).
+  #
+  # resize2fs REFUSES to shrink a mounted filesystem, so $DEV must be fully
+  # unmounted first. Unmount the chroot binds NON-lazily (a lazy `umount -l` returns
+  # before the mount is released and leaves $MNT busy, so the subsequent root
+  # unmount fails and the volume stays mounted — the shrink then silently fails),
+  # then unmount the root, retrying until $DEV really is gone from the mount table.
   for m in dev/pts dev proc sys run boot; do
-    mountpoint -q "$MNT/$m" && umount -l "$MNT/$m" 2>/dev/null || true
+    umount "$MNT/$m" 2>/dev/null || umount -l "$MNT/$m" 2>/dev/null || true
   done
-  umount "$MNT" 2>/dev/null || true
-  fstype="$(blkid -s TYPE -o value "$DEV" 2>/dev/null || true)"
-  case "$fstype" in
-    ext2|ext3|ext4)
-      log "Shrinking $fstype on $DEV to ${VMREPL_SHRINK_MB}MiB so it fits the smaller local disk"
-      rc=0; e2fsck -fy "$DEV" >/dev/null 2>&1 || rc=$?
-      if [ "$rc" -ge 4 ]; then
-        log "e2fsck could not clean $DEV (rc=$rc); skipping shrink"
-        echo "vmrepl-shrink: failed e2fsck"
-      elif resize2fs "$DEV" "${VMREPL_SHRINK_MB}M" 2>&1 | sed 's/^/   [resize2fs] /'; then
-        echo "vmrepl-shrink: ok ${VMREPL_SHRINK_MB}M"
-      else
-        echo "vmrepl-shrink: failed resize2fs"
-      fi ;;
-    *)
-      log "filesystem on $DEV is ${fstype:-unknown}, not ext — cannot shrink to fit a smaller local disk"
-      echo "vmrepl-shrink: skipped ${fstype:-unknown}" ;;
-  esac
+  sync
+  for _try in 1 2 3 4 5; do
+    mountpoint -q "$MNT" || break
+    umount "$MNT" 2>/dev/null || umount "$DEV" 2>/dev/null || true
+    sleep 1
+  done
+  if mountpoint -q "$MNT"; then
+    log "could not unmount $DEV to shrink it (still busy); skipping shrink"
+    echo "vmrepl-shrink: failed unmount"
+  else
+    fstype="$(blkid -s TYPE -o value "$DEV" 2>/dev/null || true)"
+    case "$fstype" in
+      ext2|ext3|ext4)
+        log "Shrinking $fstype on $DEV to ${VMREPL_SHRINK_MB}MiB so it fits the smaller local disk"
+        rc=0; e2fsck -fy "$DEV" >/dev/null 2>&1 || rc=$?
+        if [ "$rc" -ge 4 ]; then
+          log "e2fsck could not clean $DEV (rc=$rc); skipping shrink"
+          echo "vmrepl-shrink: failed e2fsck rc=$rc"
+        else
+          rout="$(resize2fs "$DEV" "${VMREPL_SHRINK_MB}M" 2>&1)"; rrc=$?
+          echo "$rout" | sed 's/^/   [resize2fs] /'
+          # Flush so the (subsequent) volume clone captures the shrunk filesystem,
+          # not stale cached blocks from before the resize.
+          sync; blockdev --flushbufs "$DEV" 2>/dev/null || true
+          if [ "$rrc" -eq 0 ]; then
+            echo "vmrepl-shrink: ok ${VMREPL_SHRINK_MB}M"
+          else
+            echo "vmrepl-shrink: failed resize2fs rc=$rrc $(echo "$rout" | tr '\n' ' ' | tail -c 160)"
+          fi
+        fi ;;
+      *)
+        log "filesystem on $DEV is ${fstype:-unknown}, not ext — cannot shrink to fit a smaller local disk"
+        echo "vmrepl-shrink: skipped ${fstype:-unknown}" ;;
+    esac
+  fi
 fi
 log "Conversion done. Next: in the Linode API/UI, create a config profile that"
 log "boots this disk (Kernel = GRUB 2, or Direct Disk) with the raw disk as sda,"
