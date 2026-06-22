@@ -87,6 +87,13 @@ type Hello struct {
 	// instant rather than a multi-minute "smear". The receiver uses this at
 	// cutover to know it has captured a launchable, crash-consistent image.
 	Consistent bool `json:"consistent,omitempty"`
+	// QuiesceError, when non-empty, means this is NOT a data session: the agent
+	// tried to capture a crash-consistent image for cutover and couldn't (e.g. the
+	// source root could not be remounted read-only because apps are still writing).
+	// It carries the reason (and any blocking processes) so the appliance can fail
+	// the cutover fast with an actionable message instead of waiting out its timeout.
+	// The receiver skips Validate / data apply for such a Hello.
+	QuiesceError string `json:"quiesce_error,omitempty"`
 }
 
 // HelloAck is the receiver's response to Hello.

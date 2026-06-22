@@ -92,6 +92,16 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 	dev0 := d.SourceDevice
 	go func() {
 		err := receiver.Serve(ctx, ln, device, manifest, false, func(st receiver.Stats) {
+			// Quiesce-failure report (not a data session): the agent tried and could
+			// not capture a consistent image for cutover. Record it so quiesceForCutover
+			// fails fast with the agent's actual reason instead of waiting out its timeout.
+			if st.Hello.QuiesceError != "" {
+				if s.wantDiskConsistency(diskID) {
+					s.markDiskQuiesceFailed(diskID, st.Hello.QuiesceError)
+					_ = s.st.AddEvent(s.ctx, migID, "warn", fmt.Sprintf("disk %d (%s): the source could not be quiesced for a consistent cutover — %s", diskIdx, dev0, st.Hello.QuiesceError))
+				}
+				return
+			}
 			total := blockdiff.NumBlocks(st.Hello.DeviceSize, st.Hello.BlockSize)
 			bytes := st.BlocksWritten * int64(st.Hello.BlockSize)
 			wasBaselined := false
@@ -145,6 +155,7 @@ func (s *Server) requestDiskConsistency(diskID int64) {
 	s.recMu.Lock()
 	s.consistReq[diskID] = true
 	s.consistDone[diskID] = false
+	delete(s.quiesceErr, diskID) // a fresh request clears any prior failure report
 	s.recMu.Unlock()
 }
 
@@ -172,12 +183,29 @@ func (s *Server) diskConsistencyDone(diskID int64) bool {
 	return s.consistDone[diskID]
 }
 
+// markDiskQuiesceFailed records that a disk's agent reported it could not capture a
+// consistent image for cutover (with the reason), so the wait can stop immediately.
+func (s *Server) markDiskQuiesceFailed(diskID int64, reason string) {
+	s.recMu.Lock()
+	s.quiesceErr[diskID] = reason
+	s.recMu.Unlock()
+}
+
+// diskQuiesceFailed returns the reported quiesce-failure reason for a disk, if any.
+func (s *Server) diskQuiesceFailed(diskID int64) (string, bool) {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	r, ok := s.quiesceErr[diskID]
+	return r, ok
+}
+
 // clearConsistency forgets all consistency state for a migration's disks.
 func (s *Server) clearConsistency(m api.Migration) {
 	s.recMu.Lock()
 	for _, d := range m.Disks {
 		delete(s.consistReq, d.ID)
 		delete(s.consistDone, d.ID)
+		delete(s.quiesceErr, d.ID)
 	}
 	s.recMu.Unlock()
 }
@@ -215,6 +243,14 @@ func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) bool {
 	for {
 		if ctx.Err() != nil {
 			return false
+		}
+		// Fail fast if any agent has actively reported it cannot quiesce — no point
+		// waiting out the timeout when we already know a consistent image won't come.
+		for _, d := range m.Disks {
+			if reason, failed := s.diskQuiesceFailed(d.ID); failed {
+				_ = s.st.AddEvent(s.ctx, m.ID, "warn", "cutover: the source reported it cannot be quiesced for a consistent image ("+reason+"). Stop the source's apps/services so its root can be remounted read-only, then start the cutover again.")
+				return false
+			}
 		}
 		allDone := true
 		for _, d := range m.Disks {

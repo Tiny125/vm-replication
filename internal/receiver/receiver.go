@@ -107,6 +107,17 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress,
 	if err := json.Unmarshal(payload, &hello); err != nil {
 		return Stats{}, fmt.Errorf("decode hello: %w", err)
 	}
+	// Quiesce-failure report: not a data session. The agent couldn't capture a
+	// crash-consistent image (e.g. the root could not be remounted read-only) and is
+	// telling us so the appliance can fail the cutover fast. It carries no valid
+	// device geometry, so ack and return BEFORE Validate / the consistency bounce /
+	// any device write — surfaced to the caller via onComplete(Stats{Hello}).
+	if hello.QuiesceError != "" {
+		log.Printf("receiver: agent %q reports it could not quiesce for cutover: %s", hello.SourceHostname, hello.QuiesceError)
+		_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, Message: "quiesce failure noted"})
+		_ = w.Flush()
+		return Stats{Hello: hello}, nil
+	}
 	// Validate before allocating/opening anything: a buggy or hostile (but
 	// authenticated) agent must not be able to crash or OOM the receiver.
 	if err := hello.Validate(); err != nil {
