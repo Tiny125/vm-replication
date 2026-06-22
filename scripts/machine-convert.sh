@@ -554,21 +554,39 @@ if [ -n "${VMREPL_SHRINK_MB:-}" ] && [ "$PARTITIONED" -eq 0 ] && [ "$VMREPL_SHRI
     fstype="$(blkid -s TYPE -o value "$DEV" 2>/dev/null || true)"
     case "$fstype" in
       ext2|ext3|ext4)
-        log "Shrinking $fstype on $DEV to ${VMREPL_SHRINK_MB}MiB so it fits the smaller local disk"
+        log "Shrinking $fstype on $DEV to fit the smaller local disk (target ${VMREPL_SHRINK_MB}MiB)"
         rc=0; e2fsck -fy "$DEV" >/dev/null 2>&1 || rc=$?
         if [ "$rc" -ge 4 ]; then
           log "e2fsck could not clean $DEV (rc=$rc); skipping shrink"
           echo "vmrepl-shrink: failed e2fsck rc=$rc"
         else
+          # Current filesystem size in MiB, read straight from the superblock.
+          fsmib() {
+            bc=$(tune2fs -l "$DEV" 2>/dev/null | awk -F: '/Block count/{gsub(/ /,"",$2);print $2}')
+            bz=$(tune2fs -l "$DEV" 2>/dev/null | awk -F: '/Block size/{gsub(/ /,"",$2);print $2}')
+            if [ -n "$bc" ] && [ -n "$bz" ]; then echo $(( bc * bz / 1048576 )); else echo 0; fi
+          }
           rout="$(resize2fs "$DEV" "${VMREPL_SHRINK_MB}M" 2>&1)"; rrc=$?
           echo "$rout" | sed 's/^/   [resize2fs] /'
+          cur=$(fsmib)
+          # Don't trust resize2fs's exit code alone: some images report success
+          # ("Nothing to do") without actually shrinking, which then fails the
+          # in-guest copy with "does not fit". If the filesystem is still larger
+          # than the target, force a minimize so the copy is guaranteed to fit; the
+          # first normal boot grows the root back to fill the whole local disk.
+          if [ "$rrc" -eq 0 ] && [ "${cur:-0}" -gt "$VMREPL_SHRINK_MB" ]; then
+            log "targeted shrink left the filesystem at ${cur}MiB (> ${VMREPL_SHRINK_MB}); minimizing instead"
+            rout="$(resize2fs -M "$DEV" 2>&1)"; rrc=$?
+            echo "$rout" | sed 's/^/   [resize2fs -M] /'
+            cur=$(fsmib)
+          fi
           # Flush so the (subsequent) volume clone captures the shrunk filesystem,
           # not stale cached blocks from before the resize.
           sync; blockdev --flushbufs "$DEV" 2>/dev/null || true
-          if [ "$rrc" -eq 0 ]; then
-            echo "vmrepl-shrink: ok ${VMREPL_SHRINK_MB}M"
+          if [ "$rrc" -eq 0 ] && [ "${cur:-0}" -gt 0 ] && [ "${cur:-0}" -le "$VMREPL_SHRINK_MB" ]; then
+            echo "vmrepl-shrink: ok ${cur}M"
           else
-            echo "vmrepl-shrink: failed resize2fs rc=$rrc $(echo "$rout" | tr '\n' ' ' | tail -c 160)"
+            echo "vmrepl-shrink: failed resize2fs rc=$rrc fs=${cur:-?}M $(echo "$rout" | tr '\n' ' ' | tail -c 140)"
           fi
         fi ;;
       *)
