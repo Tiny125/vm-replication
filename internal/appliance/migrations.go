@@ -193,7 +193,11 @@ const consistencyWait = 6 * time.Minute
 // single instant — the key to a clean boot. If no agent is checking in, or the
 // agents are an older build that ignores the request, it warns and proceeds
 // with the current data.
-func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) {
+// quiesceForCutover returns true only if every disk delivered a crash-consistent
+// pass (so the cloned image is a clean point-in-time). It returns false when there
+// is no agent to ask or the wait times out — the caller proceeds on the current
+// data, which may be inconsistent.
+func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) bool {
 	anyAgent := false
 	for _, d := range m.Disks {
 		if !d.AgentLastSeen.IsZero() && time.Since(d.AgentLastSeen) < 5*time.Minute {
@@ -203,14 +207,14 @@ func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) {
 	}
 	if !anyAgent {
 		_ = s.st.AddEvent(s.ctx, m.ID, "warn", "cutover: no source agent has checked in recently, so a fresh crash-consistent snapshot can't be taken; cloning the current replicated data as-is (it may be inconsistent if the source was changing)")
-		return
+		return false
 	}
 	_ = s.st.AddEvent(s.ctx, m.ID, "info", "cutover: quiescing the source for a crash-consistent point-in-time snapshot before launch — this can take a while (often several minutes, and longer for busy or large disks)")
 
 	deadline := time.Now().Add(consistencyWait)
 	for {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
 		allDone := true
 		for _, d := range m.Disks {
@@ -221,15 +225,15 @@ func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) {
 		}
 		if allDone {
 			_ = s.st.AddEvent(s.ctx, m.ID, "info", "cutover: crash-consistent snapshot captured on all disks; converting and cloning the point-in-time image")
-			return
+			return true
 		}
 		if time.Now().After(deadline) {
-			_ = s.st.AddEvent(s.ctx, m.ID, "warn", "cutover: timed out waiting for a crash-consistent snapshot from the source (the agent may be an older build, or offline); proceeding with the current replicated data, which may be inconsistent")
-			return
+			_ = s.st.AddEvent(s.ctx, m.ID, "warn", "cutover: timed out waiting for a crash-consistent snapshot from the source (the agent may be an older build, or offline, or the root could not be quiesced — stop the source's apps so its root can be remounted read-only); proceeding with the current replicated data, which may be inconsistent")
+			return false
 		}
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-time.After(3 * time.Second):
 		}
 	}
@@ -600,6 +604,44 @@ func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "migrating"})
 }
 
+// handleCompleteCutover runs phase 2 of a guided cutover: after the operator has
+// powered off the source, convert + clone + launch using the options captured in
+// phase 1. Only valid while the migration is paused in MigAwaitingCutover.
+func (s *Server) handleCompleteCutover(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	m, err := s.st.Migration(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	if m.State != api.MigAwaitingCutover {
+		writeErr(w, http.StatusConflict, "migration is not awaiting cutover completion")
+		return
+	}
+	s.recMu.Lock()
+	req, have := s.pendingCutover[id]
+	s.recMu.Unlock()
+	if !have {
+		// Lost across a restart — fall back to a fresh request body (or defaults).
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	if err := s.st.SetMigrationState(ctx, id, api.MigMigrating, ""); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.st.AddEvent(ctx, id, "info", "cutover: operator confirmed — completing (convert, clone, launch)")
+	finCtx, cancel := context.WithCancel(s.ctx)
+	s.recMu.Lock()
+	s.finalizes[id] = cancel
+	s.recMu.Unlock()
+	go s.finalizeComplete(finCtx, m, req)
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "migrating"})
+}
+
 // handleStopMigration cancels an in-flight finalize and resumes replication.
 func (s *Server) handleStopMigration(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
@@ -612,13 +654,14 @@ func (s *Server) handleStopMigration(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not found")
 		return
 	}
-	if m.State != api.MigMigrating {
+	if m.State != api.MigMigrating && m.State != api.MigAwaitingCutover {
 		writeErr(w, http.StatusConflict, "migration is not running")
 		return
 	}
 	s.recMu.Lock()
 	cancel := s.finalizes[id]
 	delete(s.finalizes, id)
+	delete(s.pendingCutover, id)
 	s.recMu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -738,21 +781,62 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	canceled := func() bool { return ctx.Err() != nil }
 	sctx := s.ctx // store writes survive a Stop (which owns its own transition)
 
-	// 0) Quiesce for a crash-consistent cutover: ask each disk's agent
-	//    for one final point-in-time snapshot pass so the image we clone reflects a
-	//    single instant and boots cleanly, then stop the receivers. Skipped when
-	//    the operator has already stopped the source's apps/databases (the common
-	//    path) — the data is then already consistent and we avoid the long wait.
+	// 0) Quiesce for a crash-consistent cutover: ask each disk's agent for one
+	//    final point-in-time snapshot pass so the cloned image reflects a single
+	//    instant and boots cleanly, then stop the receivers.
+	//
+	//    "Skip snapshot" is the operator's explicit promise that the replicated data
+	//    is ALREADY consistent — the source is powered off, or its root filesystem
+	//    has been quiesced (e.g. `mount -o remount,ro /`). We honour it as given.
+	//    Note: the automatic snapshot only works when the source root is on LVM; a
+	//    plain whole-disk source (a typical cloud image) has no point-in-time
+	//    mechanism, so quiesceForCutover will warn and proceed on live data. For such
+	//    sources, quiesce the source first and use skip — see docs/CUTOVER.md.
+	consistent := false
 	if req.SkipSnapshot {
-		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: skipping the point-in-time snapshot — the source's apps/databases are reported stopped, so the current replicated data is already consistent")
+		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: skipping the point-in-time snapshot at the operator's request — the source is reported powered off or quiesced, so the current replicated data is treated as consistent. (If the source was still running and writing, the image may be inconsistent.)")
+		consistent = true // operator's assertion
 	} else {
-		s.quiesceForCutover(ctx, m)
+		consistent = s.quiesceForCutover(ctx, m)
 	}
 	if canceled() {
 		return
 	}
 	s.stopReceivers(m)
 	s.clearConsistency(m)
+
+	if req.GuidedShutdown {
+		// Guided cutover: the point-in-time image is now frozen (receivers stopped).
+		// Pause for the operator to power the source off, then resume via /complete.
+		// Stash the request so phase 2 reuses the options.
+		s.recMu.Lock()
+		s.pendingCutover[m.ID] = req
+		s.recMu.Unlock()
+		_ = s.st.SetMigrationState(sctx, m.ID, api.MigAwaitingCutover, "")
+		if consistent {
+			_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: consistent point-in-time image captured and frozen. Now POWER OFF the source server (recommended — so the source and the migrated instance never run at once), then click \"Complete cutover\" to convert, clone and launch.")
+		} else {
+			_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: paused for shutdown, but a consistent snapshot was NOT captured (the source root could not be quiesced — most often apps are still writing to it). The image may be inconsistent and fail to boot. Recommended: Cancel, stop the source's apps, and cut over again. If you proceed, power off the source first.")
+		}
+		return
+	}
+	s.finalizeComplete(ctx, m, req)
+}
+
+// finalizeComplete is cutover phase 2: convert the boot disk, clone every disk
+// into launchable artifacts, and (for disk-boot) stream onto the local disk. It
+// runs inline after phase 1 for a normal cutover, or when the operator confirms a
+// guided cutover via /complete (after powering off the source). The consistent
+// image is already captured and the receivers are stopped by phase 1.
+func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.FinalizeRequest) {
+	defer func() {
+		s.recMu.Lock()
+		delete(s.finalizes, m.ID)
+		delete(s.pendingCutover, m.ID)
+		s.recMu.Unlock()
+	}()
+	canceled := func() bool { return ctx.Err() != nil }
+	sctx := s.ctx
 
 	boot := m.Disks[0]
 	bootDevice := s.diskDevicePath(m, boot)
@@ -765,6 +849,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	//    (via "vmrepl-layout:") when the disk is a partitionless whole-disk root,
 	//    which must boot via a Linode-supplied kernel instead.
 	kernel, rootDevice := "linode/grub2", "/dev/sda"
+	convertFailed := false
 	if s.cfg.ConvertScript != "" && isBlockDevice(bootDevice) {
 		log.Printf("appliance: migration %d: machine conversion on boot disk %s", m.ID, bootDevice)
 		// machine-convert.sh requires bash (set -o pipefail, etc). Run it under
@@ -819,6 +904,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 			rootDevice = rd
 		}
 		if err != nil {
+			convertFailed = true
 			log.Printf("appliance: migration %d: machine-convert failed (continuing best-effort): %v\n%s", m.ID, err, trimOut(out))
 			_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish, so the launched instance may not boot. Most often the replicated filesystem is inconsistent because the source kept changing during the copy — the reliable fix is a fresh full sync of a quiesced/idle source, then cut over again. The image volume is still created so you can also repair it manually in Rescue Mode (see docs/TROUBLESHOOTING.md). Detail: "+oneLine(trimOut(out)))
 		} else {
@@ -856,6 +942,17 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	// streams the image onto the instance's local disk. Steady-state replication
 	// and the boot conversion above are identical.
 	if m.BootTarget == api.BootTargetDisk {
+		// Disk-boot streams the converted image onto the instance's local disk and
+		// boots from it. If the conversion failed (e.g. the root filesystem couldn't
+		// be located because the replicated copy is inconsistent), proceeding would
+		// boot an unconverted image — which drops to a grub> prompt and then hangs
+		// the cutover for an hour waiting for a power-off that never comes. Abort
+		// with a clear, actionable error instead. (The replication volume is left
+		// intact for manual inspection in Rescue Mode.)
+		if convertFailed {
+			s.fail(m.ID, "boot disk conversion failed, so the local-disk image would not boot (you'd see a grub> prompt and a stuck cutover). This almost always means the replicated filesystem is inconsistent — retry the cutover and let it take the crash-consistent snapshot (do not skip it; power the source off if you want to skip). See the conversion detail above for the fsck output.")
+			return
+		}
 		s.finalizeDisk(ctx, m, cl, kernel, rootDevice)
 		return
 	}
@@ -1185,20 +1282,47 @@ func (s *Server) cleanupCutoverArtifacts(ctx context.Context, m api.Migration) {
 			continue
 		}
 		_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("removing previous cutover volume %d (disk %d) before retrying", vid, d.Index))
-		_ = cl.DetachVolume(ctx, vid)
-		var derr error
-		for i := 0; i < 10; i++ {
-			if derr = cl.DeleteVolume(ctx, vid); derr == nil {
-				break
-			}
-			time.Sleep(2 * time.Second)
-		}
-		if derr != nil {
-			_ = s.st.AddEvent(ctx, m.ID, "warn", fmt.Sprintf("could not delete previous cutover volume %d: %v", vid, derr))
+		if err := s.detachAndDeleteVolume(ctx, cl, vid); err != nil {
+			_ = s.st.AddEvent(ctx, m.ID, "warn", fmt.Sprintf("could not delete previous cutover volume %d (detach it and delete in Cloud Manager, or the next clone may fail on a duplicate label): %v", vid, err))
 		}
 		_ = s.st.SetDiskArtifact(ctx, d.ID, "")
 	}
 	_ = s.st.SetMigrationImage(ctx, m.ID, "", 0)
+}
+
+// detachAndDeleteVolume detaches a volume and waits for the detach to actually
+// complete before deleting it. Detach is asynchronous on Linode: deleting while
+// the volume is still attached (e.g. right after deleting the instance it was on)
+// fails with "must be detached", which then leaves the stale clone in place and
+// makes the next clone fail with "Label must be unique". Poll until the volume is
+// no longer attached to any Linode, then delete (with retries).
+func (s *Server) detachAndDeleteVolume(ctx context.Context, cl *linode.Client, vid int64) error {
+	_ = cl.DetachVolume(ctx, vid)
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		v, err := cl.GetVolume(ctx, vid)
+		if err != nil {
+			break // gone (404) or unreachable — fall through to delete, which no-ops if absent
+		}
+		if v.LinodeID == 0 && v.Status == "active" {
+			break // fully detached
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
+	var derr error
+	for i := 0; i < 10; i++ {
+		if derr = cl.DeleteVolume(ctx, vid); derr == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return derr
+		}
+		time.Sleep(3 * time.Second)
+	}
+	return derr
 }
 
 // artifactVolumeID parses "volume:<id>" → id (0 if not a volume artifact).

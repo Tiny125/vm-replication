@@ -62,8 +62,12 @@ type Server struct {
 	// such a crash-consistent sync.
 	consistReq  map[int64]bool
 	consistDone map[int64]bool
-	progress    sync.Map // migrationID -> *syncProgress
-	ctx         context.Context
+	// pendingCutover holds the FinalizeRequest from a guided cutover's phase 1 so
+	// the /complete endpoint (phase 2) can reuse the operator's options without
+	// re-prompting (keyed by migrationID, guarded by recMu).
+	pendingCutover map[int64]api.FinalizeRequest
+	progress       sync.Map // migrationID -> *syncProgress
+	ctx            context.Context
 
 	auditCh chan auditEntry // buffered audit entries -> DB (best-effort)
 }
@@ -88,12 +92,13 @@ func New(ctx context.Context, cfg Config) *Server {
 	}
 	s := &Server{
 		cfg: cfg, st: cfg.Store, mux: http.NewServeMux(),
-		receivers:   map[int64]context.CancelFunc{},
-		finalizes:   map[int64]context.CancelFunc{},
-		consistReq:  map[int64]bool{},
-		consistDone: map[int64]bool{},
-		ctx:         ctx,
-		auditCh:     make(chan auditEntry, 2048),
+		receivers:      map[int64]context.CancelFunc{},
+		finalizes:      map[int64]context.CancelFunc{},
+		consistReq:     map[int64]bool{},
+		consistDone:    map[int64]bool{},
+		pendingCutover: map[int64]api.FinalizeRequest{},
+		ctx:            ctx,
+		auditCh:        make(chan auditEntry, 2048),
 	}
 	go s.auditDrain()
 	go s.auditUploader()
@@ -122,6 +127,7 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/migrations/{id}/events", s.auth(s.handleMigrationEvents))
 	s.mux.Handle("DELETE /api/v1/migrations/{id}", s.auth(s.handleDeleteMigration))
 	s.mux.Handle("POST /api/v1/migrations/{id}/start", s.auth(s.handleStartMigration))
+	s.mux.Handle("POST /api/v1/migrations/{id}/complete", s.auth(s.handleCompleteCutover))
 	s.mux.Handle("POST /api/v1/migrations/{id}/stop", s.auth(s.handleStopMigration))
 	s.mux.Handle("POST /api/v1/diagnostics/connection", s.auth(s.handleConnTest))
 	s.mux.Handle("GET /api/v1/linode/plans", s.auth(s.handleLinodePlans))

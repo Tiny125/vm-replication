@@ -42,6 +42,12 @@ const (
 	ModeNone     Mode = "none"
 	ModeFsfreeze Mode = "fsfreeze"
 	ModeLVM      Mode = "lvm"
+	// ModeRemountRO remounts the source filesystem read-only for the read, giving a
+	// genuinely consistent (clean, not just crash-consistent) image without LVM.
+	// Used at cutover for non-LVM sources that are being decommissioned: writes are
+	// blocked for the duration, and cleanup remounts read-write again so an aborted
+	// cutover doesn't leave the source crippled.
+	ModeRemountRO Mode = "remountro"
 )
 
 // Options configures Prepare.
@@ -89,6 +95,8 @@ func Prepare(o Options) (readPath string, cleanup func(), err error) {
 		return o.Device, func() {}, nil
 	case ModeFsfreeze:
 		return prepareFsfreeze(o)
+	case ModeRemountRO:
+		return prepareRemountRO(o)
 	case ModeLVM:
 		return prepareLVM(o)
 	default:
@@ -188,6 +196,33 @@ func prepareFsfreeze(o Options) (string, func(), error) {
 	thaw() // immediately — never hold the freeze across the read
 	_ = runShell(o.PostHook)
 	return o.Device, func() {}, nil
+}
+
+// prepareRemountRO flushes and remounts the filesystem read-only so a whole-device
+// read is consistent (no in-flight writes), with no LVM required. cleanup remounts
+// read-write and runs the post-hook, so an aborted cutover restores the source.
+// Intended for cutover on a source that will be powered off afterwards.
+func prepareRemountRO(o Options) (string, func(), error) {
+	mp, err := mountpointFor(o)
+	if err != nil {
+		return "", func() {}, err
+	}
+	if err := runShell(o.PreHook); err != nil {
+		return "", func() {}, err
+	}
+	_, _ = run("sync")
+	log.Printf("snapshot: remounting %s read-only for a consistent cutover read", mp)
+	if out, rerr := run("mount", "-o", "remount,ro", mp); rerr != nil {
+		_ = runShell(o.PostHook)
+		return "", func() {}, fmt.Errorf("remount %s read-only failed (a process is still writing to it — stop your apps/services first): %w (%s)", mp, rerr, out)
+	}
+	cleanup := func() {
+		if out, uerr := run("mount", "-o", "remount,rw", mp); uerr != nil {
+			log.Printf("snapshot: WARNING could not remount %s read-write again: %v (%s)", mp, uerr, out)
+		}
+		_ = runShell(o.PostHook)
+	}
+	return o.Device, cleanup, nil
 }
 
 func prepareLVM(o Options) (string, func(), error) {

@@ -154,14 +154,15 @@ type SetStateRequest struct {
 type MigrationState string
 
 const (
-	MigCreated       MigrationState = "created"        // record exists; provisioning storage
-	MigAwaitingAgent MigrationState = "awaiting_agent" // enrollment command issued; no agent yet
-	MigReplicating   MigrationState = "replicating"    // agent checked in; syncing
-	MigReady         MigrationState = "ready"          // validations passed; can cut over
-	MigMigrating     MigrationState = "migrating"      // converting + imaging
-	MigImageReady    MigrationState = "image_ready"    // Linode Image created
-	MigLaunched      MigrationState = "launched"       // new instance launched from the image
-	MigFailed        MigrationState = "failed"
+	MigCreated         MigrationState = "created"          // record exists; provisioning storage
+	MigAwaitingAgent   MigrationState = "awaiting_agent"   // enrollment command issued; no agent yet
+	MigReplicating     MigrationState = "replicating"      // agent checked in; syncing
+	MigReady           MigrationState = "ready"            // validations passed; can cut over
+	MigAwaitingCutover MigrationState = "awaiting_cutover" // guided cutover: consistent image captured, paused for operator to power off the source + confirm
+	MigMigrating       MigrationState = "migrating"        // converting + imaging
+	MigImageReady      MigrationState = "image_ready"      // Linode Image created
+	MigLaunched        MigrationState = "launched"         // new instance launched from the image
+	MigFailed          MigrationState = "failed"
 )
 
 // Disk is one source block device within a migration. A migration has one or
@@ -357,4 +358,11 @@ type FinalizeRequest struct {
 	// never persisted.
 	RootPassword     string `json:"root_password,omitempty"`      // set+unlock root's password
 	SSHAuthorizedKey string `json:"ssh_authorized_key,omitempty"` // add to root's authorized_keys
+
+	// GuidedShutdown turns cutover into two phases: phase 1 captures a consistent
+	// point-in-time image (quiescing the source) and then PAUSES so the operator
+	// can power the source off; the migration sits in MigAwaitingCutover until the
+	// operator confirms via the /complete endpoint, which runs phase 2 (convert,
+	// clone, launch). Without it, cutover runs straight through as before.
+	GuidedShutdown bool `json:"guided_shutdown,omitempty"`
 }
