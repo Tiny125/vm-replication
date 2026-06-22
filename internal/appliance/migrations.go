@@ -864,6 +864,7 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 	//    which must boot via a Linode-supplied kernel instead.
 	kernel, rootDevice := "linode/grub2", "/dev/sda"
 	convertFailed := false
+	convertEnvIssue := false // failure was a missing command / bad env, not inconsistent data
 	if s.cfg.ConvertScript != "" && isBlockDevice(bootDevice) {
 		log.Printf("appliance: migration %d: machine conversion on boot disk %s", m.ID, bootDevice)
 		// machine-convert.sh requires bash (set -o pipefail, etc). Run it under
@@ -919,8 +920,13 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 		}
 		if err != nil {
 			convertFailed = true
+			convertEnvIssue = convertFailureEnvIssue(err, string(out))
 			log.Printf("appliance: migration %d: machine-convert failed (continuing best-effort): %v\n%s", m.ID, err, trimOut(out))
-			_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish, so the launched instance may not boot. Most often the replicated filesystem is inconsistent because the source kept changing during the copy — the reliable fix is a fresh full sync of a quiesced/idle source, then cut over again. The image volume is still created so you can also repair it manually in Rescue Mode (see docs/TROUBLESHOOTING.md). Detail: "+oneLine(trimOut(out)))
+			if convertEnvIssue {
+				_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish because a command was missing in the conversion environment (exit 127 / \"command not found\"). This is an appliance/PATH problem, NOT an inconsistent source — re-syncing won't help. Update the appliance to the latest build (the convert step now pins a full PATH) and retry the cutover. Detail: "+oneLine(trimOut(out)))
+			} else {
+				_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish, so the launched instance may not boot. Most often the replicated filesystem is inconsistent because the source kept changing during the copy — the reliable fix is a fresh full sync of a quiesced/idle source, then cut over again. The image volume is still created so you can also repair it manually in Rescue Mode (see docs/TROUBLESHOOTING.md). Detail: "+oneLine(trimOut(out)))
+			}
 		} else {
 			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("boot disk converted for Linode (virtio, network); boot kernel %s root %s", kernel, rootDevice))
 			if access := accessSeededNote(req); access != "" {
@@ -964,7 +970,11 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 		// with a clear, actionable error instead. (The replication volume is left
 		// intact for manual inspection in Rescue Mode.)
 		if convertFailed {
-			s.fail(m.ID, "boot disk conversion failed, so the local-disk image would not boot (you'd see a grub> prompt and a stuck cutover). This almost always means the replicated filesystem is inconsistent — retry the cutover and let it take the crash-consistent snapshot (do not skip it; power the source off if you want to skip). See the conversion detail above for the fsck output.")
+			if convertEnvIssue {
+				s.fail(m.ID, "boot disk conversion failed because a required command was missing in the conversion environment (exit 127 / \"command not found\"). This is an appliance/PATH bug, NOT an inconsistent source — re-syncing won't help. Update the appliance to the latest build (the convert step now pins a full PATH), restart applianced, and retry the cutover. The replication volume is left intact for inspection; see the conversion detail above.")
+			} else {
+				s.fail(m.ID, "boot disk conversion failed, so the local-disk image would not boot (you'd see a grub> prompt and a stuck cutover). This almost always means the replicated filesystem is inconsistent — retry the cutover and let it take the crash-consistent snapshot (do not skip it; power the source off if you want to skip). See the conversion detail above for the fsck output.")
+			}
 			return
 		}
 		s.finalizeDisk(ctx, m, cl, kernel, rootDevice)
@@ -1604,6 +1614,19 @@ func trimOut(b []byte) string {
 		b = b[len(b)-max:]
 	}
 	return string(b)
+}
+
+// convertFailureEnvIssue reports whether a failed machine-convert run died because
+// a command was missing / the environment was unusable (exit 127 or a shell
+// "command not found"), rather than because the source filesystem was inconsistent.
+// The two need opposite remedies — fix/redeploy the appliance vs. re-sync a quiesced
+// source — so we must not report the former as the latter (as the old message did).
+func convertFailureEnvIssue(err error, out string) bool {
+	if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 127 {
+		return true
+	}
+	lo := strings.ToLower(out)
+	return strings.Contains(lo, "command not found") || strings.Contains(lo, ": not found")
 }
 
 func orDefault(v, def string) string {
