@@ -92,6 +92,16 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 	dev0 := d.SourceDevice
 	go func() {
 		err := receiver.Serve(ctx, ln, device, manifest, false, func(st receiver.Stats) {
+			// Quiesce-failure report (not a data session): the agent tried and could
+			// not capture a consistent image for cutover. Record it so quiesceForCutover
+			// fails fast with the agent's actual reason instead of waiting out its timeout.
+			if st.Hello.QuiesceError != "" {
+				if s.wantDiskConsistency(diskID) {
+					s.markDiskQuiesceFailed(diskID, st.Hello.QuiesceError)
+					_ = s.st.AddEvent(s.ctx, migID, "warn", fmt.Sprintf("disk %d (%s): the source could not be quiesced for a consistent cutover — %s", diskIdx, dev0, st.Hello.QuiesceError))
+				}
+				return
+			}
 			total := blockdiff.NumBlocks(st.Hello.DeviceSize, st.Hello.BlockSize)
 			bytes := st.BlocksWritten * int64(st.Hello.BlockSize)
 			wasBaselined := false
@@ -145,6 +155,7 @@ func (s *Server) requestDiskConsistency(diskID int64) {
 	s.recMu.Lock()
 	s.consistReq[diskID] = true
 	s.consistDone[diskID] = false
+	delete(s.quiesceErr, diskID) // a fresh request clears any prior failure report
 	s.recMu.Unlock()
 }
 
@@ -172,12 +183,29 @@ func (s *Server) diskConsistencyDone(diskID int64) bool {
 	return s.consistDone[diskID]
 }
 
+// markDiskQuiesceFailed records that a disk's agent reported it could not capture a
+// consistent image for cutover (with the reason), so the wait can stop immediately.
+func (s *Server) markDiskQuiesceFailed(diskID int64, reason string) {
+	s.recMu.Lock()
+	s.quiesceErr[diskID] = reason
+	s.recMu.Unlock()
+}
+
+// diskQuiesceFailed returns the reported quiesce-failure reason for a disk, if any.
+func (s *Server) diskQuiesceFailed(diskID int64) (string, bool) {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	r, ok := s.quiesceErr[diskID]
+	return r, ok
+}
+
 // clearConsistency forgets all consistency state for a migration's disks.
 func (s *Server) clearConsistency(m api.Migration) {
 	s.recMu.Lock()
 	for _, d := range m.Disks {
 		delete(s.consistReq, d.ID)
 		delete(s.consistDone, d.ID)
+		delete(s.quiesceErr, d.ID)
 	}
 	s.recMu.Unlock()
 }
@@ -215,6 +243,14 @@ func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) bool {
 	for {
 		if ctx.Err() != nil {
 			return false
+		}
+		// Fail fast if any agent has actively reported it cannot quiesce — no point
+		// waiting out the timeout when we already know a consistent image won't come.
+		for _, d := range m.Disks {
+			if reason, failed := s.diskQuiesceFailed(d.ID); failed {
+				_ = s.st.AddEvent(s.ctx, m.ID, "warn", "cutover: the source reported it cannot be quiesced for a consistent image ("+reason+"). Stop the source's apps/services so its root can be remounted read-only, then start the cutover again.")
+				return false
+			}
 		}
 		allDone := true
 		for _, d := range m.Disks {
@@ -796,28 +832,42 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	if req.SkipSnapshot {
 		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: skipping the point-in-time snapshot at the operator's request — the source is reported powered off or quiesced, so the current replicated data is treated as consistent. (If the source was still running and writing, the image may be inconsistent.)")
 		consistent = true // operator's assertion
+	} else if !s.sourceAgentActive(m) {
+		// No agent checked in — the source appears powered off, so the current
+		// replicated data is already a static, consistent point-in-time.
+		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: the source agent is not checked in (the source appears powered off), so the current replicated data is treated as a consistent point-in-time")
+		consistent = true
 	} else {
 		consistent = s.quiesceForCutover(ctx, m)
 	}
 	if canceled() {
 		return
 	}
+
+	// Guided cutover must NOT proceed on an inconsistent image. If the source was
+	// still running but couldn't be quiesced (apps holding the root, or an outdated
+	// agent), fail fast WITHOUT stopping replication, so the operator can fix it and
+	// retry rather than ending up at a grub> prompt.
+	if req.GuidedShutdown && !consistent {
+		s.clearConsistency(m)
+		_ = s.st.SetMigrationState(sctx, m.ID, api.MigReplicating, "")
+		_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: could NOT capture a consistent image — the source root could not be remounted read-only (stop the source's apps/services so nothing is writing to / ), or the source agent predates this feature (re-enroll the source). Replication is still running; fix the above and start the cutover again.")
+		return
+	}
+
 	s.stopReceivers(m)
 	s.clearConsistency(m)
 
 	if req.GuidedShutdown {
-		// Guided cutover: the point-in-time image is now frozen (receivers stopped).
-		// Pause for the operator to power the source off, then resume via /complete.
-		// Stash the request so phase 2 reuses the options.
+		// Guided cutover: a consistent point-in-time image is now frozen (receivers
+		// stopped). Pause for the operator to power the source off (verified by the
+		// agent going silent), then resume via /complete. Stash the request so phase
+		// 2 reuses the options.
 		s.recMu.Lock()
 		s.pendingCutover[m.ID] = req
 		s.recMu.Unlock()
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigAwaitingCutover, "")
-		if consistent {
-			_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: consistent point-in-time image captured and frozen. Now POWER OFF the source server (recommended — so the source and the migrated instance never run at once), then click \"Complete cutover\" to convert, clone and launch.")
-		} else {
-			_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: paused for shutdown, but a consistent snapshot was NOT captured (the source root could not be quiesced — most often apps are still writing to it). The image may be inconsistent and fail to boot. Recommended: Cancel, stop the source's apps, and cut over again. If you proceed, power off the source first.")
-		}
+		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: consistent point-in-time image captured and frozen. Now POWER OFF the source server; once the appliance confirms the source agent has stopped, click \"Complete cutover\" to convert, clone and launch.")
 		return
 	}
 	s.finalizeComplete(ctx, m, req)
@@ -850,6 +900,7 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 	//    which must boot via a Linode-supplied kernel instead.
 	kernel, rootDevice := "linode/grub2", "/dev/sda"
 	convertFailed := false
+	convertEnvIssue := false // failure was a missing command / bad env, not inconsistent data
 	if s.cfg.ConvertScript != "" && isBlockDevice(bootDevice) {
 		log.Printf("appliance: migration %d: machine conversion on boot disk %s", m.ID, bootDevice)
 		// machine-convert.sh requires bash (set -o pipefail, etc). Run it under
@@ -905,8 +956,13 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 		}
 		if err != nil {
 			convertFailed = true
+			convertEnvIssue = convertFailureEnvIssue(err, string(out))
 			log.Printf("appliance: migration %d: machine-convert failed (continuing best-effort): %v\n%s", m.ID, err, trimOut(out))
-			_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish, so the launched instance may not boot. Most often the replicated filesystem is inconsistent because the source kept changing during the copy — the reliable fix is a fresh full sync of a quiesced/idle source, then cut over again. The image volume is still created so you can also repair it manually in Rescue Mode (see docs/TROUBLESHOOTING.md). Detail: "+oneLine(trimOut(out)))
+			if convertEnvIssue {
+				_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish because a command was missing in the conversion environment (exit 127 / \"command not found\"). This is an appliance/PATH problem, NOT an inconsistent source — re-syncing won't help. Update the appliance to the latest build (the convert step now pins a full PATH) and retry the cutover. Detail: "+oneLine(trimOut(out)))
+			} else {
+				_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish, so the launched instance may not boot. Most often the replicated filesystem is inconsistent because the source kept changing during the copy — the reliable fix is a fresh full sync of a quiesced/idle source, then cut over again. The image volume is still created so you can also repair it manually in Rescue Mode (see docs/TROUBLESHOOTING.md). Detail: "+oneLine(trimOut(out)))
+			}
 		} else {
 			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("boot disk converted for Linode (virtio, network); boot kernel %s root %s", kernel, rootDevice))
 			if access := accessSeededNote(req); access != "" {
@@ -950,7 +1006,11 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 		// with a clear, actionable error instead. (The replication volume is left
 		// intact for manual inspection in Rescue Mode.)
 		if convertFailed {
-			s.fail(m.ID, "boot disk conversion failed, so the local-disk image would not boot (you'd see a grub> prompt and a stuck cutover). This almost always means the replicated filesystem is inconsistent — retry the cutover and let it take the crash-consistent snapshot (do not skip it; power the source off if you want to skip). See the conversion detail above for the fsck output.")
+			if convertEnvIssue {
+				s.fail(m.ID, "boot disk conversion failed because a required command was missing in the conversion environment (exit 127 / \"command not found\"). This is an appliance/PATH bug, NOT an inconsistent source — re-syncing won't help. Update the appliance to the latest build (the convert step now pins a full PATH), restart applianced, and retry the cutover. The replication volume is left intact for inspection; see the conversion detail above.")
+			} else {
+				s.fail(m.ID, "boot disk conversion failed, so the local-disk image would not boot (you'd see a grub> prompt and a stuck cutover). This almost always means the replicated filesystem is inconsistent — retry the cutover and let it take the crash-consistent snapshot (do not skip it; power the source off if you want to skip). See the conversion detail above for the fsck output.")
+			}
 			return
 		}
 		s.finalizeDisk(ctx, m, cl, kernel, rootDevice)
@@ -1348,6 +1408,19 @@ func cutoverVolumeLabel(name string, idx, total int) string {
 	return fitLabel("", sanitizeLabel(name), suffix)
 }
 
+// sourceAgentActive reports whether any disk's agent has checked in recently —
+// i.e. the source OS is still running. Used to decide whether a snapshot can be
+// taken (agent up) or the source is already off (current data is consistent), and
+// to gate guided cutover's "source powered off" confirmation.
+func (s *Server) sourceAgentActive(m api.Migration) bool {
+	for _, d := range m.Disks {
+		if !d.AgentLastSeen.IsZero() && time.Since(d.AgentLastSeen) < 2*time.Minute {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) fail(id int64, msg string) {
 	log.Printf("appliance: migration %d failed: %s", id, msg)
 	_ = s.st.SetMigrationState(context.Background(), id, api.MigFailed, msg)
@@ -1577,6 +1650,19 @@ func trimOut(b []byte) string {
 		b = b[len(b)-max:]
 	}
 	return string(b)
+}
+
+// convertFailureEnvIssue reports whether a failed machine-convert run died because
+// a command was missing / the environment was unusable (exit 127 or a shell
+// "command not found"), rather than because the source filesystem was inconsistent.
+// The two need opposite remedies — fix/redeploy the appliance vs. re-sync a quiesced
+// source — so we must not report the former as the latter (as the old message did).
+func convertFailureEnvIssue(err error, out string) bool {
+	if ee, ok := err.(*exec.ExitError); ok && ee.ExitCode() == 127 {
+		return true
+	}
+	lo := strings.ToLower(out)
+	return strings.Contains(lo, "command not found") || strings.Contains(lo, ": not found")
 }
 
 func orDefault(v, def string) string {

@@ -162,6 +162,12 @@ func run(c cfg) (syncResult, error) {
 		if c.cutoverQuiesce == string(snapshot.ModeRemountRO) {
 			log.Printf("agent: crash-consistent snapshot requested and no LVM — remounting the source filesystem read-only for one consistent cutover pass")
 			res, _, err = replicate(c, snapshot.ModeRemountRO, false)
+			if err != nil {
+				// Tell the appliance we couldn't quiesce, so it fails the cutover fast
+				// with this reason instead of waiting out its consistency timeout.
+				log.Printf("agent: could not quiesce for cutover: %v", err)
+				reportQuiesceFailure(c, err.Error())
+			}
 			return res, err
 		}
 		log.Printf("agent: crash-consistent snapshot requested, but the source has no LVM snapshot capability — replicating live without freezing (the appliance proceeds on the current data). Put the source root on LVM, or quiesce it at cutover, for a clean point-in-time image.")
@@ -171,6 +177,40 @@ func run(c cfg) (syncResult, error) {
 	log.Printf("agent: receiver requested a crash-consistent snapshot for cutover; re-reading from a point-in-time %s snapshot", cmode)
 	res, _, err = replicate(c, cmode, false)
 	return res, err
+}
+
+// reportQuiesceFailure connects to the receiver and sends a control-only Hello
+// telling the appliance the source could not be quiesced for a consistent cutover.
+// It carries no device geometry (the receiver skips Validate/apply for it), so the
+// appliance can fail the cutover fast with this reason instead of timing out.
+// Best-effort: any error here is logged and ignored — the cutover already failed.
+func reportQuiesceFailure(c cfg, reason string) {
+	tlsCfg, err := transport.ClientConfig(c.tls, c.serverName)
+	if err != nil {
+		return
+	}
+	conn, err := tls.Dial("tcp", c.target, tlsCfg)
+	if err != nil {
+		log.Printf("agent: could not reach the appliance to report the quiesce failure: %v", err)
+		return
+	}
+	defer conn.Close()
+	w := bufio.NewWriterSize(conn, 1<<12)
+	host, _ := os.Hostname()
+	if err := protocol.WriteJSON(w, protocol.MsgHello, protocol.Hello{
+		ProtocolVersion: 1,
+		JobID:           c.jobID,
+		SourceHostname:  host,
+		DevicePath:      c.device,
+		QuiesceError:    reason,
+	}); err != nil {
+		return
+	}
+	if err := w.Flush(); err != nil {
+		return
+	}
+	// Read the ack best-effort so the receiver side completes cleanly.
+	_, _ = expectAck(bufio.NewReaderSize(conn, 1<<12))
 }
 
 // replicate runs one pass reading from the given mode's source (the live device

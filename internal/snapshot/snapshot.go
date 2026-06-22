@@ -104,6 +104,25 @@ func Prepare(o Options) (readPath string, cleanup func(), err error) {
 	}
 }
 
+// blockingWriters returns a short, human-readable list of the processes keeping mp
+// busy (which is what makes a remount,ro fail), best-effort via fuser. Returns ""
+// if nothing is found or fuser is unavailable, so the caller degrades gracefully.
+func blockingWriters(mp string) string {
+	// fuser -m lists processes using the filesystem; -v prints a readable table
+	// (mostly on stderr, which CombinedOutput captures).
+	out, _ := run("fuser", "-vm", mp)
+	s := strings.TrimSpace(out)
+	if s == "" {
+		return ""
+	}
+	s = strings.Join(strings.Fields(s), " ") // collapse the table to one tidy line
+	const max = 500
+	if len(s) > max {
+		s = s[:max] + "…"
+	}
+	return s
+}
+
 func run(name string, args ...string) (string, error) {
 	out, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
@@ -212,9 +231,13 @@ func prepareRemountRO(o Options) (string, func(), error) {
 	}
 	_, _ = run("sync")
 	log.Printf("snapshot: remounting %s read-only for a consistent cutover read", mp)
-	if out, rerr := run("mount", "-o", "remount,ro", mp); rerr != nil {
+	if _, rerr := run("mount", "-o", "remount,ro", mp); rerr != nil {
 		_ = runShell(o.PostHook)
-		return "", func() {}, fmt.Errorf("remount %s read-only failed (a process is still writing to it — stop your apps/services first): %w (%s)", mp, rerr, out)
+		msg := fmt.Sprintf("could not remount %s read-only — a process is still writing to it; stop the source's apps/services (databases, web servers, etc.) so the root is idle, then cut over again: %v", mp, rerr)
+		if w := blockingWriters(mp); w != "" {
+			msg += " — processes holding " + mp + ": " + w
+		}
+		return "", func() {}, fmt.Errorf("%s", msg)
 	}
 	cleanup := func() {
 		if out, uerr := run("mount", "-o", "remount,rw", mp); uerr != nil {

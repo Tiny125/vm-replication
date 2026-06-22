@@ -62,6 +62,9 @@ type Server struct {
 	// such a crash-consistent sync.
 	consistReq  map[int64]bool
 	consistDone map[int64]bool
+	// quiesceErr records that a disk's agent reported it could not capture a
+	// consistent image for cutover (keyed by diskID), so the wait can fail fast.
+	quiesceErr map[int64]string
 	// pendingCutover holds the FinalizeRequest from a guided cutover's phase 1 so
 	// the /complete endpoint (phase 2) can reuse the operator's options without
 	// re-prompting (keyed by migrationID, guarded by recMu).
@@ -96,6 +99,7 @@ func New(ctx context.Context, cfg Config) *Server {
 		finalizes:      map[int64]context.CancelFunc{},
 		consistReq:     map[int64]bool{},
 		consistDone:    map[int64]bool{},
+		quiesceErr:     map[int64]string{},
 		pendingCutover: map[int64]api.FinalizeRequest{},
 		ctx:            ctx,
 		auditCh:        make(chan auditEntry, 2048),
