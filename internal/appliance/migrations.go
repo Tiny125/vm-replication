@@ -796,28 +796,42 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	if req.SkipSnapshot {
 		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: skipping the point-in-time snapshot at the operator's request — the source is reported powered off or quiesced, so the current replicated data is treated as consistent. (If the source was still running and writing, the image may be inconsistent.)")
 		consistent = true // operator's assertion
+	} else if !s.sourceAgentActive(m) {
+		// No agent checked in — the source appears powered off, so the current
+		// replicated data is already a static, consistent point-in-time.
+		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: the source agent is not checked in (the source appears powered off), so the current replicated data is treated as a consistent point-in-time")
+		consistent = true
 	} else {
 		consistent = s.quiesceForCutover(ctx, m)
 	}
 	if canceled() {
 		return
 	}
+
+	// Guided cutover must NOT proceed on an inconsistent image. If the source was
+	// still running but couldn't be quiesced (apps holding the root, or an outdated
+	// agent), fail fast WITHOUT stopping replication, so the operator can fix it and
+	// retry rather than ending up at a grub> prompt.
+	if req.GuidedShutdown && !consistent {
+		s.clearConsistency(m)
+		_ = s.st.SetMigrationState(sctx, m.ID, api.MigReplicating, "")
+		_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: could NOT capture a consistent image — the source root could not be remounted read-only (stop the source's apps/services so nothing is writing to / ), or the source agent predates this feature (re-enroll the source). Replication is still running; fix the above and start the cutover again.")
+		return
+	}
+
 	s.stopReceivers(m)
 	s.clearConsistency(m)
 
 	if req.GuidedShutdown {
-		// Guided cutover: the point-in-time image is now frozen (receivers stopped).
-		// Pause for the operator to power the source off, then resume via /complete.
-		// Stash the request so phase 2 reuses the options.
+		// Guided cutover: a consistent point-in-time image is now frozen (receivers
+		// stopped). Pause for the operator to power the source off (verified by the
+		// agent going silent), then resume via /complete. Stash the request so phase
+		// 2 reuses the options.
 		s.recMu.Lock()
 		s.pendingCutover[m.ID] = req
 		s.recMu.Unlock()
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigAwaitingCutover, "")
-		if consistent {
-			_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: consistent point-in-time image captured and frozen. Now POWER OFF the source server (recommended — so the source and the migrated instance never run at once), then click \"Complete cutover\" to convert, clone and launch.")
-		} else {
-			_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: paused for shutdown, but a consistent snapshot was NOT captured (the source root could not be quiesced — most often apps are still writing to it). The image may be inconsistent and fail to boot. Recommended: Cancel, stop the source's apps, and cut over again. If you proceed, power off the source first.")
-		}
+		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: consistent point-in-time image captured and frozen. Now POWER OFF the source server; once the appliance confirms the source agent has stopped, click \"Complete cutover\" to convert, clone and launch.")
 		return
 	}
 	s.finalizeComplete(ctx, m, req)
@@ -1346,6 +1360,19 @@ func cutoverVolumeLabel(name string, idx, total int) string {
 		suffix = fmt.Sprintf("-cutover-%d", idx)
 	}
 	return fitLabel("", sanitizeLabel(name), suffix)
+}
+
+// sourceAgentActive reports whether any disk's agent has checked in recently —
+// i.e. the source OS is still running. Used to decide whether a snapshot can be
+// taken (agent up) or the source is already off (current data is consistent), and
+// to gate guided cutover's "source powered off" confirmation.
+func (s *Server) sourceAgentActive(m api.Migration) bool {
+	for _, d := range m.Disks {
+		if !d.AgentLastSeen.IsZero() && time.Since(d.AgentLastSeen) < 2*time.Minute {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) fail(id int64, msg string) {

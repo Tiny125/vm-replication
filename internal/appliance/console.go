@@ -538,35 +538,32 @@ async function startMig(id,btn){
   const meta=migMeta[id]||{};
   const disk=meta.boot_target==='disk';
   const planNote=meta.linode_type?(' on plan <b>'+esc(meta.linode_type)+'</b>'):'';
-  const warn='<div class="warn" style="margin-bottom:8px">After cutover the source agent <b>stops replicating</b> — the migrated copy is frozen at this point.</div>';
   const access='<div class="muted" style="font-size:12px;margin-top:10px">Migrated disks keep the <b>source</b>’s logins, and cloud images usually leave root locked — so set a root password (and/or SSH key) below to reach the new instance via the Lish console without rescue mode.</div>';
-  const snapNote='<div class="muted" style="font-size:12px;margin-top:8px">Leave the snapshot box checked if you’ve <b>stopped the source’s apps/databases</b> — the replicated data is then already consistent and cutover is immediate. Uncheck it to instead ask the still-connected agent for a crash-consistent point-in-time snapshot first (can take several minutes). <b>Guided shutdown</b> quiesces the source for you (remount root read-only) and then waits while you power it off — best for a plain (non-LVM) source that can’t be auto-snapshotted; it overrides the snapshot box.</div>';
+  // Step 1 of the guided cutover: capture a CONSISTENT image. The agent quiesces
+  // the source (remounts its root read-only for one pass); if the source is already
+  // powered off the current data is used as-is. This pauses afterwards so you can
+  // power off the source, then Complete cutover.
+  const how='<div style="margin-bottom:8px">This captures a <b>consistent</b> point-in-time image of the source, then <b>pauses</b> so you can power the source off before the final cutover'+(disk?(', after which it creates a new Linode'+planNote+' and boots from its local disk.'):(meta.linode_type?(', after which it launches a new Linode'+planNote+'.'):' and clones every disk into launchable volumes.'))+'</div>';
+  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s apps/services so its root filesystem can be remounted read-only. The source must still be <b>running</b> (its agent connected) so it can be quiesced — you’ll power it off in the next step.</div>';
   const opts={
-    title:'Cut over migration #'+id+'?',
-    okText:'Cut over',
+    title:'Cut over migration #'+id+' — step 1: capture consistent image',
+    okText:'Capture image',
+    html:how+access+prep,
     fields:[
       {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
       {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
     ],
-    checkboxes:[
-      {id:'skip_snap',label:'Source apps/databases are already stopped — cut over from the current data (no snapshot).',checked:true},
-      {id:'guided',label:'Guided shutdown: capture a consistent image (quiescing the source), then PAUSE so I can power off the source before completing. Recommended for non-LVM sources.',checked:false}
-    ]
+    checkboxes:[]
   };
-  if(disk){
-    // Local-disk boot always launches a new instance and keeps no volume.
-    opts.html=warn+
-      'The appliance converts the boot disk, then creates a new Linode'+planNote+', copies the image onto its <b>local disk</b> and boots from that disk. The temporary volume is deleted afterwards — no separate Block Storage volume is kept. This is the final step.'+access+snapNote;
-  }else{
-    opts.html=warn+
-      'The appliance converts the boot disk and clones every disk into launchable <b>&lt;name&gt;-cutover</b> volumes'+(meta.linode_type?(', and launches a new Linode'+planNote):'')+'. This is the final step.'+access+snapNote;
-    opts.checkboxes.push({id:'launch',label:'Also launch a new <name>-cutover Linode now (boot=sda, data=sdb…). Uncheck to just create the cutover volumes.',checked:true});
+  if(!disk && meta.linode_type){
+    opts.checkboxes.push({id:'launch',label:'Also launch a new <name>-cutover Linode at completion (boot=sda, data=sdb…). Uncheck to just create the cutover volumes.',checked:true});
   }
   const r=await confirmModal(opts);
   if(!r)return;
   busy(btn,true);
-  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:disk?true:r.launch,root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:r.guided?false:r.skip_snap,guided_shutdown:r.guided});await refreshMig(id)}
-  catch(e){alertModal({title:'Cannot cut over',html:esc(e.message),danger:true})}finally{busy(btn,false)}
+  // Always guided + consistent: never cut over from inconsistent live data.
+  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:disk?true:(r.launch!==false),root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:false,guided_shutdown:true});await refreshMig(id)}
+  catch(e){alertModal({title:'Cannot start cutover',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function completeCutover(id,btn){
   if(!await confirmModal({title:'Complete cutover #'+id+'?',html:'The consistent image is already captured. Make sure the source is <b>powered off</b>, then this converts the boot disk, clones every disk, and launches. This is the final step.',okText:'Complete cutover'}))return;
@@ -870,9 +867,11 @@ function migCard(v){
   }else if(m.state==='migrating'){
     b+='<button class="danger" onclick="stopMig('+m.id+',this)">Stop</button>';
   }else if(m.state==='awaiting_cutover'){
-    // Guided cutover: phase 1 done, paused for the operator to power off the source.
+    // Guided cutover: phase 1 captured a consistent image and froze it (receivers
+    // stopped). Now the operator powers off the source and confirms.
+    b+='<div class="warn" style="font-size:12px;margin-bottom:6px">✓ Consistent image captured and frozen. Now <b>power off the source server</b>, then click <b>Complete cutover</b>. (Completing while the source is still running won’t corrupt the image — it just risks the old and new machines both being up.)</div>';
     b+='<button class="primary" onclick="completeCutover('+m.id+',this)">Complete cutover</button>'+
-      infoIcon('A consistent point-in-time image has been captured and frozen. Power off the source server, then click to convert, clone and launch. This is the final step.')+
+      infoIcon('A consistent image is frozen. Power off the source first, then this converts the boot disk, clones every disk, and launches. Final step.')+
       '<button class="danger" onclick="stopMig('+m.id+',this)">Cancel</button>';
   }else if(m.state==='failed' && allDone(m)){
     // A cutover failed but the data is fully replicated — retry re-runs it.
