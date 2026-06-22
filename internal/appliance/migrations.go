@@ -1203,6 +1203,14 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", clone.ID), inst.ID)
 	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("created cutover Linode %q (id %d) on plan %s", cutoverName(m.Name), inst.ID, m.LinodeType))
 
+	// Disable Lassie (the Shutdown Watchdog) for the install phase. The in-guest
+	// one-shot signals "copy done" by powering the instance off; with Lassie enabled
+	// Linode would instead auto-reboot it, so it would never settle "offline" and the
+	// cutover would hang until timeout. Re-enabled after the final boot below.
+	if err := cl.SetWatchdog(ctx, inst.ID, false); err != nil {
+		log.Printf("appliance: migration %d: could not disable shutdown watchdog on instance %d: %v", m.ID, inst.ID, err)
+	}
+
 	// A brand-new Linode is still "provisioning" for a short while, during which
 	// disk operations are rejected with "Linode busy". Wait until it settles to
 	// "offline" before adding the local disk.
@@ -1301,6 +1309,12 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		}
 		s.fail(m.ID, "instance did not boot from the local disk: "+err.Error())
 		return
+	}
+
+	// Re-enable Lassie now that the install poweroff dance is done, so the migrated
+	// production instance keeps the auto-reboot-on-crash watchdog (best-effort).
+	if err := cl.SetWatchdog(ctx, inst.ID, true); err != nil {
+		log.Printf("appliance: migration %d: could not re-enable shutdown watchdog on instance %d: %v", m.ID, inst.ID, err)
 	}
 
 	// 6) Drop the now-unneeded cutover volume.

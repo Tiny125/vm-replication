@@ -246,6 +246,16 @@ func (c *Client) CreateInstance(ctx context.Context, label, region, typ string) 
 	return inst, err
 }
 
+// SetWatchdog enables or disables Lassie, the Linode Shutdown Watchdog, which
+// automatically reboots an instance that powers itself off. The disk-boot cutover
+// MUST disable it around the install boot: the in-guest one-shot copies the image
+// and then powers the instance off as its "done" signal, but with Lassie enabled
+// the instance is rebooted instead of settling "offline", so the cutover hangs.
+func (c *Client) SetWatchdog(ctx context.Context, instanceID int64, enabled bool) error {
+	return c.do(ctx, http.MethodPut, fmt.Sprintf("/linode/instances/%d", instanceID),
+		map[string]any{"watchdog_enabled": enabled}, nil)
+}
+
 // CreateConfigBootingVolume creates a config profile that boots from an attached
 // volume (GRUB 2) and returns the config id.
 func (c *Client) CreateConfigBootingVolume(ctx context.Context, linodeID, volumeID int64, label string) (int64, error) {
