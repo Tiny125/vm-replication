@@ -24,6 +24,13 @@
 # tweaks. Always keep the source until you have booted and validated the target.
 set -euo pipefail
 
+# Never trust the inherited PATH: applianced runs us with whatever environment it
+# was started in (a systemd unit, a bare shell, a container), and a PATH missing
+# /usr/bin makes coreutils like `ln` vanish — which later breaks the chroot's
+# update-initramfs and our own symlinks (exit 127), masquerading as a "filesystem
+# inconsistent" boot failure. Pin a known-good PATH up front.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 DEV="${1:-/dev/sda}"
 MNT="$(mktemp -d)"
 KPARTX_USED=0
@@ -198,6 +205,11 @@ log "Root filesystem UUID: $ROOT_UUID"
 cat > "$MNT/root/.convert-inner.sh" <<INNER
 #!/usr/bin/env bash
 set -euo pipefail
+# Inside the chroot, resolve binaries from the TARGET filesystem with a complete,
+# known-good PATH. chroot does not reset PATH, so without this we inherit the
+# appliance's (possibly /usr/bin-less) PATH and \`ln\`, \`update-initramfs\` hooks,
+# etc. fail with "command not found" (exit 127), aborting the conversion.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ROOT_UUID="$ROOT_UUID"
 log() { echo "   [chroot] \$*"; }
 
