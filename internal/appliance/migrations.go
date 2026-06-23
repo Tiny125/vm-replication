@@ -919,25 +919,12 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 		}
 		if m.BootTarget == api.BootTargetDisk {
 			// Bake in the one-shot that, on the volume-boot phase, copies the image
-			// onto the instance's local disk (see finalizeDisk).
+			// onto the instance's local disk (see finalizeDisk). The whole-disk ext
+			// shrink that makes the image fit that local disk is NOT requested here: it
+			// runs in finalizeDisk, sized to the ACTUAL disk Linode creates rather than
+			// the plan's nominal size minus a guessed margin, because the real disk size
+			// is only known once the disk has been created.
 			cmd.Env = append(cmd.Env, "VMREPL_DISK_INSTALL=1")
-			// The plan's local disk is a little smaller than a same-sized volume
-			// (Linode reserves a sliver), so a 1:1 whole-disk copy of an image that
-			// equals the plan size won't fit. Tell convert to shrink a whole-disk
-			// ext filesystem to the plan disk minus a safety margin so it fits.
-			shrinkReq := false
-			if cl, ok := s.linodeClient(sctx); ok {
-				if types, terr := cl.ListTypes(sctx); terr == nil {
-					if mb := linode.TypeDiskMB(types, m.LinodeType); mb > 256 {
-						cmd.Env = append(cmd.Env, fmt.Sprintf("VMREPL_SHRINK_MB=%d", mb-128))
-						shrinkReq = true
-						_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: requesting whole-disk ext shrink to %d MiB so the image fits the %s local disk (%d MiB)", mb-128, m.LinodeType, mb))
-					}
-				}
-			}
-			if !shrinkReq {
-				_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: could not determine the plan's local disk size, so the image filesystem will not be shrunk — if the copy reports it does not fit, retry once the appliance can reach the Linode API, or use a larger plan")
-			}
 		}
 		out, err := cmd.CombinedOutput()
 		if canceled() {
@@ -967,19 +954,6 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("boot disk converted for Linode (virtio, network); boot kernel %s root %s", kernel, rootDevice))
 			if access := accessSeededNote(req); access != "" {
 				_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: "+access+" — you can log in to the launched instance without rescue mode")
-			}
-			// Surface what the shrink step did (or didn't do) — otherwise a skipped or
-			// failed shrink is invisible until the in-guest copy reports "does not fit".
-			if m.BootTarget == api.BootTargetDisk {
-				if sr := convertField(string(out), "vmrepl-shrink:"); sr != "" {
-					lvl := "info"
-					if strings.Contains(sr, "failed") || strings.Contains(sr, "skipped") {
-						lvl = "warn"
-					}
-					_ = s.st.AddEvent(sctx, m.ID, lvl, "cutover: filesystem shrink "+sr)
-				} else {
-					_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: convert did not report a filesystem-shrink result (the shrink step did not run); if the copy reports it does not fit, the running appliance may predate the shrink fix — restart applianced after deploying, then retry")
-				}
 			}
 		}
 	} else {
@@ -1164,30 +1138,14 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	sctx := s.ctx
 	canceled := func() bool { return ctx.Err() != nil }
 	boot := m.Disks[0]
+	bootDevice := s.diskDevicePath(m, boot)
 
-	_ = s.st.AddEvent(sctx, m.ID, "info", "cutover (local disk) started: cloning the converted image")
+	_ = s.st.AddEvent(sctx, m.ID, "info", "cutover (local disk) started")
 	s.cleanupCutoverArtifacts(sctx, m) // retry-safe
 
-	// 1) Clone the replication volume into the image we copy onto the local disk.
-	label := cutoverVolumeLabel(m.Name, boot.Index, len(m.Disks))
-	clone, err := cl.CloneVolume(ctx, boot.VolumeID, label)
-	if canceled() {
-		return
-	}
-	if err != nil {
-		s.fail(m.ID, "clone boot volume: "+err.Error())
-		return
-	}
-	if _, err := cl.WaitVolumeActive(ctx, clone.ID, 15*time.Minute); err != nil {
-		if canceled() {
-			return
-		}
-		s.fail(m.ID, "wait clone active: "+err.Error())
-		return
-	}
-	_ = s.st.SetDiskArtifact(sctx, boot.ID, fmt.Sprintf("volume:%d", clone.ID))
-
-	// 2) Create the target instance on the resolved plan (region = appliance's).
+	// 1) Create the target instance on the resolved plan (region = appliance's).
+	//    Create it (and its local disk) BEFORE cloning the image so the filesystem
+	//    shrink can be sized to the real local disk Linode hands us, not a guess.
 	region := s.cfg.Region
 	if inst, err := cl.GetInstance(ctx, s.cfg.ApplianceLinodeID); err == nil && inst.Region != "" {
 		region = inst.Region
@@ -1200,7 +1158,8 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		s.fail(m.ID, "create instance: "+err.Error())
 		return
 	}
-	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", clone.ID), inst.ID)
+	// Record the instance id now so a later failure or retry can clean it up.
+	_ = s.st.SetMigrationImage(sctx, m.ID, "", inst.ID)
 	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("created cutover Linode %q (id %d) on plan %s", cutoverName(m.Name), inst.ID, m.LinodeType))
 
 	// Disable Lassie (the Shutdown Watchdog) for the install phase. The in-guest
@@ -1222,7 +1181,10 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		return
 	}
 
-	// 3) Create a blank raw local disk sized to the plan's full storage.
+	// 2) Create a blank raw local disk sized to the plan's full storage, then read
+	//    back its ACTUAL size: Linode reserves a sliver, so the real disk is a little
+	//    smaller than the nominal plan disk, and that real size is what the image
+	//    must be shrunk to fit.
 	diskMB := 0
 	if types, terr := cl.ListTypes(ctx); terr == nil {
 		diskMB = linode.TypeDiskMB(types, m.LinodeType)
@@ -1250,8 +1212,69 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		s.fail(m.ID, "wait local disk ready: "+err.Error())
 		return
 	}
+	actualMB := rawDisk.Size
+	if actualMB <= 0 {
+		actualMB = diskMB
+	}
 
-	// 4) Boot once from the volume (sda) with the raw disk attached (sdb); the
+	// 3) Shrink the whole-disk ext filesystem on the source boot device to fit the
+	//    ACTUAL local disk before cloning it. Sizing to the real disk (minus a small
+	//    rounding headroom) replaces the old fixed margin guessed against the plan's
+	//    nominal size. Only whole-disk ext{2,3,4} roots are shrunk; the convert
+	//    script no-ops other layouts. The first normal boot grows the root back to
+	//    fill the disk.
+	if s.cfg.ConvertScript != "" && isBlockDevice(bootDevice) && actualMB > 256 {
+		target := actualMB - 16 // headroom for block rounding, anchored to the real disk
+		_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: shrinking the image filesystem to fit the %s local disk (%d MiB; target %d MiB)", m.LinodeType, actualMB, target))
+		shrinkCmd := exec.CommandContext(ctx, bashPath(), s.cfg.ConvertScript, bootDevice)
+		shrinkCmd.Env = append(os.Environ(), "VMREPL_SHRINK_ONLY=1", fmt.Sprintf("VMREPL_SHRINK_MB=%d", target))
+		out, serr := shrinkCmd.CombinedOutput()
+		if canceled() {
+			return
+		}
+		resultMB := 0
+		if sr := convertField(string(out), "vmrepl-shrink:"); sr != "" {
+			lvl := "info"
+			if strings.Contains(sr, "failed") || strings.Contains(sr, "skipped") {
+				lvl = "warn"
+			}
+			_ = s.st.AddEvent(sctx, m.ID, lvl, "cutover: filesystem shrink "+sr)
+			resultMB = shrinkResultMB(sr)
+		}
+		if serr != nil {
+			log.Printf("appliance: migration %d: filesystem shrink command failed: %v\n%s", m.ID, serr, trimOut(out))
+		}
+		// Authoritative fit check against the ACTUAL disk: if the filesystem still
+		// will not fit, fail fast now instead of hanging the install boot for an hour
+		// waiting for a power-off the in-guest copy will never send.
+		if resultMB > 0 && resultMB > actualMB {
+			s.fail(m.ID, fmt.Sprintf("image filesystem is %d MiB but the %s local disk is only %d MiB, so the copy cannot fit; recreate the migration on a larger plan", resultMB, m.LinodeType, actualMB))
+			return
+		}
+	}
+
+	// 4) Clone the (now-shrunk) replication volume into the image we copy onto the
+	//    local disk.
+	label := cutoverVolumeLabel(m.Name, boot.Index, len(m.Disks))
+	clone, err := cl.CloneVolume(ctx, boot.VolumeID, label)
+	if canceled() {
+		return
+	}
+	if err != nil {
+		s.fail(m.ID, "clone boot volume: "+err.Error())
+		return
+	}
+	if _, err := cl.WaitVolumeActive(ctx, clone.ID, 15*time.Minute); err != nil {
+		if canceled() {
+			return
+		}
+		s.fail(m.ID, "wait clone active: "+err.Error())
+		return
+	}
+	_ = s.st.SetDiskArtifact(sctx, boot.ID, fmt.Sprintf("volume:%d", clone.ID))
+	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", clone.ID), inst.ID)
+
+	// 5) Boot once from the volume (sda) with the raw disk attached (sdb); the
 	//    in-guest one-shot copies sda->sdb and powers the instance off.
 	installCfg, err := cl.CreateConfig(ctx, inst.ID, "vmrepl-install", kernel, rootDevice,
 		map[string]any{"sda": map[string]any{"volume_id": clone.ID}, "sdb": map[string]any{"disk_id": rawDisk.ID}})
@@ -1286,7 +1309,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	}
 	_ = s.st.AddEvent(sctx, m.ID, "info", "image copied onto the local disk; switching boot to the local disk")
 
-	// 5) Boot from the local disk (sda) and confirm it comes up.
+	// 6) Boot from the local disk (sda) and confirm it comes up.
 	bootCfg, err := cl.CreateConfig(ctx, inst.ID, "boot-migrated", kernel, rootDevice,
 		map[string]any{"sda": map[string]any{"disk_id": rawDisk.ID}})
 	if err != nil {
@@ -1317,7 +1340,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		log.Printf("appliance: migration %d: could not re-enable shutdown watchdog on instance %d: %v", m.ID, inst.ID, err)
 	}
 
-	// 6) Drop the now-unneeded cutover volume.
+	// 7) Drop the now-unneeded cutover volume.
 	_ = cl.DetachVolume(ctx, clone.ID)
 	var derr error
 	for i := 0; i < 10; i++ {
@@ -1703,6 +1726,20 @@ func accessSeededNote(req api.FinalizeRequest) string {
 
 // convertField extracts the value of a "key: value" line emitted by
 // machine-convert.sh (e.g. "vmrepl-root: /dev/sda1") from its output.
+// shrinkResultMB extracts the resulting filesystem size in MiB from a
+// "vmrepl-shrink:" result line (e.g. "ok 81888M" or
+// "failed resize2fs rc=1 fs=81920M ..."). Returns 0 when no size is present
+// (e.g. "skipped ext4", "failed unmount", "failed e2fsck rc=4").
+func shrinkResultMB(sr string) int {
+	for _, tok := range strings.Fields(sr) {
+		t := strings.TrimSuffix(strings.TrimPrefix(tok, "fs="), "M")
+		if n, err := strconv.Atoi(t); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
 func convertField(out, key string) string {
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)

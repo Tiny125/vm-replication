@@ -51,6 +51,78 @@ trap cleanup EXIT
 DEV="$(readlink -f "$DEV" 2>/dev/null || echo "$DEV")"
 [ -b "$DEV" ] || { echo "$DEV is not a block device"; exit 1; }
 
+# Shrink-only mode (disk-mode cutover). The appliance calls this AFTER it has
+# created the instance's local disk, so the shrink can be sized to the real disk
+# Linode handed it rather than a guess against the plan's nominal size. Shrink a
+# whole-disk ext{2,3,4} filesystem on $DEV to VMREPL_SHRINK_MB MiB so the 1:1 copy
+# onto that local disk fits, print a "vmrepl-shrink:" result, and exit. Other
+# layouts are left untouched (the caller then requires a larger plan). Does not
+# convert anything else.
+if [ -n "${VMREPL_SHRINK_ONLY:-}" ]; then
+  target="${VMREPL_SHRINK_MB:-0}"
+  # resize2fs needs the device unmounted; the appliance unmounted it after
+  # conversion, but a lazy unmount can lag, so make sure (and retry).
+  for _t in 1 2 3 4 5; do
+    findmnt -nro TARGET -S "$DEV" >/dev/null 2>&1 || break
+    umount "$DEV" 2>/dev/null || true
+    sleep 1
+  done
+  if findmnt -nro TARGET -S "$DEV" >/dev/null 2>&1; then
+    log "could not unmount $DEV to shrink it (still busy); skipping shrink"
+    echo "vmrepl-shrink: failed unmount"
+    exit 0
+  fi
+  # Current filesystem size in MiB, read straight from the superblock.
+  fsmib() {
+    bc=$(tune2fs -l "$DEV" 2>/dev/null | awk -F: '/Block count/{gsub(/ /,"",$2);print $2}')
+    bz=$(tune2fs -l "$DEV" 2>/dev/null | awk -F: '/Block size/{gsub(/ /,"",$2);print $2}')
+    if [ -n "$bc" ] && [ -n "$bz" ]; then echo $(( bc * bz / 1048576 )); else echo 0; fi
+  }
+  devmib=$(( $(blockdev --getsize64 "$DEV" 2>/dev/null || echo 0) / 1048576 ))
+  fstype="$(blkid -s TYPE -o value "$DEV" 2>/dev/null || true)"
+  case "$fstype" in
+    ext2|ext3|ext4)
+      if [ "$target" -le 0 ] || [ "$target" -ge "$devmib" ]; then
+        log "shrink target ${target}MiB is not smaller than $DEV (${devmib}MiB); nothing to shrink"
+        echo "vmrepl-shrink: ok ${devmib}M"
+        exit 0
+      fi
+      log "Shrinking $fstype on $DEV to fit the local disk (target ${target}MiB)"
+      rc=0; e2fsck -fy "$DEV" >/dev/null 2>&1 || rc=$?
+      if [ "$rc" -ge 4 ]; then
+        log "e2fsck could not clean $DEV (rc=$rc); skipping shrink"
+        echo "vmrepl-shrink: failed e2fsck rc=$rc"
+        exit 0
+      fi
+      rout="$(resize2fs "$DEV" "${target}M" 2>&1)"; rrc=$?
+      echo "$rout" | sed 's/^/   [resize2fs] /'
+      cur=$(fsmib)
+      # Don't trust resize2fs's exit code alone: some images report success
+      # ("Nothing to do") without actually shrinking, which then fails the in-guest
+      # copy with "does not fit". If the filesystem is still larger than the target,
+      # force a minimize so the copy is guaranteed to fit; the first normal boot
+      # grows the root back to fill the whole local disk.
+      if [ "$rrc" -eq 0 ] && [ "${cur:-0}" -gt "$target" ]; then
+        log "targeted shrink left the filesystem at ${cur}MiB (> ${target}); minimizing instead"
+        rout="$(resize2fs -M "$DEV" 2>&1)"; rrc=$?
+        echo "$rout" | sed 's/^/   [resize2fs -M] /'
+        cur=$(fsmib)
+      fi
+      # Flush so the (subsequent) volume clone captures the shrunk filesystem, not
+      # stale cached blocks from before the resize.
+      sync; blockdev --flushbufs "$DEV" 2>/dev/null || true
+      if [ "$rrc" -eq 0 ] && [ "${cur:-0}" -gt 0 ] && [ "${cur:-0}" -le "$target" ]; then
+        echo "vmrepl-shrink: ok ${cur}M"
+      else
+        echo "vmrepl-shrink: failed resize2fs rc=$rrc fs=${cur:-?}M $(echo "$rout" | tr '\n' ' ' | tail -c 140)"
+      fi ;;
+    *)
+      log "filesystem on $DEV is ${fstype:-unknown}, not a whole-disk ext fs - cannot shrink to fit a smaller local disk"
+      echo "vmrepl-shrink: skipped ${fstype:-unknown}" ;;
+  esac
+  exit 0
+fi
+
 # The data arrived as a raw block stream, so the kernel's cached partition table
 # for this device is stale. Force a re-read through every mechanism available,
 # then let udev settle so the partition nodes + fs metadata appear.
@@ -521,80 +593,6 @@ rm -f "$MNT/root/.convert-inner.sh"
 log "Syncing"
 sync
 
-# Disk-mode cutover: the launched Linode's local disk is slightly smaller than a
-# same-sized Block Storage volume (Linode reserves a sliver of the plan's disk),
-# so a 1:1 whole-disk copy of an image equal to the plan size won't fit. When the
-# caller asks (VMREPL_SHRINK_MB, the plan disk minus a margin), shrink a
-# whole-disk ext filesystem to that size so the in-guest copy fits. Only ext{2,3,4}
-# whole-disk roots are shrunk; other layouts leave it to the caller to require a
-# larger plan. The filesystem must be UNMOUNTED here, so tear the mounts down first.
-devmib=$(( $(blockdev --getsize64 "$DEV" 2>/dev/null || echo 0) / 1048576 ))
-if [ -n "${VMREPL_SHRINK_MB:-}" ] && [ "$PARTITIONED" -eq 0 ] && [ "$VMREPL_SHRINK_MB" -lt "$devmib" ]; then
-  # Only shrink when the target (plan disk minus margin) is smaller than the source
-  # device; a larger target needs no shrink (the copy does a full dd instead).
-  #
-  # resize2fs REFUSES to shrink a mounted filesystem, so $DEV must be fully
-  # unmounted first. Unmount the chroot binds NON-lazily (a lazy `umount -l` returns
-  # before the mount is released and leaves $MNT busy, so the subsequent root
-  # unmount fails and the volume stays mounted — the shrink then silently fails),
-  # then unmount the root, retrying until $DEV really is gone from the mount table.
-  for m in dev/pts dev proc sys run boot; do
-    umount "$MNT/$m" 2>/dev/null || umount -l "$MNT/$m" 2>/dev/null || true
-  done
-  sync
-  for _try in 1 2 3 4 5; do
-    mountpoint -q "$MNT" || break
-    umount "$MNT" 2>/dev/null || umount "$DEV" 2>/dev/null || true
-    sleep 1
-  done
-  if mountpoint -q "$MNT"; then
-    log "could not unmount $DEV to shrink it (still busy); skipping shrink"
-    echo "vmrepl-shrink: failed unmount"
-  else
-    fstype="$(blkid -s TYPE -o value "$DEV" 2>/dev/null || true)"
-    case "$fstype" in
-      ext2|ext3|ext4)
-        log "Shrinking $fstype on $DEV to fit the smaller local disk (target ${VMREPL_SHRINK_MB}MiB)"
-        rc=0; e2fsck -fy "$DEV" >/dev/null 2>&1 || rc=$?
-        if [ "$rc" -ge 4 ]; then
-          log "e2fsck could not clean $DEV (rc=$rc); skipping shrink"
-          echo "vmrepl-shrink: failed e2fsck rc=$rc"
-        else
-          # Current filesystem size in MiB, read straight from the superblock.
-          fsmib() {
-            bc=$(tune2fs -l "$DEV" 2>/dev/null | awk -F: '/Block count/{gsub(/ /,"",$2);print $2}')
-            bz=$(tune2fs -l "$DEV" 2>/dev/null | awk -F: '/Block size/{gsub(/ /,"",$2);print $2}')
-            if [ -n "$bc" ] && [ -n "$bz" ]; then echo $(( bc * bz / 1048576 )); else echo 0; fi
-          }
-          rout="$(resize2fs "$DEV" "${VMREPL_SHRINK_MB}M" 2>&1)"; rrc=$?
-          echo "$rout" | sed 's/^/   [resize2fs] /'
-          cur=$(fsmib)
-          # Don't trust resize2fs's exit code alone: some images report success
-          # ("Nothing to do") without actually shrinking, which then fails the
-          # in-guest copy with "does not fit". If the filesystem is still larger
-          # than the target, force a minimize so the copy is guaranteed to fit; the
-          # first normal boot grows the root back to fill the whole local disk.
-          if [ "$rrc" -eq 0 ] && [ "${cur:-0}" -gt "$VMREPL_SHRINK_MB" ]; then
-            log "targeted shrink left the filesystem at ${cur}MiB (> ${VMREPL_SHRINK_MB}); minimizing instead"
-            rout="$(resize2fs -M "$DEV" 2>&1)"; rrc=$?
-            echo "$rout" | sed 's/^/   [resize2fs -M] /'
-            cur=$(fsmib)
-          fi
-          # Flush so the (subsequent) volume clone captures the shrunk filesystem,
-          # not stale cached blocks from before the resize.
-          sync; blockdev --flushbufs "$DEV" 2>/dev/null || true
-          if [ "$rrc" -eq 0 ] && [ "${cur:-0}" -gt 0 ] && [ "${cur:-0}" -le "$VMREPL_SHRINK_MB" ]; then
-            echo "vmrepl-shrink: ok ${cur}M"
-          else
-            echo "vmrepl-shrink: failed resize2fs rc=$rrc fs=${cur:-?}M $(echo "$rout" | tr '\n' ' ' | tail -c 140)"
-          fi
-        fi ;;
-      *)
-        log "filesystem on $DEV is ${fstype:-unknown}, not ext — cannot shrink to fit a smaller local disk"
-        echo "vmrepl-shrink: skipped ${fstype:-unknown}" ;;
-    esac
-  fi
-fi
 log "Conversion done. Next: in the Linode API/UI, create a config profile that"
 log "boots this disk (Kernel = GRUB 2, or Direct Disk) with the raw disk as sda,"
 log "then reboot out of rescue. See docs/CUTOVER.md."
