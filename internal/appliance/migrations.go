@@ -127,6 +127,15 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 				_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("disk %d: agent connected, replicating", diskIdx))
 			}
 		}, onProgress, func(serr error) {
+			// The receiver port is publicly reachable, so internet scanners and other
+			// non-agent clients connect and fail the TLS 1.3 + mutual-cert handshake.
+			// Those are connection noise, NOT a replication failure — logging them as a
+			// migration error raises a false "replication attempt failed" alarm on a
+			// healthy migration. Keep them in the system log only.
+			if isNonAgentHandshake(serr) {
+				log.Printf("appliance: migration %d disk %d: ignored non-agent connection on receiver port: %v", migID, diskID, serr)
+				return
+			}
 			_ = s.st.RecordDiskError(s.ctx, diskID, serr.Error())
 			_ = s.st.AddEvent(s.ctx, migID, "error", fmt.Sprintf("disk %d (%s): replication attempt failed: %s", diskIdx, dev0, serr.Error()))
 		}, func(h protocol.Hello) bool {
@@ -1642,6 +1651,33 @@ func isBlockDevice(path string) bool {
 		return false
 	}
 	return info.Mode()&os.ModeDevice != 0
+}
+
+// isNonAgentHandshake reports whether a receiver session error is just a stray,
+// non-agent connection failing the TLS 1.3 + mutual-certificate handshake (internet
+// port scanners, health probes, plain-HTTP pokes). The real agent always negotiates
+// TLS 1.3 with a valid client cert, so these can never be a genuine replication
+// failure — we keep them out of the migration's error log to avoid false alarms.
+func isNonAgentHandshake(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	for _, sig := range []string{
+		"client offered only unsupported versions",        // old TLS (no 1.3)
+		"remote error: tls:",                              // peer aborted the handshake
+		"first record does not look like a tls handshake", // plain HTTP / junk
+		"tls: bad certificate",
+		"tls: certificate required",
+		"client didn't provide a certificate",
+		"tls: no certificates configured",
+		"tls: unsupported", // misc unsupported handshake parameters
+	} {
+		if strings.Contains(s, sig) {
+			return true
+		}
+	}
+	return false
 }
 
 func trimOut(b []byte) string {
