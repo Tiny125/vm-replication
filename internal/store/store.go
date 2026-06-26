@@ -127,6 +127,8 @@ CREATE TABLE IF NOT EXISTS migrations (
   boot_target     TEXT NOT NULL DEFAULT 'volume',
   plan_class      TEXT NOT NULL DEFAULT '',
   linode_type     TEXT NOT NULL DEFAULT '',
+  replication_enabled INTEGER NOT NULL DEFAULT 0,
+  enrolled_at     INTEGER NOT NULL DEFAULT 0,
   created_at      INTEGER NOT NULL
 );
 
@@ -147,6 +149,7 @@ CREATE TABLE IF NOT EXISTS migration_disks (
   bytes_on_wire   INTEGER NOT NULL DEFAULT 0,
   last_sync_at    INTEGER NOT NULL DEFAULT 0,
   agent_last_seen INTEGER NOT NULL DEFAULT 0,
+  agent_connected_at INTEGER NOT NULL DEFAULT 0,
   last_error      TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_disks_migration ON migration_disks(migration_id, idx);
@@ -188,9 +191,22 @@ CREATE INDEX IF NOT EXISTS idx_audit_migration ON audit_log(migration_id, id);
 		`ALTER TABLE migrations ADD COLUMN plan_class TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE migrations ADD COLUMN linode_type TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE migration_disks ADD COLUMN last_error TEXT NOT NULL DEFAULT ''`,
+		// Gated replication start: the operator validates the agent connection, then
+		// explicitly starts replication. replication_enabled flips on the "Start
+		// replication" action; enrolled_at marks when the agent was first downloaded
+		// (install running) so the console can time out a never-connecting agent;
+		// agent_connected_at records each successful agent handshake (even a held one).
+		`ALTER TABLE migrations ADD COLUMN replication_enabled INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE migrations ADD COLUMN enrolled_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE migration_disks ADD COLUMN agent_connected_at INTEGER NOT NULL DEFAULT 0`,
 	} {
 		_, _ = s.db.Exec(stmt)
 	}
+	// Migrations created before the gated-start flow have replication_enabled=0 but
+	// are already replicating (or beyond). Mark them enabled so the new gate never
+	// holds an in-flight migration and the console reflects their real state. Only
+	// the pre-start states are left disabled.
+	_, _ = s.db.Exec(`UPDATE migrations SET replication_enabled=1 WHERE state NOT IN ('created','awaiting_agent') AND replication_enabled=0`)
 	return nil
 }
 

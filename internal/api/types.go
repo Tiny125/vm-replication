@@ -185,7 +185,12 @@ type Disk struct {
 	BytesOnWire   int64     `json:"bytes_on_wire"`
 	LastSyncAt    time.Time `json:"last_sync_at"`
 	AgentLastSeen time.Time `json:"agent_last_seen"`
-	LastError     string    `json:"last_error,omitempty"` // last receiver-side session error
+	// AgentConnectedAt is the last time this disk's agent completed a handshake
+	// with the receiver — including a "held" handshake before replication is
+	// started. It is how the console knows the agent connection is validated even
+	// before any data has flowed.
+	AgentConnectedAt time.Time `json:"agent_connected_at"`
+	LastError        string    `json:"last_error,omitempty"` // last receiver-side session error
 }
 
 // Event is one entry in a migration's activity log.
@@ -217,6 +222,14 @@ type Migration struct {
 	BootTarget string `json:"boot_target,omitempty"`
 	PlanClass  string `json:"plan_class,omitempty"`
 	LinodeType string `json:"linode_type,omitempty"`
+
+	// ReplicationEnabled is the gate the operator flips with "Start replication":
+	// while false the receiver acknowledges the agent connection but holds (no
+	// data is applied); once true the next agent pass streams the baseline.
+	ReplicationEnabled bool `json:"replication_enabled"`
+	// EnrolledAt is when the agent was first downloaded onto the source (the
+	// install command ran). Used to time out an agent that never connects.
+	EnrolledAt time.Time `json:"enrolled_at,omitempty"`
 
 	// Finalize result.
 	ImageID    string `json:"image_id,omitempty"` // primary (boot) artifact, "volume:<id>"
@@ -297,6 +310,18 @@ type MigrationView struct {
 	Assessed     bool              `json:"assessed"` // pre-migration assessment passed
 	EnrollCmd    string            `json:"enroll_cmd,omitempty"`
 	UninstallCmd string            `json:"uninstall_cmd,omitempty"`
+
+	// Gated replication start (computed for the console):
+	//   AgentConnected     — every disk's agent has handshaked recently (tick).
+	//   ConnectionFailed   — enrolled, the grace window elapsed, and not all
+	//                        disks' agents have connected (show "connection failed").
+	//   ReplicationStarted — the operator has started replication (gate enabled).
+	//   CanReplicate       — connection validated and not started yet, so the
+	//                        "Start replication" button is enabled.
+	AgentConnected     bool `json:"agent_connected"`
+	ConnectionFailed   bool `json:"connection_failed"`
+	ReplicationStarted bool `json:"replication_started"`
+	CanReplicate       bool `json:"can_replicate"`
 
 	// Live progress for the console: Phase is a human label ("initial sync",
 	// "finalizing", …); PercentDone/ETASeconds are -1 when unknown.

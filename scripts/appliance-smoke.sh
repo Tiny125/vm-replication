@@ -98,11 +98,30 @@ SH=$(curl -fsS --cacert "$CACERT" "$BASE/install/agent.sh?token=$TOKEN")
 echo "$SH" | grep -q 'systemctl stop vmrepl-agent' || { echo "FAIL: installer not re-run safe"; exit 1; }
 echo "   OK: 2 ExecStart lines, stop-before-replace"
 
-echo "== Replicate each disk to its own port =="
 run_disk(){ local dev=$1 port=$2 man=$3; local ok=0; for _ in 1 2 3 4 5; do
   if "$WORK/agent" -device "$dev" -target "127.0.0.1:$port" -server-name 127.0.0.1 \
      -manifest "$man" -cert "$WORK/certs/agent.crt" -key "$WORK/certs/agent.key" -ca "$WORK/certs/ca.crt"; then ok=1; break; fi
   sleep 0.5; done; [ "$ok" = 1 ]; }
+
+echo "== Gated start: a first agent pass only VALIDATES the connection (no data) =="
+# Replication is not auto-started: the receiver acknowledges the agent and holds.
+run_disk "$WORK/sda.img" "$PORT0" "$WORK/sda.cbt" || { echo "FAIL: boot disk connection check"; exit 1; }
+run_disk "$WORK/sdb.img" "$PORT1" "$WORK/sdb.cbt" || { echo "FAIL: data disk connection check"; exit 1; }
+V=$(api "$BASE/api/v1/migrations/$MID")
+echo "$V" | jq -e '.agent_connected==true' >/dev/null || { echo "FAIL: agent_connected should be true after a connection check: $V"; exit 1; }
+echo "$V" | jq -e '.replication_started==false' >/dev/null || { echo "FAIL: replication must NOT auto-start"; exit 1; }
+echo "$V" | jq -e '.can_replicate==true' >/dev/null || { echo "FAIL: start should be enabled once the connection is validated"; exit 1; }
+echo "$V" | jq -e '.migration.disks | all(.full_sync_done|not)' >/dev/null || { echo "FAIL: no disk should be baselined before replication is started"; exit 1; }
+cmp -s "$WORK/sda.img" "$WORK/data/migration-$MID-disk0.img" 2>/dev/null && { echo "FAIL: data was applied before replication was started"; exit 1; }
+echo "   OK: connection validated, replication held (no data written), start enabled"
+
+echo "== Start replication (explicit operator gate) =="
+api -X POST "$BASE/api/v1/migrations/$MID/replicate" >/dev/null || { echo "FAIL: /replicate rejected"; exit 1; }
+V=$(api "$BASE/api/v1/migrations/$MID")
+echo "$V" | jq -e '.replication_started==true' >/dev/null || { echo "FAIL: replication_started should be true after /replicate: $V"; exit 1; }
+echo "   OK: replication started by operator"
+
+echo "== Replicate each disk to its own port =="
 run_disk "$WORK/sda.img" "$PORT0" "$WORK/sda.cbt" || { echo "FAIL: boot disk sync"; exit 1; }
 run_disk "$WORK/sdb.img" "$PORT1" "$WORK/sdb.cbt" || { echo "FAIL: data disk sync"; exit 1; }
 
@@ -123,7 +142,11 @@ echo "$V" | jq -e '.can_migrate==true' >/dev/null || { echo "FAIL: should be cut
 echo "   OK: can_migrate true without an assessment step"
 
 echo "== Cutover (file-fallback finalize) =="
-api -X POST "$BASE/api/v1/migrations/$MID/start" -H 'Content-Type: application/json' -d '{}' >/dev/null
+# skip_snapshot: the "source" here is static image files (never changing), so the
+# replicated data is already consistent. Without this the cutover would block for
+# minutes in quiesceForCutover waiting for a crash-consistent pass from the (one-shot,
+# already-exited but still recently-seen) agent that never comes.
+api -X POST "$BASE/api/v1/migrations/$MID/start" -H 'Content-Type: application/json' -d '{"skip_snapshot":true}' >/dev/null
 for _ in $(seq 1 50); do
   STATE=$(api "$BASE/api/v1/migrations/$MID" | jq -r '.migration.state')
   [ "$STATE" = "image_ready" ] && break

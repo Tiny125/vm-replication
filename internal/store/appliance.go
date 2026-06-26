@@ -181,21 +181,24 @@ func (s *Store) LinodeAccount(ctx context.Context) (string, error) {
 // the migrations table remain for older databases but are no longer read.)
 const migCols = `id, name, state, source_hostname, source_ip, source_device, source_disk_size,
  image_id, launched_id, last_error, assessed_at, migrate_started, migrate_finished,
- boot_target, plan_class, linode_type, created_at`
+ boot_target, plan_class, linode_type, replication_enabled, enrolled_at, created_at`
 
 func scanMigration(row interface{ Scan(...any) error }) (api.Migration, error) {
 	var m api.Migration
 	var state string
-	var assessed, migStart, migFinish, created int64
+	var assessed, migStart, migFinish, enrolled, created int64
+	var replEnabled int
 	if err := row.Scan(&m.ID, &m.Name, &state, &m.SourceHostname, &m.SourceIP, &m.SourceDevice, &m.SourceDiskSize,
 		&m.ImageID, &m.LaunchedID, &m.LastError, &assessed, &migStart, &migFinish,
-		&m.BootTarget, &m.PlanClass, &m.LinodeType, &created); err != nil {
+		&m.BootTarget, &m.PlanClass, &m.LinodeType, &replEnabled, &enrolled, &created); err != nil {
 		return api.Migration{}, err
 	}
 	m.State = api.MigrationState(state)
 	m.AssessedAt = fromUnix(assessed)
 	m.MigrateStarted = fromUnix(migStart)
 	m.MigrateFinished = fromUnix(migFinish)
+	m.ReplicationEnabled = replEnabled != 0
+	m.EnrolledAt = fromUnix(enrolled)
 	m.CreatedAt = fromUnix(created)
 	return m, nil
 }
@@ -250,20 +253,21 @@ INSERT INTO migration_disks (migration_id, idx, source_device, size_bytes) VALUE
 }
 
 const diskCols = `id, idx, source_device, size_bytes, receiver_port, volume_id, volume_device,
- artifact_id, full_sync_done, total_blocks, changed_blocks, bytes_on_wire, last_sync_at, agent_last_seen, last_error`
+ artifact_id, full_sync_done, total_blocks, changed_blocks, bytes_on_wire, last_sync_at, agent_last_seen, agent_connected_at, last_error`
 
 func scanDisk(row interface{ Scan(...any) error }) (api.Disk, error) {
 	var d api.Disk
 	var full int
-	var lastSync, agentSeen int64
+	var lastSync, agentSeen, agentConn int64
 	if err := row.Scan(&d.ID, &d.Index, &d.SourceDevice, &d.SizeBytes, &d.ReceiverPort, &d.VolumeID,
 		&d.VolumeDevice, &d.ArtifactID, &full, &d.TotalBlocks, &d.ChangedBlocks, &d.BytesOnWire,
-		&lastSync, &agentSeen, &d.LastError); err != nil {
+		&lastSync, &agentSeen, &agentConn, &d.LastError); err != nil {
 		return api.Disk{}, err
 	}
 	d.FullSyncDone = full != 0
 	d.LastSyncAt = fromUnix(lastSync)
 	d.AgentLastSeen = fromUnix(agentSeen)
+	d.AgentConnectedAt = fromUnix(agentConn)
 	return d, nil
 }
 
@@ -383,6 +387,41 @@ func (s *Store) SetDiskArtifact(ctx context.Context, diskID int64, artifactID st
 func (s *Store) RecordDiskError(ctx context.Context, diskID int64, msg string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE migration_disks SET last_error=?, agent_last_seen=? WHERE id=?`,
 		msg, unix(time.Now()), diskID)
+	return err
+}
+
+// RecordAgentConnected stamps a disk's agent_connected_at (and refreshes
+// agent_last_seen) to now. It is called on every successful agent handshake —
+// including a "held" one before replication is started — so the console can show
+// the agent as connected without any data having to flow yet.
+func (s *Store) RecordAgentConnected(ctx context.Context, diskID int64) error {
+	now := unix(time.Now())
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE migration_disks SET agent_connected_at=?, agent_last_seen=? WHERE id=?`, now, now, diskID)
+	return err
+}
+
+// SetReplicationEnabled flips a migration's replication gate. While disabled the
+// receiver acknowledges agent connections but holds (applies no data); enabling
+// it lets the next agent pass stream.
+func (s *Store) SetReplicationEnabled(ctx context.Context, id int64, enabled bool) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE migrations SET replication_enabled=? WHERE id=?`, boolToInt(enabled), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkEnrolled stamps enrolled_at to now the first time the agent is downloaded
+// for a migration (i.e. the install command is running on the source), so the
+// console can time out an agent that never checks in. Idempotent: only the first
+// download sets it; later re-downloads leave the original timestamp.
+func (s *Store) MarkEnrolled(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE migrations SET enrolled_at=? WHERE id=? AND enrolled_at=0`, unix(time.Now()), id)
 	return err
 }
 

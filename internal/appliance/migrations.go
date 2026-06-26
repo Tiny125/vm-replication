@@ -142,12 +142,72 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 			// Bounce a live pass into a crash-consistent re-read while we're quiescing
 			// this disk for cutover (but never re-request a pass already consistent).
 			return s.wantDiskConsistency(diskID) && !h.Consistent
+		}, func(h protocol.Hello) bool {
+			// Replication gate: record that this disk's agent connected (validates the
+			// connection in the console, even before any data flows) and report whether
+			// the operator has started replication. While disabled the receiver holds.
+			if err := s.st.RecordAgentConnected(s.ctx, diskID); err != nil {
+				log.Printf("appliance: record agent connected (migration %d disk %d): %v", migID, diskID, err)
+			}
+			return s.replicationEnabled(migID)
 		})
 		if err != nil && ctx.Err() == nil {
 			log.Printf("appliance: receiver (migration %d disk %d) stopped: %v", migID, diskID, err)
 		}
 	}()
 	return nil
+}
+
+// replicationEnabled reports whether the operator has started replication for a
+// migration (the gate the receiver consults on every agent handshake). It holds
+// ONLY in the pre-start phase: anything already replicating or beyond is treated
+// as enabled, which also covers migrations created before the gated-start flow
+// and never wedges an in-flight migration. On a transient read error it fails
+// open (allows) rather than stalling an active migration.
+func (s *Server) replicationEnabled(migID int64) bool {
+	m, err := s.st.Migration(s.ctx, migID)
+	if err != nil {
+		return true
+	}
+	if m.ReplicationEnabled {
+		return true
+	}
+	switch m.State {
+	case api.MigCreated, api.MigAwaitingAgent:
+		return false
+	default:
+		return true
+	}
+}
+
+// Connection-validation windows for the gated-start flow.
+const (
+	// agentConnectedWindow is how recently a disk's agent must have handshaked to
+	// count as "connected" (the agent re-checks every 60s; this allows a miss).
+	agentConnectedWindow = 150 * time.Second
+	// agentConnectGrace is how long after the agent download (enrolled_at) we wait
+	// for a first connection before the console reports "connection failed". It's
+	// the typical install+connect time plus a buffer; it stays soft (it flips back
+	// to connected the moment a handshake lands).
+	agentConnectGrace = 90 * time.Second
+)
+
+// diskAgentConnected reports whether a disk's agent handshaked within the window.
+func diskAgentConnected(d api.Disk) bool {
+	return !d.AgentConnectedAt.IsZero() && time.Since(d.AgentConnectedAt) < agentConnectedWindow
+}
+
+// allAgentsConnected reports whether every disk's agent is currently connected.
+func allAgentsConnected(m api.Migration) bool {
+	if len(m.Disks) == 0 {
+		return false
+	}
+	for _, d := range m.Disks {
+		if !diskAgentConnected(d) {
+			return false
+		}
+	}
+	return true
 }
 
 // ---- crash-consistent cutover coordination ----
@@ -605,6 +665,46 @@ func (s *Server) handleMigrationEvents(w http.ResponseWriter, r *http.Request) {
 		events = []api.Event{}
 	}
 	writeJSON(w, http.StatusOK, events)
+}
+
+// handleStartReplication flips the replication gate on after the operator has
+// confirmed (in the console) that the agent connection is validated. Until this
+// is called the receiver acknowledges agent connections but holds (applies no
+// data); afterwards the next agent pass streams the baseline. The console labels
+// this "Start replication".
+func (s *Server) handleStartReplication(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	m, err := s.st.Migration(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	if m.ReplicationEnabled {
+		// Idempotent: already started.
+		writeJSON(w, http.StatusOK, map[string]string{"status": "replicating"})
+		return
+	}
+	// Only valid before replication/cutover has begun, and only once every disk's
+	// agent connection has been validated (so a started baseline can actually run).
+	if m.State != api.MigAwaitingAgent && m.State != api.MigCreated {
+		writeErr(w, http.StatusConflict, "replication can only be started while waiting for the agent")
+		return
+	}
+	if !allAgentsConnected(m) {
+		writeErr(w, http.StatusConflict, "the agent has not connected on all disks yet — wait for the connection to be validated")
+		return
+	}
+	if err := s.st.SetReplicationEnabled(ctx, id, true); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.st.AddEvent(ctx, id, "info", "replication started by operator; the agent will stream the initial full sync on its next pass (within ~60s)")
+	// Receivers are already listening from create time; they will now accept data.
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "replicating"})
 }
 
 // handleStartMigration cuts over: it stops replication and runs finalize
@@ -1496,9 +1596,30 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	v.CanMigrate = cutoverReady(m)
 	v.Assessed = v.CanMigrate // no separate manual assessment; readiness is auto-computed
 
+	// Gated-start signals for the console: the agent connection is validated
+	// independently of any data flowing, replication is started explicitly, and a
+	// never-connecting agent is reported (softly) once the post-install grace ends.
+	v.AgentConnected = allAgentsConnected(m)
+	v.ReplicationStarted = m.ReplicationEnabled
+	if !m.ReplicationEnabled && (m.State == api.MigAwaitingAgent || m.State == api.MigCreated) {
+		v.CanReplicate = v.AgentConnected
+		if !v.AgentConnected && !m.EnrolledAt.IsZero() && time.Since(m.EnrolledAt) > agentConnectGrace {
+			v.ConnectionFailed = true
+		}
+	}
+
 	switch m.State {
 	case api.MigCreated, api.MigAwaitingAgent:
-		v.Phase = "waiting for agent"
+		switch {
+		case m.ReplicationEnabled:
+			v.Phase = "starting replication"
+		case v.AgentConnected:
+			v.Phase = "agent connected — ready to start replication"
+		case v.ConnectionFailed:
+			v.Phase = "agent not detected"
+		default:
+			v.Phase = "waiting for agent"
+		}
 	case api.MigReplicating, api.MigReady:
 		v.Phase = "replicating"
 		// Aggregate initial-sync progress across all disks still baselining.

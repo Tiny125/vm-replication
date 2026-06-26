@@ -573,6 +573,34 @@ async function stopMig(id,btn){
   if(!await confirmModal({title:'Stop cutover #'+id+'?',html:'The finalize run is cancelled and replication resumes.',okText:'Stop cutover',okDanger:true}))return;
   busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/stop');await refreshMig(id)}catch(e){alertModal({title:'Cannot stop',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
+async function startReplication(id,btn){
+  if(!await confirmModal({title:'Start replication for #'+id+'?',html:'The agent connection is validated. This begins the <b>initial full sync</b> from the source; the agent streams every block, then keeps the copy current. You can cut over once the baseline completes.',okText:'Start replication'}))return;
+  busy(btn,true);
+  try{await api('POST','/api/v1/migrations/'+id+'/replicate',{});await refreshMig(id)}
+  catch(e){alertModal({title:'Cannot start replication',html:esc(e.message),danger:true})}finally{busy(btn,false)}
+}
+// connStatus renders the agent-connection state for the enroll panel: a green
+// tick once every disk's agent has handshaked, a soft "connection failed" once
+// the post-install grace elapses with no agent, or a waiting note. It also gates
+// the "Start replication" button — enabled only when the connection is validated.
+function connStatus(v,m){
+  if(v.replication_started)
+    return '<div class="resultbox ok" style="margin-top:10px">✔ Replication started — the agent is streaming the initial full sync.</div>';
+  let box,btnAttr;
+  if(v.agent_connected){
+    box='<div class="resultbox ok"><b>✔ Agent connected</b> on all disks — connection validated. Click <b>Start replication</b> to begin the initial full sync.</div>';
+    btnAttr='';
+  }else if(v.connection_failed){
+    box='<div class="resultbox bad"><b>✘ Connection failed.</b> The agent hasn’t checked in. Confirm the install command ran on <b>'+esc(m.source_hostname||'the source')+'</b>, and that the appliance’s receiver ports (TCP 5000–5100) are reachable. The agent retries every 60s, so this clears automatically once it connects.</div>';
+    btnAttr=' disabled title="Waiting for the agent connection to be validated"';
+  }else{
+    box='<div class="resultbox">Waiting for the agent to connect (usually within ~60s of running the command above)…</div>';
+    btnAttr=' disabled title="Waiting for the agent connection to be validated"';
+  }
+  return '<div style="margin-top:10px">'+box+
+    '<div class="actions"><button class="primary"'+btnAttr+' onclick="startReplication('+m.id+',this)">Start replication</button>'+
+    infoIcon('Replication does not start automatically. Once the agent connection shows a green tick, this begins the initial full sync. Until then the agent only validates connectivity and copies no data.')+'</div></div>';
+}
 async function deleteMig(id,name,btn){
   if(!await confirmModal({title:'Delete migration #'+id+'?',
     html:'<b>'+esc(name)+'</b><div style="margin-top:8px" class="warn">This deletes any <name>-cutover image volume(s) and the launched cutover Linode. It cannot be undone.</div>'+
@@ -611,7 +639,10 @@ async function checkStatus(id,btn){
       box.classList.remove('hide');
       if(allDone(m)){box.className='resultbox ok';box.textContent='✔ All disks baselined and replicating.';}
       else if(err){box.className='resultbox bad';box.textContent='✘ Last replication attempt failed: '+err;}
-      else{box.className='resultbox';box.textContent='No completed sync yet. The agent retries every 60s — run the force-retry command on the source if needed.';}
+      else if(v.agent_connected&&!v.replication_started){box.className='resultbox ok';box.textContent='✔ Agent connected on all disks — connection validated. Click Start replication to begin the initial sync.';}
+      else if(v.replication_started){box.className='resultbox';box.textContent='Replication started — initial full sync in progress.';}
+      else if(v.connection_failed){box.className='resultbox bad';box.textContent='✘ Connection failed — the agent has not checked in. Verify the install command ran and TCP 5000-5100 is reachable.';}
+      else{box.className='resultbox';box.textContent='Waiting for the agent to connect — it retries every 60s. Run the force-retry command on the source if needed.';}
     }
     flash(card);
   }catch(e){const box=$('status'+id);if(box){box.className='resultbox bad';box.textContent='Error: '+e.message}}
@@ -737,6 +768,19 @@ function diskTable(m){const d=disks(m);if(!d.length)return '';
 }
 function infoIcon(tip){return '<span class="info" data-tip="'+esc(tip)+'">i</span>'}
 function stateLabel(s){return ({created:'created',awaiting_agent:'waiting for agent',replicating:'replicating',ready:'ready to cut over',awaiting_cutover:'power off source, then complete',migrating:'finalizing',image_ready:'image ready',launched:'launched',failed:'failed'})[s]||s}
+// pillFor renders the header status pill. Before replication starts (state still
+// awaiting_agent/created) it reflects the gated-start connection signals so the
+// operator sees connect → start at a glance; otherwise it uses the migration state.
+function pillFor(v,m){
+  if((m.state==='awaiting_agent'||m.state==='created') && !v.replication_started){
+    if(v.agent_connected)return '<span class="pill ok">agent connected</span>';
+    if(v.connection_failed)return '<span class="pill bad">connection failed</span>';
+    return '<span class="pill warn">waiting for agent</span>';
+  }
+  if((m.state==='awaiting_agent'||m.state==='created') && v.replication_started)
+    return '<span class="pill warn">starting replication</span>';
+  return '<span class="pill '+stateClass(m.state)+'">'+esc(stateLabel(m.state))+'</span>';
+}
 // statusLegend renders a hover legend that shows each status as its ACTUAL
 // colored pill (so you can match what you see in the table to its meaning).
 const STATE_DESCS=[['awaiting_agent','enrolled; the agent has not connected yet'],
@@ -799,7 +843,7 @@ function migCard(v){
 
   h+='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+statusLegend()+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
     '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_ip||m.source_hostname||'-')+'</span></td>'+
-    '<td><span class="pill '+stateClass(m.state)+'">'+esc(stateLabel(m.state))+'</span></td>'+
+    '<td>'+pillFor(v,m)+'</td>'+
     '<td class="muted">'+disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining')+'</td>'+
     '<td>'+progressLine(v,m)+'</td>'+
     '<td class="muted">'+(v.rpo_seconds?Math.round(v.rpo_seconds)+'s':'—')+'</td></tr></table>';
@@ -851,6 +895,7 @@ function migCard(v){
        'Force a retry on the source with <code style="display:inline;padding:1px 5px">sudo systemctl start vmrepl-agent.service</code>, then click <b>Check status</b> below.</div>'+
        '<div class="actions"><button onclick="checkStatus('+m.id+',this)">Check status</button></div>'+
        '<div id="status'+m.id+'" class="resultbox hide"></div>'+
+       connStatus(v,m)+
        '<hr class="migdivider"></div></details>';
   }
   if(v.uninstall_cmd && ['image_ready','launched'].includes(m.state)){
