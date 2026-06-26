@@ -329,6 +329,14 @@ func replicate(c cfg, mode snapshot.Mode, mayBail bool) (_ syncResult, resync bo
 	if mayBail && ack.ConsistentResync && !passConsistent {
 		return res, true, nil
 	}
+	// Connection validated, but the operator hasn't started replication yet: the
+	// receiver acknowledges us so the console can show the agent as connected, but
+	// asks us to HOLD. Exit cleanly (not an error) so the systemd timer keeps
+	// re-checking every tick; once replication is started the next pass streams.
+	if ack.Hold {
+		log.Printf("agent: connection validated — replication not started yet (waiting for the operator to start it in the console); will retry")
+		return res, false, nil
+	}
 	if !ack.Accepted {
 		return res, false, fmt.Errorf("receiver rejected session: %s", ack.Message)
 	}

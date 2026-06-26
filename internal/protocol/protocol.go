@@ -106,6 +106,13 @@ type HelloAck struct {
 	// replication stays live and disruption-free, and only the final pre-launch
 	// pass is quiesced. Old agents that don't understand it simply ignore it.
 	ConsistentResync bool `json:"consistent_resync,omitempty"`
+	// Hold tells the agent that the connection is validated but replication has
+	// NOT been started yet by the operator: the agent should treat this as a
+	// successful connection check (not an error) and retry on its next tick
+	// without streaming any data. The receiver sets it (with Accepted=false)
+	// until the operator clicks "Start replication" in the console. Old agents
+	// that don't understand it see Accepted=false and simply retry next tick.
+	Hold bool `json:"hold,omitempty"`
 }
 
 // Done closes the stream and reports what the agent sent.
