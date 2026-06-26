@@ -204,9 +204,15 @@ CREATE INDEX IF NOT EXISTS idx_audit_migration ON audit_log(migration_id, id);
 	}
 	// Migrations created before the gated-start flow have replication_enabled=0 but
 	// are already replicating (or beyond). Mark them enabled so the new gate never
-	// holds an in-flight migration and the console reflects their real state. Only
-	// the pre-start states are left disabled.
-	_, _ = s.db.Exec(`UPDATE migrations SET replication_enabled=1 WHERE state NOT IN ('created','awaiting_agent') AND replication_enabled=0`)
+	// holds an in-flight migration and the console reflects their real state. This
+	// runs EXACTLY ONCE (guarded by a settings sentinel): on later restarts it must
+	// not re-enable a migration the operator has deliberately PAUSED.
+	var backfilled string
+	_ = s.db.QueryRow(`SELECT value FROM settings WHERE key='repl_gate_backfilled'`).Scan(&backfilled)
+	if backfilled == "" {
+		_, _ = s.db.Exec(`UPDATE migrations SET replication_enabled=1 WHERE state NOT IN ('created','awaiting_agent')`)
+		_, _ = s.db.Exec(`INSERT INTO settings(key,value) VALUES('repl_gate_backfilled','1') ON CONFLICT(key) DO UPDATE SET value='1'`)
+	}
 	return nil
 }
 

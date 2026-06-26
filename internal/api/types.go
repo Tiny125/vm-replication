@@ -311,16 +311,21 @@ type MigrationView struct {
 	EnrollCmd    string            `json:"enroll_cmd,omitempty"`
 	UninstallCmd string            `json:"uninstall_cmd,omitempty"`
 
-	// Gated replication start (computed for the console):
+	// Gated replication start + pause/resume (computed for the console):
 	//   AgentConnected     — every disk's agent has handshaked recently (tick).
-	//   ConnectionFailed   — enrolled, the grace window elapsed, and not all
-	//                        disks' agents have connected (show "connection failed").
-	//   ReplicationStarted — the operator has started replication (gate enabled).
-	//   CanReplicate       — connection validated and not started yet, so the
-	//                        "Start replication" button is enabled.
+	//   ConnectionFailed   — enrolled, the grace window elapsed, and the agent has
+	//                        never connected (show "connection failed"); pre-start only.
+	//   ReplicationStarted — replication has ever been started (started or paused),
+	//                        used to pick "Start" vs "Resume"/"Pause" in the console.
+	//   ReplicationActive  — the gate is currently enabled (data is flowing).
+	//   ReplicationPaused  — started but the gate is currently disabled (paused).
+	//   CanReplicate       — connection validated and the gate is off, so the
+	//                        "Start replication" / "Resume replication" button is enabled.
 	AgentConnected     bool `json:"agent_connected"`
 	ConnectionFailed   bool `json:"connection_failed"`
 	ReplicationStarted bool `json:"replication_started"`
+	ReplicationActive  bool `json:"replication_active"`
+	ReplicationPaused  bool `json:"replication_paused"`
 	CanReplicate       bool `json:"can_replicate"`
 
 	// Live progress for the console: Phase is a human label ("initial sync",

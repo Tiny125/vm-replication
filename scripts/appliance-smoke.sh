@@ -141,6 +141,23 @@ echo "== Cutover is auto-enabled once baselined (no manual assessment) =="
 echo "$V" | jq -e '.can_migrate==true' >/dev/null || { echo "FAIL: should be cutover-ready once baselined"; exit 1; }
 echo "   OK: can_migrate true without an assessment step"
 
+echo "== Pause replication: the gate holds, no data is applied =="
+api -X POST "$BASE/api/v1/migrations/$MID/pause" >/dev/null || { echo "FAIL: /pause rejected"; exit 1; }
+V=$(api "$BASE/api/v1/migrations/$MID")
+echo "$V" | jq -e '.replication_active==false and .replication_paused==true' >/dev/null || { echo "FAIL: not paused: $V"; exit 1; }
+# Change the source, then run the agent: while paused it must be HELD (target unchanged).
+printf 'PAUSEDWRITE' | dd of="$WORK/sda.img" bs=1 seek=1048576 conv=notrunc status=none
+run_disk "$WORK/sda.img" "$PORT0" "$WORK/sda.cbt" || { echo "FAIL: agent pass during pause errored (should hold cleanly)"; exit 1; }
+cmp -s "$WORK/sda.img" "$WORK/data/migration-$MID-disk0.img" && { echo "FAIL: target changed while paused"; exit 1; }
+echo "   OK: paused — agent held, the source change was not applied"
+
+echo "== Resume replication: an incremental delta catches the target up =="
+api -X POST "$BASE/api/v1/migrations/$MID/replicate" >/dev/null || { echo "FAIL: resume (/replicate) rejected"; exit 1; }
+echo "$(api "$BASE/api/v1/migrations/$MID")" | jq -e '.replication_active==true' >/dev/null || { echo "FAIL: not active after resume"; exit 1; }
+run_disk "$WORK/sda.img" "$PORT0" "$WORK/sda.cbt" || { echo "FAIL: delta pass after resume"; exit 1; }
+cmp -s "$WORK/sda.img" "$WORK/data/migration-$MID-disk0.img" || { echo "FAIL: target not caught up after resume (delta not applied)"; exit 1; }
+echo "   OK: resumed — delta applied (no full re-copy), target matches again"
+
 echo "== Cutover (file-fallback finalize) =="
 # skip_snapshot: the "source" here is static image files (never changing), so the
 # replicated data is already consistent. Without this the cutover would block for

@@ -158,12 +158,14 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 	return nil
 }
 
-// replicationEnabled reports whether the operator has started replication for a
-// migration (the gate the receiver consults on every agent handshake). It holds
-// ONLY in the pre-start phase: anything already replicating or beyond is treated
-// as enabled, which also covers migrations created before the gated-start flow
-// and never wedges an in-flight migration. On a transient read error it fails
-// open (allows) rather than stalling an active migration.
+// replicationEnabled reports whether the receiver should apply data for a
+// migration (the gate consulted on every agent handshake). It is authoritative
+// on the ReplicationEnabled flag so the operator can both start and PAUSE
+// replication. The one exception is an in-progress cutover (migrating /
+// awaiting_cutover): the final crash-consistent pass must be allowed through even
+// if replication was paused. On a transient read error it fails open (allows)
+// rather than stalling an active migration. Migrations created before this flow
+// are marked enabled by a one-time startup backfill, so they are never held.
 func (s *Server) replicationEnabled(migID int64) bool {
 	m, err := s.st.Migration(s.ctx, migID)
 	if err != nil {
@@ -173,11 +175,36 @@ func (s *Server) replicationEnabled(migID int64) bool {
 		return true
 	}
 	switch m.State {
-	case api.MigCreated, api.MigAwaitingAgent:
-		return false
+	case api.MigMigrating, api.MigAwaitingCutover:
+		return true // cutover needs the final consistent pass even if paused
 	default:
+		return false
+	}
+}
+
+// pausableStates are the migration states where replication can be started,
+// paused or resumed (i.e. the steady replication phase, before cutover).
+func replicationControllable(st api.MigrationState) bool {
+	switch st {
+	case api.MigCreated, api.MigAwaitingAgent, api.MigReplicating, api.MigReady:
+		return true
+	default:
+		return false
+	}
+}
+
+// replicationHasRun reports whether replication has ever actually moved data for
+// this migration (so the console can tell "not started yet" from "paused").
+func replicationHasRun(m api.Migration) bool {
+	if m.State == api.MigReplicating {
 		return true
 	}
+	for _, d := range m.Disks {
+		if d.FullSyncDone || !d.LastSyncAt.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 // Connection-validation windows for the gated-start flow.
@@ -684,27 +711,64 @@ func (s *Server) handleStartReplication(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if m.ReplicationEnabled {
-		// Idempotent: already started.
+		// Idempotent: already running.
 		writeJSON(w, http.StatusOK, map[string]string{"status": "replicating"})
 		return
 	}
-	// Only valid before replication/cutover has begun, and only once every disk's
-	// agent connection has been validated (so a started baseline can actually run).
-	if m.State != api.MigAwaitingAgent && m.State != api.MigCreated {
-		writeErr(w, http.StatusConflict, "replication can only be started while waiting for the agent")
+	// Valid while in the replication phase (start, or resume after a pause), once
+	// every disk's agent connection has been validated.
+	if !replicationControllable(m.State) {
+		writeErr(w, http.StatusConflict, "replication can only be started or resumed during the replication phase")
 		return
 	}
 	if !allAgentsConnected(m) {
 		writeErr(w, http.StatusConflict, "the agent has not connected on all disks yet — wait for the connection to be validated")
 		return
 	}
+	resuming := replicationHasRun(m)
 	if err := s.st.SetReplicationEnabled(ctx, id, true); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	_ = s.st.AddEvent(ctx, id, "info", "replication started by operator; the agent will stream the initial full sync on its next pass (within ~60s)")
+	if resuming {
+		_ = s.st.AddEvent(ctx, id, "info", "replication resumed by operator; the agent ships only the blocks changed during the pause on its next pass (within ~60s)")
+	} else {
+		_ = s.st.AddEvent(ctx, id, "info", "replication started by operator; the agent will stream the initial full sync on its next pass (within ~60s)")
+	}
 	// Receivers are already listening from create time; they will now accept data.
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "replicating"})
+}
+
+// handlePauseReplication pauses replication: it disables the gate so the agent's
+// next pass is held (acknowledged but no data applied). Already-replicated data
+// and the change-tracking checkpoints are kept, so resuming ships only a delta.
+// The console labels this "Pause replication".
+func (s *Server) handlePauseReplication(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	m, err := s.st.Migration(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	if !m.ReplicationEnabled {
+		// Idempotent: already paused / not running.
+		writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
+		return
+	}
+	if !replicationControllable(m.State) {
+		writeErr(w, http.StatusConflict, "replication can only be paused during the replication phase")
+		return
+	}
+	if err := s.st.SetReplicationEnabled(ctx, id, false); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.st.AddEvent(ctx, id, "info", "replication paused by operator; a pass already in flight finishes, then the agent holds. Resume to continue with an incremental delta sync (no full re-copy).")
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "paused"})
 }
 
 // handleStartMigration cuts over: it stops replication and runs finalize
@@ -1596,14 +1660,22 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	v.CanMigrate = cutoverReady(m)
 	v.Assessed = v.CanMigrate // no separate manual assessment; readiness is auto-computed
 
-	// Gated-start signals for the console: the agent connection is validated
-	// independently of any data flowing, replication is started explicitly, and a
-	// never-connecting agent is reported (softly) once the post-install grace ends.
+	// Gated start + pause/resume signals for the console: the agent connection is
+	// validated independently of any data flowing; replication is started, paused
+	// and resumed explicitly; and a never-connecting agent is reported (softly)
+	// once the post-install grace ends.
 	v.AgentConnected = allAgentsConnected(m)
-	v.ReplicationStarted = m.ReplicationEnabled
-	if !m.ReplicationEnabled && (m.State == api.MigAwaitingAgent || m.State == api.MigCreated) {
+	hasRun := replicationHasRun(m)
+	v.ReplicationActive = m.ReplicationEnabled
+	v.ReplicationStarted = m.ReplicationEnabled || hasRun
+	v.ReplicationPaused = !m.ReplicationEnabled && hasRun && replicationControllable(m.State)
+	if !m.ReplicationEnabled && replicationControllable(m.State) {
+		// The gate is off: either not started yet, or paused. Either way the
+		// Start/Resume button is enabled once the connection is validated.
 		v.CanReplicate = v.AgentConnected
-		if !v.AgentConnected && !m.EnrolledAt.IsZero() && time.Since(m.EnrolledAt) > agentConnectGrace {
+		// "Connection failed" only applies pre-start (a paused migration's agent is
+		// connected and simply held); never flag it once replication has run.
+		if !hasRun && !v.AgentConnected && !m.EnrolledAt.IsZero() && time.Since(m.EnrolledAt) > agentConnectGrace {
 			v.ConnectionFailed = true
 		}
 	}
@@ -1611,6 +1683,8 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	switch m.State {
 	case api.MigCreated, api.MigAwaitingAgent:
 		switch {
+		case v.ReplicationPaused:
+			v.Phase = "replication paused"
 		case m.ReplicationEnabled:
 			v.Phase = "starting replication"
 		case v.AgentConnected:
@@ -1621,6 +1695,10 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 			v.Phase = "waiting for agent"
 		}
 	case api.MigReplicating, api.MigReady:
+		if v.ReplicationPaused {
+			v.Phase = "replication paused"
+			break
+		}
 		v.Phase = "replicating"
 		// Aggregate initial-sync progress across all disks still baselining.
 		var sumWritten, sumTotal int64
