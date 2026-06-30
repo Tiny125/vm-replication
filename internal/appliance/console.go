@@ -224,12 +224,8 @@ const consoleHTML = `<!DOCTYPE html>
         <div><label>Name</label><input id="m_name" placeholder="web01"></div>
         <div><label>Source hostname</label><input id="m_host" placeholder="web01.prod"></div>
       </div>
-      <label style="margin-top:12px">Source IP address <span class="muted">(must pass the connection test before you can create)</span></label>
-      <div style="display:flex;gap:8px;align-items:flex-start">
-        <input id="m_ip" placeholder="e.g. 172.236.148.63" style="flex:1" oninput="ipChanged()" onkeydown="if(event.key==='Enter')testCreateIP(this)">
-        <button id="m_iptest" onclick="testCreateIP(this)">Test connection</button>
-      </div>
-      <div id="m_ipstatus" class="resultbox hide" style="margin-top:6px"></div>
+      <label style="margin-top:12px">Source IP address</label>
+      <input id="m_ip" placeholder="e.g. 172.236.148.63">
       <label style="margin-top:12px">Source disks (first = boot disk)</label>
       <div id="disks"></div>
       <div style="margin-top:8px"><button onclick="addDisk()">+ Add disk</button></div>
@@ -480,22 +476,13 @@ function updatePlanInfo(){
 }
 // IP addresses that passed the in-form connection test; only these may be used
 // to create a migration.
-const testedOkIPs=new Set();
-function ipChanged(){$('m_ipstatus').classList.add('hide');}
-async function testCreateIP(btn){
-  const ip=$('m_ip').value.trim();const s=$('m_ipstatus');
-  s.classList.remove('hide');
-  if(!ip){s.className='resultbox bad';s.textContent='Enter the source IP address first.';return}
-  busy(btn,true);
-  s.className='resultbox';s.textContent='Testing connection to '+ip+'…';
-  try{
-    const r=await api('POST','/api/v1/diagnostics/connection',{ip:ip});
-    const open=(r.ports||[]).filter(p=>p.open).length;
-    const reachable=r.ping_ok||open>0||(r.ports||[]).some(p=>/refused/.test(p.detail));
-    if(reachable){testedOkIPs.add(ip);s.className='resultbox ok';s.textContent='✔ '+ip+' is reachable — you can create the migration.';}
-    else{testedOkIPs.delete(ip);s.className='resultbox bad';s.textContent='✘ '+ip+' is not reachable. Fix connectivity (see the Connection test tab) before creating.';}
-  }catch(e){s.className='resultbox bad';s.textContent='Error: '+e.message}
-  finally{busy(btn,false)}
+// validIP checks the source IP is a well-formed IPv4 (or loose IPv6) address.
+// Reachability is no longer tested at create time — enroll the agent and watch
+// the connection validate in the migration card instead.
+function validIP(s){
+  const m=/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+  if(m)return m.slice(1).every(o=>+o<=255);
+  return /^[0-9A-Fa-f:]+$/.test(s)&&s.includes(':'); // loose IPv6
 }
 async function createMig(btn){
   $('createErr').textContent='';
@@ -504,7 +491,7 @@ async function createMig(btn){
   if(!host){$('createErr').textContent='Enter the source hostname.';return}
   if(!validHostname(host)){$('createErr').textContent='“'+host+'” is not a valid hostname (letters, digits, dots and hyphens only — no spaces). Fix it and try again.';return}
   if(!ip){$('createErr').textContent='Enter the source IP address.';return}
-  if(!testedOkIPs.has(ip)){$('createErr').textContent='Run and pass the connection test for '+ip+' first (click “Test connection”).';return}
+  if(!validIP(ip)){$('createErr').textContent='“'+ip+'” is not a valid IP address (e.g. 172.236.148.63).';return}
   const rows=document.querySelectorAll('#disks .row');const devices=[];
   for(const r of rows){const dev=r.querySelector('.d_dev').value.trim();const gbRaw=r.querySelector('.d_size').value.trim();const gb=parseInt(gbRaw,10);
     if(!dev||!gbRaw){$('createErr').textContent='Fill in every disk row (device path and size) or remove the empty one before creating.';return}
@@ -519,7 +506,7 @@ async function createMig(btn){
   $('creating').scrollIntoView({behavior:'smooth',block:'center'});
   try{
     await api('POST','/api/v1/migrations',{name:name,source_hostname:host,source_ip:ip,devices:devices,boot_target:bootTarget,plan_class:planClass,linode_type:planType});
-    $('m_name').value=$('m_host').value=$('m_ip').value='';$('m_ipstatus').classList.add('hide');
+    $('m_name').value=$('m_host').value=$('m_ip').value='';
     $('disks').innerHTML='';diskSeq=0;addDisk();$('m_boot').value='volume';bootTargetChanged();
     await refresh(true);
     const last=$('migs').lastElementChild;if(last)last.scrollIntoView({behavior:'smooth',block:'center'});
