@@ -102,7 +102,7 @@ func exchangeHello(t *testing.T, target string, h protocol.Hello, want Consisten
 	t.Helper()
 	c, srv := net.Pipe()
 	go func() {
-		_, _ = Handle(srv, target, "", nil, want)
+		_, _ = Handle(srv, target, "", nil, want, nil)
 	}()
 	defer c.Close()
 

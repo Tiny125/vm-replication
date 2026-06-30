@@ -44,16 +44,31 @@ type Progress func(writtenBlocks, totalBlocks int64, fullSync bool)
 // a pass the agent has already marked Consistent.
 type ConsistencyFunc func(hello protocol.Hello) bool
 
+// ReplicationGate decides, after a valid Hello, whether replication is enabled
+// for this session. It is consulted before any device is opened or written.
+// Returning false makes the receiver acknowledge the connection (HelloAck with
+// Hold=true) so the appliance can show the agent as connected, but it does NOT
+// apply data — it holds until the operator starts replication. A nil gate means
+// always enabled (e.g. the standalone receiver). Implementations also use the
+// call to record that the agent connected (a connection heartbeat).
+type ReplicationGate func(hello protocol.Hello) bool
+
 // errConsistentResync is returned by Handle when it deliberately bounced a live
 // pass to request a crash-consistent resync. It is an expected control outcome,
 // not a failure, so Serve does not surface it via onError.
 var errConsistentResync = errors.New("receiver: crash-consistent resync requested")
 
+// errReplicationHeld is returned by Handle when a valid agent connected but
+// replication is not started yet, so the session was acknowledged and held
+// without applying data. Like errConsistentResync it is an expected control
+// outcome, not a failure.
+var errReplicationHeld = errors.New("receiver: replication not started (connection held)")
+
 // Serve accepts connections on ln and applies each to devicePath until ctx is
 // cancelled or the listener closes. onComplete (if non-nil) is called after each
 // successful session; onProgress (if non-nil) is called periodically during a
 // session. If once is true, Serve returns after the first successful session.
-func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress, onError func(error), requestConsistent ConsistencyFunc) error {
+func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress, onError func(error), requestConsistent ConsistencyFunc, replicationGate ReplicationGate) error {
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
@@ -66,11 +81,15 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 			}
 			return err
 		}
-		stats, herr := Handle(conn, devicePath, manifestPath, onProgress, requestConsistent)
+		stats, herr := Handle(conn, devicePath, manifestPath, onProgress, requestConsistent, replicationGate)
 		switch {
 		case errors.Is(herr, errConsistentResync):
 			// Expected: we asked the agent to re-read crash-consistently. Not an error.
 			log.Printf("receiver: asked %s to re-read crash-consistently for cutover", conn.RemoteAddr())
+		case errors.Is(herr, errReplicationHeld):
+			// Expected: agent connected, but replication isn't started yet. Connection
+			// recorded by the gate; nothing applied. Not an error.
+			log.Printf("receiver: %s connected; holding (replication not started)", conn.RemoteAddr())
 		case herr != nil:
 			log.Printf("receiver: session from %s ended with error: %v", conn.RemoteAddr(), herr)
 			if onError != nil {
@@ -91,7 +110,7 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 // every block to devicePath, fsyncs, and writes the applied manifest.
 // onProgress (optional) is invoked at session start and every progressEvery
 // applied blocks.
-func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress, requestConsistent ConsistencyFunc) (Stats, error) {
+func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress, requestConsistent ConsistencyFunc, replicationGate ReplicationGate) (Stats, error) {
 	defer conn.Close()
 	r := bufio.NewReaderSize(conn, 1<<20)
 	w := bufio.NewWriterSize(conn, 1<<16)
@@ -124,6 +143,20 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress,
 		_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, Message: err.Error()})
 		_ = w.Flush()
 		return Stats{}, err
+	}
+	// Replication gate: a validated agent has connected. If the operator hasn't
+	// started replication yet, acknowledge the connection (so the console shows it
+	// as connected) but HOLD — do not open or write the target — and return. The
+	// gate also records the connection. Checked before the consistency bounce and
+	// before opening the device so nothing is touched until replication is started.
+	if replicationGate != nil && !replicationGate(hello) {
+		_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{
+			Accepted: false,
+			Hold:     true,
+			Message:  "connection validated; replication not started yet",
+		})
+		_ = w.Flush()
+		return Stats{Hello: hello}, errReplicationHeld
 	}
 	// Cutover quiesce: if a crash-consistent snapshot is requested for this disk
 	// and the agent isn't already sending one, bounce the pass and ask it to

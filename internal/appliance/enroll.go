@@ -112,17 +112,19 @@ WantedBy=timers.target
 UNIT
   systemctl daemon-reload
   systemctl enable --now vmrepl-agent.timer
-  echo ">> Starting initial full sync now (this can take a while)"
+  echo ">> Validating the connection to the replication appliance now"
   if systemctl start vmrepl-agent.service; then
-    echo ">> First sync succeeded."
+    echo ">> Connection check ran. The agent connects every 60s and will NOT copy any"
+    echo ">> data yet: go to the console, confirm the connection shows a green tick,"
+    echo ">> then click 'Start replication' to begin the initial full sync."
   else
-    echo ">> First sync FAILED — see: journalctl -u vmrepl-agent -n 30"
+    echo ">> Connection check FAILED — see: journalctl -u vmrepl-agent -n 30"
     echo ">> No reinstall needed: the agent retries every 60s automatically."
     echo ">> Common cause: a receiver port is blocked — open TCP 5000-5100 on the"
     echo ">> replication server's firewall (including any Linode Cloud Firewall)."
     echo ">> Force a retry any time with: systemctl start vmrepl-agent.service"
   fi
-  echo ">> Enrolled. Follow progress in the console; logs: journalctl -u vmrepl-agent"
+  echo ">> Enrolled. Validate the connection in the console, then Start replication."
 else
   echo "systemd not found; run the agent manually for each disk on a schedule."
 fi
@@ -186,7 +188,8 @@ func (s *Server) handleEnrollFile(w http.ResponseWriter, r *http.Request) {
 
 // handleDownloadAgent serves the agent binary, token-gated.
 func (s *Server) handleDownloadAgent(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.migrationFromToken(w, r); !ok {
+	m, ok := s.migrationFromToken(w, r)
+	if !ok {
 		return
 	}
 	if s.cfg.AgentBinary == "" {
@@ -197,6 +200,9 @@ func (s *Server) handleDownloadAgent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "agent binary not found on the appliance")
 		return
 	}
+	// The install command is running on the source: stamp enrolled_at (first time
+	// only) so the console can time out an agent that never connects.
+	_ = s.st.MarkEnrolled(r.Context(), m.ID)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="vmrepl-agent"`)
 	http.ServeFile(w, r, s.cfg.AgentBinary)

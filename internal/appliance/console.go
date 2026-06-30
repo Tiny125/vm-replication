@@ -224,12 +224,8 @@ const consoleHTML = `<!DOCTYPE html>
         <div><label>Name</label><input id="m_name" placeholder="web01"></div>
         <div><label>Source hostname</label><input id="m_host" placeholder="web01.prod"></div>
       </div>
-      <label style="margin-top:12px">Source IP address <span class="muted">(must pass the connection test before you can create)</span></label>
-      <div style="display:flex;gap:8px;align-items:flex-start">
-        <input id="m_ip" placeholder="e.g. 172.236.148.63" style="flex:1" oninput="ipChanged()" onkeydown="if(event.key==='Enter')testCreateIP(this)">
-        <button id="m_iptest" onclick="testCreateIP(this)">Test connection</button>
-      </div>
-      <div id="m_ipstatus" class="resultbox hide" style="margin-top:6px"></div>
+      <label style="margin-top:12px">Source IP address</label>
+      <input id="m_ip" placeholder="e.g. 172.236.148.63">
       <label style="margin-top:12px">Source disks (first = boot disk)</label>
       <div id="disks"></div>
       <div style="margin-top:8px"><button onclick="addDisk()">+ Add disk</button></div>
@@ -480,22 +476,13 @@ function updatePlanInfo(){
 }
 // IP addresses that passed the in-form connection test; only these may be used
 // to create a migration.
-const testedOkIPs=new Set();
-function ipChanged(){$('m_ipstatus').classList.add('hide');}
-async function testCreateIP(btn){
-  const ip=$('m_ip').value.trim();const s=$('m_ipstatus');
-  s.classList.remove('hide');
-  if(!ip){s.className='resultbox bad';s.textContent='Enter the source IP address first.';return}
-  busy(btn,true);
-  s.className='resultbox';s.textContent='Testing connection to '+ip+'…';
-  try{
-    const r=await api('POST','/api/v1/diagnostics/connection',{ip:ip});
-    const open=(r.ports||[]).filter(p=>p.open).length;
-    const reachable=r.ping_ok||open>0||(r.ports||[]).some(p=>/refused/.test(p.detail));
-    if(reachable){testedOkIPs.add(ip);s.className='resultbox ok';s.textContent='✔ '+ip+' is reachable — you can create the migration.';}
-    else{testedOkIPs.delete(ip);s.className='resultbox bad';s.textContent='✘ '+ip+' is not reachable. Fix connectivity (see the Connection test tab) before creating.';}
-  }catch(e){s.className='resultbox bad';s.textContent='Error: '+e.message}
-  finally{busy(btn,false)}
+// validIP checks the source IP is a well-formed IPv4 (or loose IPv6) address.
+// Reachability is no longer tested at create time — enroll the agent and watch
+// the connection validate in the migration card instead.
+function validIP(s){
+  const m=/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+  if(m)return m.slice(1).every(o=>+o<=255);
+  return /^[0-9A-Fa-f:]+$/.test(s)&&s.includes(':'); // loose IPv6
 }
 async function createMig(btn){
   $('createErr').textContent='';
@@ -504,7 +491,7 @@ async function createMig(btn){
   if(!host){$('createErr').textContent='Enter the source hostname.';return}
   if(!validHostname(host)){$('createErr').textContent='“'+host+'” is not a valid hostname (letters, digits, dots and hyphens only — no spaces). Fix it and try again.';return}
   if(!ip){$('createErr').textContent='Enter the source IP address.';return}
-  if(!testedOkIPs.has(ip)){$('createErr').textContent='Run and pass the connection test for '+ip+' first (click “Test connection”).';return}
+  if(!validIP(ip)){$('createErr').textContent='“'+ip+'” is not a valid IP address (e.g. 172.236.148.63).';return}
   const rows=document.querySelectorAll('#disks .row');const devices=[];
   for(const r of rows){const dev=r.querySelector('.d_dev').value.trim();const gbRaw=r.querySelector('.d_size').value.trim();const gb=parseInt(gbRaw,10);
     if(!dev||!gbRaw){$('createErr').textContent='Fill in every disk row (device path and size) or remove the empty one before creating.';return}
@@ -519,7 +506,7 @@ async function createMig(btn){
   $('creating').scrollIntoView({behavior:'smooth',block:'center'});
   try{
     await api('POST','/api/v1/migrations',{name:name,source_hostname:host,source_ip:ip,devices:devices,boot_target:bootTarget,plan_class:planClass,linode_type:planType});
-    $('m_name').value=$('m_host').value=$('m_ip').value='';$('m_ipstatus').classList.add('hide');
+    $('m_name').value=$('m_host').value=$('m_ip').value='';
     $('disks').innerHTML='';diskSeq=0;addDisk();$('m_boot').value='volume';bootTargetChanged();
     await refresh(true);
     const last=$('migs').lastElementChild;if(last)last.scrollIntoView({behavior:'smooth',block:'center'});
@@ -573,6 +560,41 @@ async function stopMig(id,btn){
   if(!await confirmModal({title:'Stop cutover #'+id+'?',html:'The finalize run is cancelled and replication resumes.',okText:'Stop cutover',okDanger:true}))return;
   busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/stop');await refreshMig(id)}catch(e){alertModal({title:'Cannot stop',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
+// startReplication starts (or, when resume=true, resumes) replication.
+async function startReplication(id,btn,resume){
+  const opts=resume
+    ?{title:'Resume replication for #'+id+'?',html:'Replication continues with an <b>incremental delta sync</b> — only the blocks that changed during the pause are sent, not a full re-copy.',okText:'Resume replication'}
+    :{title:'Start replication for #'+id+'?',html:'The agent connection is validated. This begins the <b>initial full sync</b> from the source; the agent streams every block, then keeps the copy current. You can cut over once the baseline completes.',okText:'Start replication'};
+  if(!await confirmModal(opts))return;
+  busy(btn,true);
+  try{await api('POST','/api/v1/migrations/'+id+'/replicate',{});await refreshMig(id)}
+  catch(e){alertModal({title:'Cannot '+(resume?'resume':'start')+' replication',html:esc(e.message),danger:true})}finally{busy(btn,false)}
+}
+// pauseReplication stops replication after any in-flight pass; data is kept and a
+// later resume continues with an incremental delta (no full re-copy).
+async function pauseReplication(id,btn){
+  if(!await confirmModal({title:'Pause replication for #'+id+'?',
+    html:'<div class="warn"><b>Replication will stop.</b></div>The agent stops sending data once any pass already in flight finishes. Already-replicated data and the change tracking are kept, so <b>Resume</b> later continues with an <b>incremental delta sync</b> — no full re-copy. (Cutover needs replication running and up to date, so resume before cutting over.)',
+    okText:'Pause replication',okDanger:true}))return;
+  busy(btn,true);
+  try{await api('POST','/api/v1/migrations/'+id+'/pause',{});await refreshMig(id)}
+  catch(e){alertModal({title:'Cannot pause replication',html:esc(e.message),danger:true})}finally{busy(btn,false)}
+}
+// connStatus renders the connection / replication indicator in the enroll panel:
+// a green tick once every disk's agent has handshaked, a paused/running note, a
+// soft "connection failed" after the post-install grace, or a waiting note. The
+// Start/Pause/Resume buttons live in the action row, not here.
+function connStatus(v,m){
+  if(v.replication_active)
+    return '<div class="resultbox ok" style="margin-top:10px">✔ Replication running — the agent is streaming changes.</div>';
+  if(v.replication_paused)
+    return '<div class="resultbox" style="margin-top:10px"><b>⏸ Replication paused.</b> Already-replicated data is kept; use <b>Resume replication</b> to continue with a delta sync.</div>';
+  if(v.agent_connected)
+    return '<div class="resultbox ok" style="margin-top:10px"><b>✔ Agent connected</b> on all disks — connection validated. Use <b>Start replication</b> to begin the initial full sync.</div>';
+  if(v.connection_failed)
+    return '<div class="resultbox bad" style="margin-top:10px"><b>✘ Connection failed.</b> The agent hasn’t checked in. Confirm the install command ran on <b>'+esc(m.source_hostname||'the source')+'</b>, and that the appliance’s receiver ports (TCP 5000–5100) are reachable. The agent retries every 60s, so this clears once it connects.</div>';
+  return '<div class="resultbox" style="margin-top:10px">Waiting for the agent to connect (usually within ~60s of running the command above)…</div>';
+}
 async function deleteMig(id,name,btn){
   if(!await confirmModal({title:'Delete migration #'+id+'?',
     html:'<b>'+esc(name)+'</b><div style="margin-top:8px" class="warn">This deletes any <name>-cutover image volume(s) and the launched cutover Linode. It cannot be undone.</div>'+
@@ -609,9 +631,13 @@ async function checkStatus(id,btn){
     const m=v.migration;const err=anyDiskError(m);const box=card.querySelector('#status'+id)||$('status'+id);
     if(box){
       box.classList.remove('hide');
-      if(allDone(m)){box.className='resultbox ok';box.textContent='✔ All disks baselined and replicating.';}
+      if(v.replication_paused){box.className='resultbox';box.textContent='⏸ Replication paused. Resume to continue with an incremental delta sync (no full re-copy).';}
+      else if(allDone(m)){box.className='resultbox ok';box.textContent='✔ All disks baselined and replicating.';}
       else if(err){box.className='resultbox bad';box.textContent='✘ Last replication attempt failed: '+err;}
-      else{box.className='resultbox';box.textContent='No completed sync yet. The agent retries every 60s — run the force-retry command on the source if needed.';}
+      else if(v.replication_active){box.className='resultbox';box.textContent='Replication running — initial full sync in progress.';}
+      else if(v.agent_connected){box.className='resultbox ok';box.textContent='✔ Agent connected on all disks — connection validated. Click Start replication to begin the initial sync.';}
+      else if(v.connection_failed){box.className='resultbox bad';box.textContent='✘ Connection failed — the agent has not checked in. Verify the install command ran and TCP 5000-5100 is reachable.';}
+      else{box.className='resultbox';box.textContent='Waiting for the agent to connect — it retries every 60s. Run the force-retry command on the source if needed.';}
     }
     flash(card);
   }catch(e){const box=$('status'+id);if(box){box.className='resultbox bad';box.textContent='Error: '+e.message}}
@@ -737,6 +763,22 @@ function diskTable(m){const d=disks(m);if(!d.length)return '';
 }
 function infoIcon(tip){return '<span class="info" data-tip="'+esc(tip)+'">i</span>'}
 function stateLabel(s){return ({created:'created',awaiting_agent:'waiting for agent',replicating:'replicating',ready:'ready to cut over',awaiting_cutover:'power off source, then complete',migrating:'finalizing',image_ready:'image ready',launched:'launched',failed:'failed'})[s]||s}
+// pillFor renders the header status pill. Before replication starts (state still
+// awaiting_agent/created) it reflects the gated-start connection signals so the
+// operator sees connect → start at a glance; otherwise it uses the migration state.
+function pillFor(v,m){
+  // Paused takes precedence at any replication-phase state.
+  if(v.replication_paused && ['created','awaiting_agent','replicating','ready'].includes(m.state))
+    return '<span class="pill warn">paused</span>';
+  if((m.state==='awaiting_agent'||m.state==='created') && !v.replication_started){
+    if(v.agent_connected)return '<span class="pill ok">agent connected</span>';
+    if(v.connection_failed)return '<span class="pill bad">connection failed</span>';
+    return '<span class="pill warn">waiting for agent</span>';
+  }
+  if((m.state==='awaiting_agent'||m.state==='created') && v.replication_started)
+    return '<span class="pill warn">starting replication</span>';
+  return '<span class="pill '+stateClass(m.state)+'">'+esc(stateLabel(m.state))+'</span>';
+}
 // statusLegend renders a hover legend that shows each status as its ACTUAL
 // colored pill (so you can match what you see in the table to its meaning).
 const STATE_DESCS=[['awaiting_agent','enrolled; the agent has not connected yet'],
@@ -799,7 +841,7 @@ function migCard(v){
 
   h+='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+statusLegend()+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
     '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_ip||m.source_hostname||'-')+'</span></td>'+
-    '<td><span class="pill '+stateClass(m.state)+'">'+esc(stateLabel(m.state))+'</span></td>'+
+    '<td>'+pillFor(v,m)+'</td>'+
     '<td class="muted">'+disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining')+'</td>'+
     '<td>'+progressLine(v,m)+'</td>'+
     '<td class="muted">'+(v.rpo_seconds?Math.round(v.rpo_seconds)+'s':'—')+'</td></tr></table>';
@@ -851,6 +893,7 @@ function migCard(v){
        'Force a retry on the source with <code style="display:inline;padding:1px 5px">sudo systemctl start vmrepl-agent.service</code>, then click <b>Check status</b> below.</div>'+
        '<div class="actions"><button onclick="checkStatus('+m.id+',this)">Check status</button></div>'+
        '<div id="status'+m.id+'" class="resultbox hide"></div>'+
+       connStatus(v,m)+
        '<hr class="migdivider"></div></details>';
   }
   if(v.uninstall_cmd && ['image_ready','launched'].includes(m.state)){
@@ -878,6 +921,19 @@ function migCard(v){
     b+='<button class="primary" onclick="startMig('+m.id+',this)">Retry cutover</button>'+
       infoIcon('Re-runs the cutover on the data already replicated to this appliance. It first removes any half-built <name>-cutover instance/volumes from the failed attempt, then launches fresh — no re-replication of the source is needed.');
   }else{
+    // Replication controls (start / pause / resume) precede the cutover button,
+    // but only during the replication phase.
+    const ctrl=['created','awaiting_agent','replicating','ready'].includes(m.state);
+    if(ctrl && !v.replication_started){
+      b+='<button class="primary"'+(v.can_replicate?'':' disabled title="Waiting for the agent connection to be validated"')+' onclick="startReplication('+m.id+',this,false)">Start replication</button>'+
+        infoIcon('Replication does not start automatically. Once the agent connection shows a green tick, this begins the initial full sync.');
+    }else if(ctrl && v.replication_active){
+      b+='<button class="danger" onclick="pauseReplication('+m.id+',this)">Pause replication</button>'+
+        infoIcon('Stops sending data after any in-flight pass finishes. Already-replicated data is kept; resume continues with an incremental delta — no full re-copy.');
+    }else if(ctrl && v.replication_paused){
+      b+='<button class="primary"'+(v.can_replicate?'':' disabled title="Waiting for the agent connection"')+' onclick="startReplication('+m.id+',this,true)">Resume replication</button>'+
+        infoIcon('Continues replication with an incremental delta sync — only the blocks changed during the pause are sent.');
+    }
     // Readiness is auto-computed: the Cutover button enables itself once the
     // initial full sync is complete (no manual assessment).
     const ready=v.can_migrate;
