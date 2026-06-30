@@ -111,78 +111,55 @@ func (s *Server) ensureAuditBucket(ctx context.Context, token string) {
 		return
 	}
 
-	// Reuse our previously-chosen bucket (stable across restarts), but only when
-	// it uses the current "<prefix>-NN" scheme. Older deployments stored a name
-	// without the -NN suffix and are migrated to a fresh NN on the next provision.
-	prefix := s.auditPrefix()
-	if name, ok, _ := s.st.GetSetting(ctx, keyAuditName); ok && isAuditName(prefix, name) {
-		b, err := cl.CreateBucket(ctx, name, region)
-		if err != nil && !isAlreadyExists(err) {
+	// The audit bucket name is deterministic per appliance: vmrep-audit-<instance
+	// id>. The Linode instance id is globally unique, so the name never collides
+	// across accounts/appliances and we don't need a -NN disambiguator. Creating a
+	// bucket we already own returns "already exists" — reuse it.
+	name := s.auditBucketName()
+	b, err := cl.CreateBucket(ctx, name, region)
+	if err != nil {
+		if !isAlreadyExists(err) {
 			s.setAuditErr(err.Error())
 			return
 		}
-		if err != nil { // already exists = the bucket we made before
-			b = linode.Bucket{Label: name, Region: region}
-		}
-		s.saveAuditBucket(ctx, b)
-		return
+		b = linode.Bucket{Label: name, Region: region} // already ours — reuse it
 	}
-
-	// First provision (or migrating an old name): keep the appliance id and pick
-	// the lowest free "<prefix>-NN", checking existing buckets across the account
-	// so deployments never collide. Retry on a creation race.
-	taken := map[string]bool{}
-	if bs, err := cl.ListBuckets(ctx); err == nil {
-		for _, b := range bs {
-			taken[strings.ToLower(b.Label)] = true
-		}
-	}
-	for i := 1; i <= 99; i++ {
-		cand := fmt.Sprintf("%s-%02d", prefix, i)
-		if taken[cand] {
-			continue
-		}
-		b, err := cl.CreateBucket(ctx, cand, region)
-		if err != nil {
-			if isAlreadyExists(err) { // lost a race with another appliance; try next
-				taken[cand] = true
-				continue
-			}
-			s.setAuditErr(err.Error())
-			return
-		}
-		_ = s.st.SetSetting(ctx, keyAuditName, cand)
-		s.saveAuditBucket(ctx, b)
-		return
-	}
-	s.setAuditErr("no free audit bucket name available (" + prefix + "-01..99 are all taken)")
+	_ = s.st.SetSetting(ctx, keyAuditName, name)
+	s.saveAuditBucket(ctx, b)
 }
 
-// auditPrefix is the bucket-name prefix for this appliance: it keeps the
-// appliance's Linode id (so buckets are tied to the instance) and a -NN suffix
-// is added for uniqueness. Falls back to "vmrep-audit" with no id off-Linode.
-func (s *Server) auditPrefix() string {
+// auditBucketName is this appliance's audit bucket: vmrep-audit-<instance id>.
+// Falls back to "vmrep-audit" with no id off-Linode.
+func (s *Server) auditBucketName() string {
 	if s.cfg.ApplianceLinodeID != 0 {
 		return fmt.Sprintf("vmrep-audit-%d", s.cfg.ApplianceLinodeID)
 	}
 	return "vmrep-audit"
 }
 
-// isAuditName reports whether name is "<prefix>-NN" (1–3 digits).
-func isAuditName(prefix, name string) bool {
-	if !strings.HasPrefix(name, prefix+"-") {
-		return false
+// existingAuditBucket returns the audit bucket if one with our deterministic name
+// already exists in the account (so "Re-create" can report it instead of failing).
+func (s *Server) existingAuditBucket(ctx context.Context, cl *linode.Client) (linode.Bucket, bool) {
+	want := strings.ToLower(s.auditBucketName())
+	bs, err := cl.ListBuckets(ctx)
+	if err != nil {
+		return linode.Bucket{}, false
 	}
-	suf := name[len(prefix)+1:]
-	if len(suf) < 1 || len(suf) > 3 {
-		return false
-	}
-	for _, c := range suf {
-		if c < '0' || c > '9' {
-			return false
+	for _, b := range bs {
+		if strings.ToLower(b.Label) == want {
+			return b, true
 		}
 	}
-	return true
+	return linode.Bucket{}, false
+}
+
+// clearAuditBucket forgets the audit bucket in settings after it's deleted, so the
+// console shows it as removed and the uploader stops trying to use it.
+func (s *Server) clearAuditBucket(ctx context.Context) {
+	_ = s.st.SetSetting(ctx, keyAuditReady, "")
+	_ = s.st.DeleteSetting(ctx, keyAuditBucket)
+	_ = s.st.DeleteSetting(ctx, keyAuditName)
+	_ = s.st.SetSetting(ctx, keyAuditErr, "deleted — use \"Re-create audit bucket\" to make a new one")
 }
 
 func isAlreadyExists(err error) bool {

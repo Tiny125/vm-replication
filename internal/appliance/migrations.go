@@ -1874,6 +1874,18 @@ func cutoverReady(m api.Migration) bool {
 	return true
 }
 
+// isMigrationActive reports whether a migration is still in progress (created or
+// running) rather than finished (image_ready / launched) or failed. Used to gate
+// destructive account-level actions such as deleting the audit-log bucket.
+func isMigrationActive(st api.MigrationState) bool {
+	switch st {
+	case api.MigImageReady, api.MigLaunched, api.MigFailed:
+		return false
+	default:
+		return true
+	}
+}
+
 // bashPath resolves a bash interpreter for running machine-convert.sh. It
 // prefers $PATH, then falls back to the usual absolute locations, and finally
 // to "bash" (letting exec surface a clear not-found error).

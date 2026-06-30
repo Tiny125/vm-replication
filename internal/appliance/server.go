@@ -141,6 +141,7 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/v1/settings/linode-token", s.auth(s.handleSetLinodeToken))
 	s.mux.Handle("DELETE /api/v1/settings/linode-token", s.auth(s.handleDeleteLinodeToken))
 	s.mux.Handle("POST /api/v1/settings/audit-bucket", s.auth(s.handleProvisionAuditBucket))
+	s.mux.Handle("DELETE /api/v1/settings/audit-bucket", s.auth(s.handleDeleteAuditBucket))
 }
 
 // Handler returns the root HTTP handler.
@@ -339,13 +340,21 @@ func (s *Server) handleDeleteLinodeToken(w http.ResponseWriter, r *http.Request)
 }
 
 // handleProvisionAuditBucket (re-)creates the audit-log Object Storage bucket
-// using the current region rules, without removing the token. Useful to move the
-// bucket to the appliance's region after changing -obj-region.
+// (named vmrep-audit-<instance id>). If a bucket with that name already exists
+// (we made it before, or the operator created it manually) it reports that
+// instead of recreating. Useful after deleting the bucket, or to re-point the
+// console at an existing one.
 func (s *Server) handleProvisionAuditBucket(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	tok, err := s.st.LinodeToken(ctx)
 	if err != nil || tok == "" {
 		writeErr(w, http.StatusBadRequest, "add a Linode API token first")
+		return
+	}
+	cl := linode.New(tok)
+	if b, ok := s.existingAuditBucket(ctx, cl); ok {
+		s.saveAuditBucket(ctx, b) // make sure our settings point at it
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "already_exists": true, "audit_bucket": b.Label, "audit_region": b.Region})
 		return
 	}
 	s.ensureAuditBucket(ctx, tok)
@@ -356,7 +365,69 @@ func (s *Server) handleProvisionAuditBucket(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	b, _ := s.auditBucket(ctx)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "audit_bucket": b.Label, "audit_region": b.Region})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "created": true, "audit_bucket": b.Label, "audit_region": b.Region})
+}
+
+// handleDeleteAuditBucket empties and deletes the audit-log Object Storage bucket
+// (and all logs in it). Guarded two ways: no migration may be active (created or
+// running), and the caller must supply the correct console password.
+func (s *Server) handleDeleteAuditBucket(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var req struct {
+		Password string `json:"password"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	ok, err := s.st.VerifyAdminPassword(ctx, req.Password)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusForbidden, "incorrect console password")
+		return
+	}
+	migs, err := s.st.ListMigrations(ctx)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	active := 0
+	for _, m := range migs {
+		if isMigrationActive(m.State) {
+			active++
+		}
+	}
+	if active > 0 {
+		writeErr(w, http.StatusConflict, fmt.Sprintf("cannot delete the audit bucket while %d migration(s) are still active (created or running) — finish, launch, or delete them first", active))
+		return
+	}
+	tok, err := s.st.LinodeToken(ctx)
+	if err != nil || tok == "" {
+		writeErr(w, http.StatusBadRequest, "no Linode API token is configured")
+		return
+	}
+	cl := linode.New(tok)
+	b, ok := s.auditBucket(ctx)
+	if !ok {
+		// Not tracked locally as ready — it may still exist in the account; find it.
+		if eb, found := s.existingAuditBucket(ctx, cl); found {
+			b = eb
+		} else {
+			s.clearAuditBucket(ctx) // nothing to delete; just clear local state
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": false})
+			return
+		}
+	}
+	if err := cl.EmptyBucket(ctx, b); err != nil {
+		writeErr(w, http.StatusBadGateway, "could not empty the audit bucket: "+err.Error())
+		return
+	}
+	if err := cl.DeleteBucket(ctx, b); err != nil {
+		writeErr(w, http.StatusBadGateway, "could not delete the audit bucket: "+err.Error())
+		return
+	}
+	s.clearAuditBucket(ctx)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": true, "audit_bucket": b.Label})
 }
 
 // ---- helpers ----
