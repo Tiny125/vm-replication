@@ -464,6 +464,18 @@ func (s *Store) SetMigrationImage(ctx context.Context, id int64, imageID string,
 	return err
 }
 
+// MarkReplicating advances a migration to "replicating" the moment its agent
+// STARTS streaming a pass, rather than waiting for the first pass to finish. This
+// lets the console show live initial-full-sync progress instead of an
+// indeterminate bar that jumps to 100% only when the (~10 min) baseline
+// completes. Conditional on the pre-stream states, so it never overrides a later
+// state (e.g. paused/migrating).
+func (s *Store) MarkReplicating(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE migrations SET state='replicating' WHERE id=? AND state IN ('created','awaiting_agent')`, id)
+	return err
+}
+
 // RecordDiskSync updates one disk's progress from a completed replication pass
 // and advances the migration to "replicating" on first activity.
 func (s *Store) RecordDiskSync(ctx context.Context, migrationID, diskID int64, fullSync bool, total, changed, bytes int64) error {

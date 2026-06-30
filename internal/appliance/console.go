@@ -739,7 +739,10 @@ function progressLine(v,m){
   // Throughput line: total bytes transferred over the wire (counts re-sent and
   // changed blocks, so it can exceed the disk size) + current copy speed.
   const bps=replSpeed(v,m);
-  let recv=fmtBytes(bytesTotal(m))+' transferred';
+  // During the live initial sync, bytes_on_wire only updates when a pass finishes,
+  // so estimate transferred from the live percent instead of showing 0 B.
+  const totSz=disks(m).reduce((a,d)=>a+(d.size_bytes||0),0);
+  let recv=fmtBytes(v.percent_done>=0&&totSz>0 ? v.percent_done/100*totSz : bytesTotal(m))+' transferred';
   if(bps>=0)recv+=' · '+fmtBytes(bps)+'/s';
   // label is built only from literals/numbers (no user data), so it's safe to
   // render as HTML — needed for the live-ticking elapsed span.
