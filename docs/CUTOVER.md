@@ -153,14 +153,19 @@ When you're ready and lag is small:
    > single-user mode. Alternatively, power the source off and use skip-snapshot —
    > but then no further delta sync is possible.)
    >
-   > **Console: Guided shutdown (recommended for non-LVM sources).** In the cutover
-   > dialog, tick **"Guided shutdown"**. Phase 1 quiesces the source for you (the
-   > agent remounts its root read-only for one consistent pass), then the migration
-   > **pauses** in state `awaiting_cutover`. Power off the source, then click
-   > **Complete cutover** to convert, clone and launch. This needs the up-to-date
-   > agent, so **re-enroll the source** (re-run the install one-liner) after
-   > upgrading the appliance — older agents lack the `-cutover-quiesce` capability
-   > and the quiesce will time out.
+   > **Console (recommended for non-LVM sources).** Click **Cutover instance**. By
+   > default the appliance tries to quiesce the source for one consistent pass (the
+   > agent remounts its root read-only). On a **running root with no LVM** that
+   > usually fails with `/: mount point is busy` — even after stopping your apps,
+   > because system daemons (journald, etc.) keep `/` open for writing. When that
+   > happens, retry and tick **"Skip the read-only snapshot"** in the dialog: the
+   > image is taken from the current replicated data, which is **crash-consistent**
+   > (like a power-loss) and repaired with `fsck` on convert. Stop databases/heavy
+   > writers first and let the RPO lag drop so the captured state is clean. Either
+   > way the migration then **pauses** in state `awaiting_cutover`: power off the
+   > source and click **Complete cutover** to convert, clone and launch. (The
+   > quiesce attempt needs the up-to-date agent, so **re-enroll the source** after
+   > upgrading the appliance.)
 2. **Final delta sync.** Run the agent once more so the target is fully current.
 3. **Stop the receiver** on the Linode (Ctrl-C) so the disk is idle.
 4. **Convert the disk to boot on Linode** (still in Rescue Mode):

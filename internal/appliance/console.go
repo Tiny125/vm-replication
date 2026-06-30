@@ -531,7 +531,7 @@ async function startMig(id,btn){
   // powered off the current data is used as-is. This pauses afterwards so you can
   // power off the source, then Complete cutover.
   const how='<div style="margin-bottom:8px">This captures a <b>consistent</b> point-in-time image of the source, then <b>pauses</b> so you can power the source off before the final cutover'+(disk?(', after which it creates a new Linode'+planNote+' and boots from its local disk.'):(meta.linode_type?(', after which it launches a new Linode'+planNote+'.'):' and clones every disk into launchable volumes.'))+'</div>';
-  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s apps/services so its root filesystem can be remounted read-only. The source must still be <b>running</b> (its agent connected) so it can be quiesced — you’ll power it off in the next step.</div>';
+  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases and heavy writers so its data is settled. A clean read-only snapshot needs LVM, or a root that can be remounted read-only — many cloud images have neither, so that step fails with <i>“/: mount point is busy”</i>. If so, tick <b>Skip the read-only snapshot</b> below to cut over from the current (crash-consistent, fsck-repaired) data. The source stays <b>running</b> until you power it off in the next step.</div>';
   const opts={
     title:'Cut over migration #'+id+' — step 1: capture consistent image',
     okText:'Capture image',
@@ -540,7 +540,9 @@ async function startMig(id,btn){
       {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
       {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
     ],
-    checkboxes:[]
+    checkboxes:[
+      {id:'skipsnap',label:'Skip the read-only snapshot — use if cutover fails with “root is busy / could not remount read-only”. The image is taken from the current replicated data: crash-consistent (like a power-loss) and repaired with fsck on convert. Stop databases/heavy writers first and make sure the RPO lag is low.',checked:false}
+    ]
   };
   if(!disk && meta.linode_type){
     opts.checkboxes.push({id:'launch',label:'Also launch a new <name>-cutover Linode at completion (boot=sda, data=sdb…). Uncheck to just create the cutover volumes.',checked:true});
@@ -548,8 +550,9 @@ async function startMig(id,btn){
   const r=await confirmModal(opts);
   if(!r)return;
   busy(btn,true);
-  // Always guided + consistent: never cut over from inconsistent live data.
-  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:disk?true:(r.launch!==false),root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:false,guided_shutdown:true});await refreshMig(id)}
+  // Guided cutover. skip_snapshot lets a source with no LVM / un-remountable root
+  // proceed on its current crash-consistent data instead of a failing quiesce.
+  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:disk?true:(r.launch!==false),root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:r.skipsnap===true,guided_shutdown:true});await refreshMig(id)}
   catch(e){alertModal({title:'Cannot start cutover',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function completeCutover(id,btn){

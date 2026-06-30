@@ -1032,7 +1032,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	if req.GuidedShutdown && !consistent {
 		s.clearConsistency(m)
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigReplicating, "")
-		_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: could NOT capture a consistent image — the source root could not be remounted read-only (stop the source's apps/services so nothing is writing to / ), or the source agent predates this feature (re-enroll the source). Replication is still running; fix the above and start the cutover again.")
+		_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: could NOT capture a consistent image — the source root could not be remounted read-only (a process is still writing to / ). This is expected on a running root with no LVM. Either retry with \"Skip the read-only snapshot\" ticked (cut over from the current crash-consistent data, repaired with fsck), or power the source off and cut over again. Replication is still running.")
 		return
 	}
 
