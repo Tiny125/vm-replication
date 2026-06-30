@@ -386,8 +386,9 @@ async function loadSettings(){
        (st.audit_ready?('<span class="y">✔</span> Audit log bucket <b>'+esc(st.audit_bucket)+'</b>'+(st.audit_region?(' in region <b>'+esc(st.audit_region)+'</b>'):'')+' — console &amp; per-migration logs upload to Object Storage (browse in Cloud Manager).')
         :(st.audit_error?('<span class="x">✘</span> Audit log bucket not created: '+esc(st.audit_error)):'<span class="muted">Audit log bucket: provisioning…</span>'))+'</span>'+
        '<button onclick="reprovisionAuditBucket(this)">Re-create audit bucket</button>'+
+       (st.audit_ready?'<button class="danger" onclick="deleteAuditBucket(this)">Delete audit bucket</button>':'')+
        '<button class="danger" onclick="removeToken(this)">Remove token</button></div>'+
-       '<div class="muted" style="margin-top:8px;font-size:12px">The audit bucket is created in the appliance’s own region (override with <code style="display:inline;padding:1px 5px">-obj-region</code>). “Re-create” provisions it in the current region — handy if it landed elsewhere; delete the old bucket in Cloud Manager. The token can only be removed once <b>no migrations exist</b>.</div>';
+       '<div class="muted" style="margin-top:8px;font-size:12px">“Re-create” makes <code style="display:inline;padding:1px 5px">vmrep-audit-'+esc(st.appliance_linode_id||'&lt;id&gt;')+'</code> if it doesn’t exist (and tells you if it already does). “Delete audit bucket” empties and removes it with all logs — only when <b>no migration is active</b> and after you enter the console password. The token can only be removed once <b>no migrations exist</b>.</div>';
   }else{
     h+='<details><summary>What is this and how do I get a token?</summary><div class="muted" style="font-size:13px">'+
        'A Linode <b>Personal Access Token</b> lets the appliance create volumes, clone disks and launch instances. Stored <b>encrypted at rest</b>. '+
@@ -414,8 +415,25 @@ async function removeToken(btn){
   busy(btn,true);try{await api('DELETE','/api/v1/settings/linode-token');toast('Linode token removed','ok');loadSettings()}catch(e){alertModal({title:'Error',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
 async function reprovisionAuditBucket(btn){
   busy(btn,true);
-  try{const r=await api('POST','/api/v1/settings/audit-bucket',{});toast('Audit bucket ready: '+r.audit_bucket+(r.audit_region?(' ('+r.audit_region+')'):''),'ok');loadSettings();}
-  catch(e){alertModal({title:'Could not create audit bucket',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
+  try{
+    const r=await api('POST','/api/v1/settings/audit-bucket',{});
+    if(r.already_exists){toast('Audit bucket already exists: '+r.audit_bucket,'ok');}
+    else{toast('Audit bucket created: '+r.audit_bucket+(r.audit_region?(' ('+r.audit_region+')'):''),'ok');}
+    loadSettings();
+  }catch(e){alertModal({title:'Could not create audit bucket',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
+async function deleteAuditBucket(btn){
+  const r=await confirmModal({
+    title:'⚠ Delete the audit-log bucket?',
+    html:'<div class="warn"><b>This permanently deletes the Object Storage bucket and ALL audit logs</b> — the console “main” log and every per-migration log. It cannot be undone.</div>'+
+      '<div class="muted" style="margin-top:8px;font-size:13px">Only allowed when <b>no migration is active</b> (created or running). Enter your <b>console password</b> to confirm. You can re-create an empty bucket afterwards.</div>',
+    okText:'Delete bucket',okDanger:true,
+    fields:[{id:'pw',label:'Console password',type:'password',placeholder:'your console login password'}]
+  });
+  if(!r)return;
+  if(!r.pw){alertModal({title:'Password required',html:'Enter your console password to delete the bucket.',danger:true});return}
+  busy(btn,true);
+  try{await api('DELETE','/api/v1/settings/audit-bucket',{password:r.pw});toast('Audit bucket and its logs deleted','ok');loadSettings();}
+  catch(e){alertModal({title:'Could not delete audit bucket',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
 
 let diskSeq=0;
 function addDisk(dev,gb){

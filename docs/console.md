@@ -202,11 +202,9 @@ server and is only ever sent to `api.linode.com`.
 
 When you save a token, the appliance also provisions a **Linode Object Storage
 bucket** and shows a tick beside the token card once it's created. The bucket is
-named `vmrep-audit-<appliance-id>-NN` (e.g. `vmrep-audit-99334138-01`): it keeps
-the appliance's Linode id and adds a number — the appliance lists the account's
-existing buckets and claims the lowest free one, so **multiple appliances on the
-same account each get their own bucket without colliding**. From then on it
-keeps an audit trail there:
+named `vmrep-audit-<appliance-id>` (e.g. `vmrep-audit-99334138`) — the Linode
+instance id is globally unique, so the name never collides across accounts or
+appliances. From then on it keeps an audit trail there:
 
 - **`main.log`** — every action taken in the console (logins, connection tests,
   migration create/start/delete, token changes) plus appliance system messages,
@@ -224,9 +222,20 @@ skipped.
 
 The bucket is created in the **appliance's own region** by default (so a
 Singapore appliance gets a Singapore bucket). Override with the
-`-obj-region <region>` flag if you want it elsewhere. If a bucket ended up in
-the wrong region, use **Re-create audit bucket** on the token card to provision
-it again in the current region (then delete the stray bucket in Cloud Manager).
+`-obj-region <region>` flag if you want it elsewhere.
+
+**Managing the bucket from the token card:**
+
+- **Re-create audit bucket** — creates `vmrep-audit-<appliance-id>` if it doesn't
+  exist (e.g. after you deleted it, here or in Cloud Manager). If the bucket
+  already exists it just tells you so and re-points the console at it — it never
+  overwrites or duplicates.
+- **Delete audit bucket** — **empties and permanently deletes** the bucket and
+  **all** logs in it (the `main.log` and every `migrations/…` log). To guard
+  against mistakes it is only allowed when **no migration is active** (none in a
+  created/running state — finish, launch, or delete them first) and it requires
+  you to **type the console password**. Re-create afterwards to start a fresh,
+  empty bucket.
 
 > The launched instance's own OS boot console isn't available through the Linode
 > API, so the per-migration log captures the instance's **status transitions**
