@@ -86,6 +86,14 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 		}
 		p.written, p.total, p.fullSync = written, total, fullSync
 		p.mu.Unlock()
+		if written == 0 {
+			// Data is now flowing: advance to "replicating" so the console shows live
+			// initial-sync progress, instead of staying "awaiting_agent" (and jumping
+			// straight to 100%) until the first pass finishes. No-op once replicating.
+			if err := s.st.MarkReplicating(s.ctx, migID); err != nil {
+				log.Printf("appliance: mark replicating (migration %d): %v", migID, err)
+			}
+		}
 	}
 
 	diskIdx := d.Index
