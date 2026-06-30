@@ -22,4 +22,5 @@ Guidance for Claude Code (and other AI agents) when working in this repository.
 - Don't merge any pull request without asking first.
 - Always check for existing utility functions before writing new ones.
 - When uncertain, ask — don't guess.
-- If there is any code update to the console, update the documentation as well.
+- If there is any code update to the console, update the documentation
+  (`docs/console.md`) as well.

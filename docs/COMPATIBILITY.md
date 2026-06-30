@@ -64,7 +64,7 @@ but get no automatic repair pass.
 
 ### On the target / appliance
 1. A **Linode account** and an **API token** with **Linodes: Read/Write** and **Volumes: Read/Write**.
-2. The **appliance** (replication server) running on a Linode — see [`APPLIANCE.md`](APPLIANCE.md).
+2. The **appliance** (replication server) running on a Linode — see [`console.md`](console.md).
 3. The target volume is sized **≥ the source disk** (the console rounds up).
 
 ### For the cleanest cutover (recommended, not required)
