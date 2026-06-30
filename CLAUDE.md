@@ -23,4 +23,4 @@ Guidance for Claude Code (and other AI agents) when working in this repository.
 - Always check for existing utility functions before writing new ones.
 - When uncertain, ask — don't guess.
 - If there is any code update to the console, update the documentation
-  (`docs/console.md`) as well.
+  (`CONSOLE.md`) as well.
