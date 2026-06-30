@@ -643,27 +643,6 @@ function completeMig(id){
     '<div class="muted" style="font-size:12px;margin-top:10px">After removing the agent you can Delete this migration to clean up the appliance’s replication volumes (the launched cutover Linode and its volumes are yours to keep).</div>';
   uiDialog({title:'Migration complete — remove source agent',html:body,wide:true,cancel:false,okText:'Done'});
 }
-// "Check status" re-fetches THIS migration and shows the latest result in a box.
-async function checkStatus(id,btn){
-  busy(btn,true);
-  try{
-    const v=await api('GET','/api/v1/migrations/'+id);
-    const card=replaceCard(id,v);
-    const m=v.migration;const err=anyDiskError(m);const box=card.querySelector('#status'+id)||$('status'+id);
-    if(box){
-      box.classList.remove('hide');
-      if(v.replication_paused){box.className='resultbox';box.textContent='⏸ Replication paused. Resume to continue with an incremental delta sync (no full re-copy).';}
-      else if(allDone(m)){box.className='resultbox ok';box.textContent='✔ All disks baselined and replicating.';}
-      else if(err){box.className='resultbox bad';box.textContent='✘ Last replication attempt failed: '+err;}
-      else if(v.replication_active){box.className='resultbox';box.textContent='Replication running — initial full sync in progress.';}
-      else if(v.agent_connected){box.className='resultbox ok';box.textContent='✔ Agent connected on all disks — connection validated. Click Start replication to begin the initial sync.';}
-      else if(v.connection_failed){box.className='resultbox bad';box.textContent='✘ Connection failed — the agent has not checked in. Verify the install command ran and TCP 5000-5100 is reachable.';}
-      else{box.className='resultbox';box.textContent='Waiting for the agent to connect — it retries every 60s. Run the force-retry command on the source if needed.';}
-    }
-    flash(card);
-  }catch(e){const box=$('status'+id);if(box){box.className='resultbox bad';box.textContent='Error: '+e.message}}
-  finally{busy(btn,false)}
-}
 // Cache the rendered (latest-5) activity-log lines per migration so the 5s
 // auto-poll (which rebuilds the cards) can restore the log without a flicker.
 const logCache={};
@@ -867,7 +846,7 @@ function migCard(v){
     '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_ip||m.source_hostname||'-')+'</span></td>'+
     '<td>'+pillFor(v,m)+'</td>'+
     '<td class="muted">'+disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining')+'</td>'+
-    '<td>'+progressLine(v,m)+'</td>'+
+    '<td id="prog'+m.id+'">'+progressLine(v,m)+'</td>'+
     '<td class="muted">'+(v.rpo_seconds?Math.round(v.rpo_seconds)+'s':'—')+'</td></tr></table>';
 
   // Everything below the status table is hidden when the card is collapsed.
@@ -913,10 +892,6 @@ function migCard(v){
     b+='<label>Run this on '+esc(m.source_hostname||'the source')+'</label>'+
        '<div style="display:flex;gap:8px;align-items:flex-start"><pre id="enroll'+m.id+'" style="flex:1;margin:0">'+esc(v.enroll_cmd)+'</pre>'+
        '<button onclick="copyText(document.getElementById(\'enroll'+m.id+'\').textContent,this)">Copy</button></div>'+
-       '<div class="muted" style="font-size:12px;margin-top:8px">If a disk’s sync fails, no reinstall is needed — the agent retries every 60s. '+
-       'Force a retry on the source with <code style="display:inline;padding:1px 5px">sudo systemctl start vmrepl-agent.service</code>, then click <b>Check status</b> below.</div>'+
-       '<div class="actions"><button onclick="checkStatus('+m.id+',this)">Check status</button></div>'+
-       '<div id="status'+m.id+'" class="resultbox hide"></div>'+
        connStatus(v,m)+
        '<hr class="migdivider"></div></details>';
   }
@@ -967,7 +942,11 @@ function migCard(v){
   b+='<span style="flex:1"></span><button class="danger" onclick="deleteMig('+m.id+',\''+esc(m.name)+'\',this)">Delete</button></div>';
 
   h+='<div class="migbody">'+b+'</div>';
-  const card=document.createElement('div');card.className='mig'+(collapsed?' collapsed':'');card.id='mig'+m.id;card.innerHTML=h;return card;
+  const card=document.createElement('div');card.className='mig'+(collapsed?' collapsed':'');card.id='mig'+m.id;card.innerHTML=h;
+  // Mark cards whose progress is actively moving (initial sync streaming) so the
+  // 1s poller can update just those in place for a live progress bar.
+  card.dataset.live=(v.percent_done>=0)?'1':'';
+  return card;
 }
 
 // replaceCard swaps just this migration's card in place, preserving which
@@ -1019,7 +998,23 @@ async function init(){
   try{await api('GET','/api/v1/session');start();
     setInterval(()=>{if(!$('app').classList.contains('hide'))refresh(false)},5000);
     // Tick visible elapsed timers every second between server refreshes.
-    setInterval(()=>{document.querySelectorAll('.livedur[data-since]').forEach(s=>{const t=+s.dataset.since;if(t)s.textContent=fmtDur((Date.now()-t)/1000)})},1000);}
+    setInterval(()=>{document.querySelectorAll('.livedur[data-since]').forEach(s=>{const t=+s.dataset.since;if(t)s.textContent=fmtDur((Date.now()-t)/1000)})},1000);
+    // Live progress: every second, update just the progress cell of migrations
+    // whose initial sync is actively streaming (data-live) — so the bar, %, ETA,
+    // transferred and speed move smoothly without waiting for the 5s full refresh.
+    // Surgical: one GET per live migration, replacing only the progress <td> — no
+    // card rebuild, no log/settings reload, so it never disrupts the rest of the UI.
+    setInterval(()=>{
+      if($('app').classList.contains('hide'))return;
+      document.querySelectorAll('#migs .mig[data-live="1"]').forEach(card=>{
+        const id=card.id.slice(3);
+        api('GET','/api/v1/migrations/'+id).then(v=>{
+          const td=card.querySelector('#prog'+id);
+          if(td)td.innerHTML=progressLine(v,v.migration);
+          card.dataset.live=(v.percent_done>=0)?'1':'';
+        }).catch(()=>{});
+      });
+    },1000);}
   catch(e){show('login')}
 }
 init();
