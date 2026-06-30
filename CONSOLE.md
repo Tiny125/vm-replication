@@ -344,27 +344,36 @@ instance** button enables.
 
 ## 7. Cut over the instance
 
-Click **Cutover instance**. The appliance:
-1. stops accepting new blocks (quiesces all disks),
-2. runs the **machine conversion** on the **boot disk** so it boots on Linode
-   (virtio initramfs, GRUB, fstab, Lish serial console, network reset),
-3. **clones every disk's volume** into an immutable image volume
-   (`vmrepl-img-<id>-<diskIndex>`) — your migrated "snapshot(s)",
-4. optionally **launches a new Linode** with all image volumes attached (boot as
-   `sda`, data disks as `sdb`, `sdc`, …) and boots it.
+Cutover is **two steps with a power-off in between** (the same for volume-boot and
+local-disk boot):
+
+1. Stop the source's apps/databases and let the **RPO lag drop to ~0** (shown on
+   the card), so the frozen copy is current.
+2. Click **Cutover instance**, optionally set a **root password / SSH key** (so
+   you can log into the launched instance via the Lish console), then **Stop
+   replication & continue**. The appliance stops replication and **freezes the
+   current replicated copy** as the image to launch — crash-consistent (like a
+   power-loss) and repaired with `fsck` during the boot conversion. The migration
+   pauses in state `awaiting_cutover`. (No read-only remount of the source is
+   attempted, so it can't get stuck on a busy root.)
+3. **Power off the source server**, then click **Launch instance**. The appliance:
+   - runs the **machine conversion** on the boot disk so it boots on Linode
+     (virtio initramfs, GRUB, fstab, Lish serial console, network reset),
+   - **clones every disk's volume** into an image volume
+     (`vmrepl-img-<id>-<diskIndex>`) — your migrated "snapshot(s)",
+   - **launches a new Linode** with all image volumes attached (boot as `sda`,
+     data disks as `sdb`, `sdc`, …) and boots it.
 
 So **a multi-disk migration produces multiple image volumes** — one per source
 disk. When it finishes, the completed banner lists them and links to
 **cloud.linode.com/volumes**.
 
-> **Stop the source's apps/databases before cutting over.** The recommended
-> workflow is to stop the application/database on the source first, so the
-> replicated disk is already in a consistent state. The cutover dialog's
-> **"Source apps/databases are already stopped"** box (checked by default) then
-> cuts over immediately. Leave it unchecked only if the source is still live —
-> the appliance will instead ask the still-connected agent for a crash-consistent
-> point-in-time snapshot first (which needs a snapshot-capable agent and can take
-> several minutes).
+> **Why freeze then power off?** It gives a clean, final copy without needing LVM
+> or a read-only remount of the running root (which fails on most cloud images
+> with "/: mount point is busy"). Powering the source off before launching also
+> ensures the old and new machines aren't both up at once. For the lowest-RPO
+> cutover, stop the source's writers and wait for the lag to reach ~0 before
+> step 2.
 
 ### Launching later / manually from the image volumes
 
