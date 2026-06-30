@@ -544,37 +544,32 @@ async function startMig(id,btn){
   const disk=meta.boot_target==='disk';
   const planNote=meta.linode_type?(' on plan <b>'+esc(meta.linode_type)+'</b>'):'';
   const access='<div class="muted" style="font-size:12px;margin-top:10px">Migrated disks keep the <b>source</b>’s logins, and cloud images usually leave root locked — so set a root password (and/or SSH key) below to reach the new instance via the Lish console without rescue mode.</div>';
-  // Step 1 of the guided cutover: capture a CONSISTENT image. The agent quiesces
-  // the source (remounts its root read-only for one pass); if the source is already
-  // powered off the current data is used as-is. This pauses afterwards so you can
-  // power off the source, then Complete cutover.
-  const how='<div style="margin-bottom:8px">This captures a <b>consistent</b> point-in-time image of the source, then <b>pauses</b> so you can power the source off before the final cutover'+(disk?(', after which it creates a new Linode'+planNote+' and boots from its local disk.'):(meta.linode_type?(', after which it launches a new Linode'+planNote+'.'):' and clones every disk into launchable volumes.'))+'</div>';
-  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases and heavy writers so its data is settled. A clean read-only snapshot needs LVM, or a root that can be remounted read-only — many cloud images have neither, so that step fails with <i>“/: mount point is busy”</i>. If so, tick <b>Skip the read-only snapshot</b> below to cut over from the current (crash-consistent, fsck-repaired) data. The source stays <b>running</b> until you power it off in the next step.</div>';
+  // Guided cutover, two steps with a power-off in between (same for volume- and
+  // disk-boot, for consistency). Step 1 STOPS replication and freezes the current
+  // replicated copy as the image — crash-consistent (like a power-loss), repaired
+  // with fsck on convert; it never attempts a read-only remount, so it can't get
+  // stuck on a busy root. Step 2 (after you power off the source) launches.
+  const how='<div style="margin-bottom:8px"><b>Step 1 of 2.</b> This <b>stops replication</b> and freezes the current replicated copy as the image to launch'+(disk?(' — step 2 then creates a new Linode'+planNote+' booting from its local disk.'):(meta.linode_type?(' — step 2 then launches a new Linode'+planNote+'.'):' and clones every disk into launchable volumes.'))+' Next you’ll <b>power off the source</b>, then launch.</div>';
+  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the frozen copy is current. The image is crash-consistent and repaired with fsck on convert — no LVM or read-only remount needed.</div>';
   const opts={
-    title:'Cut over migration #'+id+' — step 1: capture consistent image',
-    okText:'Capture image',
+    title:'Cut over migration #'+id+' — step 1: stop replication & freeze the image',
+    okText:'Stop replication & continue',
     html:how+access+prep,
     fields:[
       {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
       {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
-    ],
-    checkboxes:[
-      {id:'skipsnap',label:'Skip the read-only snapshot — use if cutover fails with “root is busy / could not remount read-only”. The image is taken from the current replicated data: crash-consistent (like a power-loss) and repaired with fsck on convert. Stop databases/heavy writers first and make sure the RPO lag is low.',checked:false}
     ]
   };
-  if(!disk && meta.linode_type){
-    opts.checkboxes.push({id:'launch',label:'Also launch a new <name>-cutover Linode at completion (boot=sda, data=sdb…). Uncheck to just create the cutover volumes.',checked:true});
-  }
   const r=await confirmModal(opts);
   if(!r)return;
   busy(btn,true);
-  // Guided cutover. skip_snapshot lets a source with no LVM / un-remountable root
-  // proceed on its current crash-consistent data instead of a failing quiesce.
-  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:disk?true:(r.launch!==false),root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:r.skipsnap===true,guided_shutdown:true});await refreshMig(id)}
+  // Always guided + skip the read-only snapshot: freeze the current crash-consistent
+  // data, pause for the operator to power off the source, then launch. Always launch.
+  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:true,root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:true,guided_shutdown:true});await refreshMig(id)}
   catch(e){alertModal({title:'Cannot start cutover',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function completeCutover(id,btn){
-  if(!await confirmModal({title:'Complete cutover #'+id+'?',html:'The consistent image is already captured. Make sure the source is <b>powered off</b>, then this converts the boot disk, clones every disk, and launches. This is the final step.',okText:'Complete cutover'}))return;
+  if(!await confirmModal({title:'Source powered off — launch the migrated instance?',html:'Confirm the <b>source server is shut down</b> (both machines must not run at once). This converts the frozen image, clones the disk(s), and launches the new instance. This is the final step.',okText:'Launch instance'}))return;
   busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/complete',{});await refreshMig(id)}catch(e){alertModal({title:'Cannot complete',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function stopMig(id,btn){
@@ -718,7 +713,7 @@ function progressLine(v,m){
   if(st==='image_ready'||st==='launched'){label='completed in '+fmtDur(v.elapsed_seconds);bar=progBar(100,false);}
   else if(st==='failed'){label='failed';bar=progBar(0,false);}
   else if(st==='migrating'){label='finalizing · running '+liveDur(m.migrate_started,v.elapsed_seconds);bar=progBar(0,true);}
-  else if(st==='awaiting_cutover'){label='consistent image captured — power off the source, then Complete cutover';bar=progBar(100,false);}
+  else if(st==='awaiting_cutover'){label='step 1 done — power off the source, then Launch instance';bar=progBar(100,false);}
   else{
     const allBase=disks(m).length>0&&disks(m).every(d=>d.full_sync_done);
     if(allBase){label='initial sync completed · 100%';bar=progBar(100,false);}
@@ -765,7 +760,7 @@ function diskTable(m){const d=disks(m);if(!d.length)return '';
   return h+'</table>';
 }
 function infoIcon(tip){return '<span class="info" data-tip="'+esc(tip)+'">i</span>'}
-function stateLabel(s){return ({created:'created',awaiting_agent:'waiting for agent',replicating:'replicating',ready:'ready to cut over',awaiting_cutover:'power off source, then complete',migrating:'finalizing',image_ready:'image ready',launched:'launched',failed:'failed'})[s]||s}
+function stateLabel(s){return ({created:'created',awaiting_agent:'waiting for agent',replicating:'replicating',ready:'ready to cut over',awaiting_cutover:'power off source, then launch',migrating:'finalizing',image_ready:'image ready',launched:'launched',failed:'failed'})[s]||s}
 // pillFor renders the header status pill. Before replication starts (state still
 // awaiting_agent/created) it reflects the gated-start connection signals so the
 // operator sees connect → start at a glance; otherwise it uses the migration state.
@@ -787,7 +782,7 @@ function pillFor(v,m){
 const STATE_DESCS=[['awaiting_agent','enrolled; the agent has not connected yet'],
   ['replicating','agent connected; copying the baseline, then ongoing changes'],
   ['ready','baseline done and lag is low — safe to cut over'],
-  ['awaiting_cutover','guided cutover: consistent image captured — power off the source, then Complete cutover'],
+  ['awaiting_cutover','guided cutover: replication stopped & image frozen — power off the source, then Launch instance'],
   ['migrating','converting the boot disk and cloning volumes'],
   ['image_ready','image volume(s) ready to launch'],
   ['launched','a new Linode was launched from the image'],
@@ -911,9 +906,9 @@ function migCard(v){
   }else if(m.state==='awaiting_cutover'){
     // Guided cutover: phase 1 captured a consistent image and froze it (receivers
     // stopped). Now the operator powers off the source and confirms.
-    b+='<div class="warn" style="font-size:12px;margin-bottom:6px">✓ Consistent image captured and frozen. Now <b>power off the source server</b>, then click <b>Complete cutover</b>. (Completing while the source is still running won’t corrupt the image — it just risks the old and new machines both being up.)</div>';
-    b+='<button class="primary" onclick="completeCutover('+m.id+',this)">Complete cutover</button>'+
-      infoIcon('A consistent image is frozen. Power off the source first, then this converts the boot disk, clones every disk, and launches. Final step.')+
+    b+='<div class="warn" style="font-size:12px;margin-bottom:6px">✓ <b>Step 1 done</b> — replication is stopped and the current copy is frozen as the image. <b>Step 2:</b> <b>power off the source server now</b> (so the old and new machines aren’t both running), then click <b>Launch instance</b>.</div>';
+    b+='<button class="primary" onclick="completeCutover('+m.id+',this)">Launch instance</button>'+
+      infoIcon('Converts the frozen image, clones the disk(s), and launches the new Linode. Power off the source first. Final step.')+
       '<button class="danger" onclick="stopMig('+m.id+',this)">Cancel</button>';
   }else if(m.state==='failed' && allDone(m)){
     // A cutover failed but the data is fully replicated — retry re-runs it.

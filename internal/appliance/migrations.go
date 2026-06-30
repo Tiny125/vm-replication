@@ -1011,7 +1011,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	//    sources, quiesce the source first and use skip — see docs/CUTOVER.md.
 	consistent := false
 	if req.SkipSnapshot {
-		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: skipping the point-in-time snapshot at the operator's request — the source is reported powered off or quiesced, so the current replicated data is treated as consistent. (If the source was still running and writing, the image may be inconsistent.)")
+		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: replication stopped; freezing the current replicated copy as the image (crash-consistent, repaired with fsck on convert). Power off the source before launching so the captured state is final.")
 		consistent = true // operator's assertion
 	} else if !s.sourceAgentActive(m) {
 		// No agent checked in — the source appears powered off, so the current
@@ -1048,7 +1048,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		s.pendingCutover[m.ID] = req
 		s.recMu.Unlock()
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigAwaitingCutover, "")
-		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: consistent point-in-time image captured and frozen. Now POWER OFF the source server; once the appliance confirms the source agent has stopped, click \"Complete cutover\" to convert, clone and launch.")
+		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover step 1 done: replication stopped and the current copy frozen as the image. Now POWER OFF the source server, then click \"Launch instance\" to convert, clone and launch.")
 		return
 	}
 	s.finalizeComplete(ctx, m, req)
