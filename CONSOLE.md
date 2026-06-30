@@ -5,7 +5,7 @@ This is the turnkey way to use the **vm-replication tool**: install one service 
 from the browser. No manual cert copying or command crafting — the console
 generates a one-line command for each source.
 
-For the manual/CLI workflow instead, see [`GETTING_STARTED.md`](GETTING_STARTED.md).
+For the manual/CLI workflow instead, see [`GETTING_STARTED.md`](docs/GETTING_STARTED.md).
 
 ---
 
