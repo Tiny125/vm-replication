@@ -14,7 +14,7 @@ boots natively on Linode — with a near-zero-downtime cutover.
 > application-consistent snapshots, and Linode provisioning + boot conversion.
 >
 > **Want the turnkey web console?** See
-> **[`docs/APPLIANCE.md`](docs/APPLIANCE.md)** — one command installs a
+> **[`docs/console.md`](docs/console.md)** — one command installs a
 > replication server, you log in with a generated password, enter source
 > details, run a generated one-liner on the source, then click "Start migration"
 > to produce a launchable Linode image.
@@ -115,7 +115,7 @@ scripts/gen-certs.sh certs <LINODE_IP>
 | `internal/controlplane` · `internal/controlclient` · `internal/api` | API server, client, shared types |
 | `deploy/systemd` | unit files + env templates for agent/receiver/controld |
 | `scripts/` | cert gen, smoke tests, install, Linode provisioning, machine conversion, dm-era setup |
-| `docs/` | `APPLIANCE.md`, `GETTING_STARTED.md`, `CUTOVER.md`, `OPERATIONS.md`, `DESIGN.md` |
+| `docs/` | `console.md`, `GETTING_STARTED.md`, `CUTOVER.md`, `OPERATIONS.md`, `DESIGN.md` |
 
 ## Run it as a managed service
 
