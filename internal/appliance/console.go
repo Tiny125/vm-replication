@@ -380,11 +380,12 @@ async function loadSettings(){
   const st=await api('GET','/api/v1/settings');
   let h='<h2>Linode automation</h2>';
   if(st.linode_token_set){
-    h+='<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span><span class="y">✔</span> Linode API token validated &amp; stored.'+
+    h+='<div style="line-height:1.6"><span class="y">✔</span> Linode API token validated &amp; stored.'+
        (st.linode_account?(' Account: <b>'+esc(st.linode_account)+'</b>.'):'')+'<br>'+
        (st.linode_automation?('Appliance Linode '+esc(st.appliance_linode_id)+'; volumes created in its region.'):'(appliance Linode id unknown — file-fallback mode)')+'<br>'+
        (st.audit_ready?('<span class="y">✔</span> Audit log bucket <b>'+esc(st.audit_bucket)+'</b>'+(st.audit_region?(' in region <b>'+esc(st.audit_region)+'</b>'):'')+' — console &amp; per-migration logs upload to Object Storage (browse in Cloud Manager).')
-        :(st.audit_error?('<span class="x">✘</span> Audit log bucket not created: '+esc(st.audit_error)):'<span class="muted">Audit log bucket: provisioning…</span>'))+'</span>'+
+        :(st.audit_error?('<span class="x">✘</span> Audit log bucket not created: '+esc(st.audit_error)):'<span class="muted">Audit log bucket: provisioning…</span>'))+'</div>'+
+       '<div class="actions">'+
        '<button onclick="reprovisionAuditBucket(this)">Re-create audit bucket</button>'+
        (st.audit_ready?'<button class="danger" onclick="deleteAuditBucket(this)">Delete audit bucket</button>':'')+
        '<button class="danger" onclick="removeToken(this)">Remove token</button></div>'+
