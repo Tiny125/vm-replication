@@ -389,7 +389,7 @@ async function loadSettings(){
        '<button onclick="reprovisionAuditBucket(this)">Re-create audit bucket</button>'+
        (st.audit_ready?'<button class="danger" onclick="deleteAuditBucket(this)">Delete audit bucket</button>':'')+
        '<button class="danger" onclick="removeToken(this)">Remove token</button></div>'+
-       '<div class="muted" style="margin-top:8px;font-size:12px">“Re-create” makes <code style="display:inline;padding:1px 5px">vmrep-audit-'+esc(st.appliance_linode_id||'&lt;id&gt;')+'</code> if it doesn’t exist (and tells you if it already does). “Delete audit bucket” empties and removes it with all logs — only when <b>no migration is active</b> and after you enter the console password. The token can only be removed once <b>no migrations exist</b>.</div>';
+       '<div class="muted" style="margin-top:8px;font-size:12px">“Re-create” makes <code style="display:inline;padding:1px 5px">vmrep-audit-'+esc(st.appliance_linode_id||'&lt;id&gt;')+'</code> if it doesn’t exist (and tells you if it already does). “Delete audit bucket” empties and removes it with all logs — only when <b>no migration is active</b> and after you enter the console password. The token can be removed once <b>no migration is active</b> (completed migrations don’t block it).</div>';
   }else{
     h+='<details><summary>What is this and how do I get a token?</summary><div class="muted" style="font-size:13px">'+
        'A Linode <b>Personal Access Token</b> lets the appliance create volumes, clone disks and launch instances. Stored <b>encrypted at rest</b>. '+
@@ -411,7 +411,7 @@ async function saveToken(btn){
 async function removeToken(btn){
   if(!await confirmModal({title:'⚠ Remove Linode API token?',
     html:'<div class="warn">Provisioning, cloning and launching will <b>stop working</b> until you add a valid token again.</div>'+
-      '<div class="muted" style="margin-top:8px;font-size:13px">Only allowed when <b>no migrations exist</b> — otherwise removal is refused, because deleting a migration needs the token to remove its Linode volumes (removing it first would orphan them). This does not delete anything in your Linode account.</div>',
+      '<div class="muted" style="margin-top:8px;font-size:13px">Only allowed when <b>no migration is active</b> (created or running) — a <b>completed</b> migration doesn’t block it. Otherwise removal is refused, because deleting an active migration needs the token to remove its Linode volumes (removing it first would orphan them). This does not delete anything in your Linode account.</div>',
     okText:'Remove token',okDanger:true}))return;
   busy(btn,true);try{await api('DELETE','/api/v1/settings/linode-token');toast('Linode token removed','ok');loadSettings()}catch(e){alertModal({title:'Error',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
 async function reprovisionAuditBucket(btn){
@@ -539,6 +539,13 @@ function disks(m){return m.disks||[]}
 function allDone(m){const d=disks(m);return d.length>0&&d.every(x=>x.full_sync_done)}
 function bytesTotal(m){return disks(m).reduce((a,d)=>a+(d.bytes_on_wire||0),0)}
 function anyDiskError(m){return disks(m).map(d=>d.last_error).filter(Boolean)[0]||''}
+// rpoText renders the replication lag (RPO). Only meaningful while replication is
+// live (created/awaiting_agent/replicating/ready); once cutover is initiated the
+// stream stops, so a stale lag would mislead — show a dash from then on.
+function rpoText(v,m){
+  const replicating=['created','awaiting_agent','replicating','ready'].includes(m.state);
+  return (replicating && v.rpo_seconds) ? Math.round(v.rpo_seconds)+'s' : '—';
+}
 
 async function startMig(id,btn){
   const meta=migMeta[id]||{};
@@ -633,14 +640,39 @@ async function deleteMig(id,name,btn){
 }
 // completeMig is the green "migration complete" action: it shows the command to
 // remove the replication agent from the source — the final step of the cycle.
-function completeMig(id){
+// After the operator copies the command and clicks Done, a "Close migration"
+// button is revealed on the card (agentAcked) to clean up the appliance's
+// temporary replication volume while keeping the launched instance.
+async function completeMig(id){
   const meta=migMeta[id]||{};const cmd=meta.uninstall||'';
   const body='<div style="font-size:13.5px;margin-bottom:10px">Your server is migrated and launched on Linode. To finish, remove the replication agent from <b>'+esc(meta.source||'the source server')+'</b>:</div>'+
     (cmd?('<div style="display:flex;gap:8px;align-items:flex-start"><pre id="donecmd'+id+'" style="flex:1;margin:0">'+esc(cmd)+'</pre>'+
       '<button onclick="copyText(document.getElementById(\'donecmd'+id+'\').textContent,this)">Copy</button></div>')
       :'<div class="muted">Run your uninstall command on the source to remove the agent.</div>')+
-    '<div class="muted" style="font-size:12px;margin-top:10px">After removing the agent you can Delete this migration to clean up the appliance’s replication volumes (the launched cutover Linode and its volumes are yours to keep).</div>';
-  uiDialog({title:'Migration complete — remove source agent',html:body,wide:true,cancel:false,okText:'Done'});
+    '<div class="muted" style="font-size:12px;margin-top:10px">After you click <b>Done</b>, a <b>Close migration</b> button appears on the card. It removes the appliance’s temporary <b>vmrep-</b> replication volume and clears the card — your launched Linode and its volumes are kept, untouched.</div>';
+  await uiDialog({title:'Migration complete — remove source agent',html:body,wide:true,cancel:false,okText:'Done'});
+  // Reveal the Close button on this card (persists across refreshes via the set).
+  agentAcked.add(id);
+  refreshMig(id);
+}
+// closeMig finishes a successful migration: after confirmation it removes the
+// appliance's temporary replication volume (the vmrep- one) and clears the card,
+// while KEEPING the launched Linode and its cutover volumes.
+async function closeMig(id,name,btn){
+  if(!await confirmModal({title:'Close migration #'+id+'?',
+    html:'<b>'+esc(name)+'</b><div style="margin-top:8px">This removes the appliance’s temporary <b>vmrep-'+esc(name)+'</b> replication volume (no longer needed now that the server is migrated) and clears this card.</div>'+
+      '<div class="muted" style="margin-top:8px;font-size:13px">Your <b>launched Linode and its volumes are kept, untouched</b> — only the replication volume is deleted. This cannot be undone.</div>',
+    okText:'Close migration',okDanger:true}))return;
+  busy(btn,true);
+  try{
+    await api('POST','/api/v1/migrations/'+id+'/close');
+    agentAcked.delete(id);
+    const c=$('mig'+id);if(c)c.remove();
+    if(!$('migs').children.length){$('migs').innerHTML='<div class="muted" style="padding:8px">No migrations yet. Create one above.</div>';}
+    toast('Migration #'+id+' ('+name+') closed — replication volume removed, launched Linode kept','ok');
+    loadSettings();
+  }
+  catch(e){toast('Close failed: '+e.message,'bad');busy(btn,false);}
 }
 // Cache the rendered (latest-5) activity-log lines per migration so the 5s
 // auto-poll (which rebuilds the cards) can restore the log without a flicker.
@@ -806,6 +838,7 @@ const collapsedMigs=new Set();   // migration ids the user collapsed
 const seenMigs=new Set();        // migrations rendered at least once (for first-time defaults)
 const migMeta={};                // id -> {uninstall, source, name} captured at render time
 const pendingCleanup={};         // id -> {name, source, cmd} for deleted migrations awaiting agent removal
+const agentAcked=new Set();      // launched migrations whose "remove source agent" step was acknowledged (reveals Close)
 function toggleCollapse(id,btn){
   const card=$('mig'+id);if(!card)return;
   const now=card.classList.toggle('collapsed');
@@ -840,6 +873,12 @@ function migCard(v){
     '<span class="muted" style="font-size:12px;flex:1">'+(collapsed?'collapsed — click ▸ to expand':'')+'</span>'+
     '<button class="mini" title="Refresh this migration" onclick="refreshMig('+m.id+',this)">↻ Refresh</button></div>';
 
+  // Migration-complete header: a prominent green strip at the top of a launched /
+  // image-ready card so the finished state is obvious at a glance.
+  if(['image_ready','launched'].includes(m.state)){
+    h+='<div class="banner" style="border-color:#bfe3cd;background:#eaf7ef;color:#0f5c30;margin:0 0 10px;font-size:14px;font-weight:600">✓ Migration complete<span style="font-weight:400"> — your server is migrated and running on Linode.</span></div>';
+  }
+
   // Boot-mode header banner: distinct colours so the mode is obvious at a glance
   // (green = Linode local disk, blue = separate Block Storage volume).
   h+=(m.boot_target==='disk')
@@ -851,7 +890,7 @@ function migCard(v){
     '<td id="stat'+m.id+'">'+pillFor(v,m)+'</td>'+
     '<td class="muted" id="disks'+m.id+'">'+disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining')+'</td>'+
     '<td id="prog'+m.id+'">'+progressLine(v,m)+'</td>'+
-    '<td class="muted" id="rpo'+m.id+'">'+(v.rpo_seconds?Math.round(v.rpo_seconds)+'s':'—')+'</td></tr></table>';
+    '<td class="muted" id="rpo'+m.id+'">'+rpoText(v,m)+'</td></tr></table>';
 
   // Everything below the status table is hidden when the card is collapsed.
   let b='';
@@ -906,10 +945,15 @@ function migCard(v){
   }
 
   b+='<div class="actions">';
-  if(['image_ready','launched'].includes(m.state)){
+  const migDone=['image_ready','launched'].includes(m.state);
+  if(migDone){
     // Done: green button leads to the agent-removal notice — the intended way
-    // to finish the migration cycle.
+    // to finish the migration cycle. Once acknowledged, a Close button appears to
+    // clean up the appliance's replication volume (keeping the launched Linode).
     b+='<button class="primary done" onclick="completeMig('+m.id+')">✓ Migration complete — remove source agent</button>';
+    if(agentAcked.has(m.id))
+      b+='<button class="danger" onclick="closeMig('+m.id+',\''+esc(m.name)+'\',this)">Close migration</button>'+
+        infoIcon('Removes the appliance’s temporary vmrep- replication volume and clears this card. Your launched Linode and its volumes are kept, untouched.');
   }else if(m.state==='migrating'){
     b+='<button class="danger" onclick="stopMig('+m.id+',this)">Stop</button>';
   }else if(m.state==='awaiting_cutover'){
@@ -946,7 +990,13 @@ function migCard(v){
     b+='<button class="primary"'+(ready?'':' disabled title="The initial full sync must complete on all disks first"')+' onclick="startMig('+m.id+',this)">Cutover instance</button>'+
       infoIcon('Cuts over to Linode: stops replication, converts the boot disk, clones every disk into <name>-cutover volumes, and (optionally) launches a <name>-cutover Linode. Enables automatically once the initial full sync completes.');
   }
-  b+='<span style="flex:1"></span><button class="danger" onclick="deleteMig('+m.id+',\''+esc(m.name)+'\',this)">Delete</button></div>';
+  // Delete is hidden once the migration is complete (launched / image ready) so
+  // the migrated server can't be torn down by accident — use "Close migration"
+  // there instead, which removes only the replication volume and keeps the
+  // launched Linode.
+  b+='<span style="flex:1"></span>';
+  if(!migDone)b+='<button class="danger" onclick="deleteMig('+m.id+',\''+esc(m.name)+'\',this)">Delete</button>';
+  b+='</div>';
 
   h+='<div class="migbody">'+b+'</div>';
   const card=document.createElement('div');card.className='mig'+(collapsed?' collapsed':'');card.id='mig'+m.id;card.innerHTML=h;
@@ -1027,7 +1077,7 @@ async function init(){
           set('#stat'+id,pillFor(v,m));
           set('#disks'+id,disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining'));
           set('#prog'+id,progressLine(v,m));
-          set('#rpo'+id,v.rpo_seconds?Math.round(v.rpo_seconds)+'s':'—');
+          set('#rpo'+id,rpoText(v,m));
         }).catch(()=>{});
       });
     },1000);}

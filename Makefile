@@ -8,7 +8,7 @@ LDFLAGS   ?= -s -w
 GOFLAGS   ?=
 CGO_ENABLED ?= 0
 
-.PHONY: all build agent receiver controld replctl applianced test vet smoke certs clean
+.PHONY: all build agent receiver controld replctl applianced test test-scripts vet smoke certs clean
 
 all: build
 
@@ -31,8 +31,12 @@ controld:
 replctl:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN)/replctl ./cmd/replctl
 
-test:
+test: test-scripts
 	$(GO) test ./...
+
+# Shell-level unit tests for the conversion helpers (no root / block devices).
+test-scripts:
+	bash scripts/machine-convert-test.sh
 
 vet:
 	$(GO) vet ./...
