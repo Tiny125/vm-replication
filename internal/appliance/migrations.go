@@ -1082,6 +1082,7 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 	kernel, rootDevice := "linode/grub2", "/dev/sda"
 	convertFailed := false
 	convertEnvIssue := false // failure was a missing command / bad env, not inconsistent data
+	convertNoRoot := false   // no root/OS filesystem on the disk (wrong source device)
 	if s.cfg.ConvertScript != "" && isBlockDevice(bootDevice) {
 		log.Printf("appliance: migration %d: machine conversion on boot disk %s", m.ID, bootDevice)
 		// machine-convert.sh requires bash (set -o pipefail, etc). Run it under
@@ -1125,8 +1126,11 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 		if err != nil {
 			convertFailed = true
 			convertEnvIssue = convertFailureEnvIssue(err, string(out))
-			log.Printf("appliance: migration %d: machine-convert failed (continuing best-effort): %v\n%s", m.ID, err, trimOut(out))
-			if convertEnvIssue {
+			convertNoRoot = convertFailureNoRoot(string(out))
+			log.Printf("appliance: migration %d: machine-convert failed: %v\n%s", m.ID, err, trimOut(out))
+			if convertNoRoot {
+				_ = s.st.AddEvent(sctx, m.ID, "error", "boot disk conversion failed: "+wrongDiskMsg+" Detail: "+oneLine(trimOut(out)))
+			} else if convertEnvIssue {
 				_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish because a command was missing in the conversion environment (exit 127 / \"command not found\"). This is an appliance/PATH problem, NOT an inconsistent source — re-syncing won't help. Update the appliance to the latest build (the convert step now pins a full PATH) and retry the cutover. Detail: "+oneLine(trimOut(out)))
 			} else {
 				_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish, so the launched instance may not boot. Most often the replicated filesystem is inconsistent because the source kept changing during the copy — the reliable fix is a fresh full sync of a quiesced/idle source, then cut over again. The image volume is still created so you can also repair it manually in Rescue Mode (see docs/TROUBLESHOOTING.md). Detail: "+oneLine(trimOut(out)))
@@ -1161,7 +1165,9 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 		// with a clear, actionable error instead. (The replication volume is left
 		// intact for manual inspection in Rescue Mode.)
 		if convertFailed {
-			if convertEnvIssue {
+			if convertNoRoot {
+				s.fail(m.ID, "cutover aborted — "+wrongDiskMsg)
+			} else if convertEnvIssue {
 				s.fail(m.ID, "boot disk conversion failed because a required command was missing in the conversion environment (exit 127 / \"command not found\"). This is an appliance/PATH bug, NOT an inconsistent source — re-syncing won't help. Update the appliance to the latest build (the convert step now pins a full PATH), restart applianced, and retry the cutover. The replication volume is left intact for inspection; see the conversion detail above.")
 			} else {
 				s.fail(m.ID, "boot disk conversion failed, so the local-disk image would not boot (you'd see a grub> prompt and a stuck cutover). This almost always means the replicated filesystem is inconsistent — retry the cutover and let it take the crash-consistent snapshot (do not skip it; power the source off if you want to skip). See the conversion detail above for the fsck output.")
@@ -1169,6 +1175,14 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 			return
 		}
 		s.finalizeDisk(ctx, m, cl, kernel, rootDevice)
+		return
+	}
+
+	// If the disk holds no OS root (wrong source device — e.g. swap), a launched
+	// instance would only reach a grub> prompt. Abort BEFORE cloning/launching so we
+	// never produce an unbootable instance; the replication volume is left intact.
+	if convertNoRoot {
+		s.fail(m.ID, "cutover aborted — "+wrongDiskMsg)
 		return
 	}
 
@@ -1956,6 +1970,19 @@ func convertFailureEnvIssue(err error, out string) bool {
 	lo := strings.ToLower(out)
 	return strings.Contains(lo, "command not found") || strings.Contains(lo, ": not found")
 }
+
+// convertFailureNoRoot reports whether the boot-disk conversion failed because it
+// found no root/OS filesystem on the replicated disk — i.e. the disk holds no
+// operating system (typically swap or a data disk), which means the WRONG source
+// device was selected. This is a user error, not an inconsistent copy, so it needs
+// a different message and must never launch a would-be-grub> instance.
+func convertFailureNoRoot(out string) bool {
+	return strings.Contains(out, "could not locate a root filesystem")
+}
+
+// wrongDiskMsg guides the operator to replicate the disk that actually holds the
+// OS root, used when the converted disk has no root filesystem.
+const wrongDiskMsg = "the replicated disk has no root/OS filesystem — it looks like a swap or non-OS disk, so a launched instance would only reach a grub> prompt. You most likely selected the WRONG source device. On the source run `lsblk -f` (or `findmnt -no SOURCE /`) to find the disk holding the filesystem mounted at `/`, then create a new migration against that whole disk (e.g. /dev/sda or /dev/vda) and cut over again. Nothing was launched; delete this migration first."
 
 func orDefault(v, def string) string {
 	if v == "" {
