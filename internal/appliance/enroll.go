@@ -41,12 +41,18 @@ func (s *Server) handleAgentInstaller(w http.ResponseWriter, r *http.Request) {
 	var checks, execs strings.Builder
 	for _, d := range m.Disks {
 		target := fmt.Sprintf("%s:%d", s.cfg.PublicHost, d.ReceiverPort)
-		// Manifest path is scoped to THIS migration (by id), not just the device.
-		// Otherwise a new migration on the same device would load a previous
-		// migration's manifest and do a delta sync against its fresh, empty target
-		// volume — so the target would never receive a full copy and the baseline
-		// would never complete.
-		manifest := fmt.Sprintf("/var/lib/vmrepl-source-mig%d-disk%d.cbt", m.ID, d.Index)
+		// Manifest path is scoped to THIS migration by its unique enrollment TOKEN,
+		// not just the migration id. Ids restart at 1 whenever the appliance DB is
+		// recreated (redeploy), so a later migration could reuse an old id and load a
+		// PREVIOUS migration's checkpoint — then it does a delta against that stale
+		// manifest and writes only the changed blocks onto the fresh, empty target
+		// volume, leaving the baseline incomplete (the launched instance drops to
+		// grub>). The token never repeats, so a new migration always full-syncs.
+		tok := token
+		if len(tok) > 16 {
+			tok = tok[:16]
+		}
+		manifest := fmt.Sprintf("/var/lib/vmrepl-source-%s-disk%d.cbt", tok, d.Index)
 		fmt.Fprintf(&checks, "[ -e %q ] || { echo \"source device %s not found — re-check the device in the console\"; exit 1; }\n", d.SourceDevice, d.SourceDevice)
 		fmt.Fprintf(&execs, "ExecStart=$BIN -device %s -target %s -server-name $SERVER_NAME -manifest %s -cert $ETC/agent.crt -key $ETC/agent.key -ca $ETC/ca.crt -cutover-quiesce=remountro\n",
 			d.SourceDevice, target, manifest)
