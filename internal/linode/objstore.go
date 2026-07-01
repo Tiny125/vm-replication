@@ -53,7 +53,9 @@ func (c *Client) ListObjects(ctx context.Context, b Bucket) ([]string, error) {
 	var names []string
 	marker := ""
 	for {
-		path := fmt.Sprintf("/object-storage/buckets/%s/%s/object-list?page_size=1000", b.pathSeg(), b.Label)
+		// The object-list endpoint caps page_size at 25-100 (unlike the bucket list),
+		// so request the max 100 and page through with the marker below.
+		path := fmt.Sprintf("/object-storage/buckets/%s/%s/object-list?page_size=100", b.pathSeg(), b.Label)
 		if marker != "" {
 			path += "&marker=" + url.QueryEscape(marker)
 		}
