@@ -115,11 +115,11 @@ const consoleHTML = `<!DOCTYPE html>
  .leg:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
  .legbox{display:none;position:absolute;top:150%;left:50%;transform:translateX(-50%);z-index:40;
    background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.2);
-   padding:12px 14px;width:300px;text-transform:none;letter-spacing:normal;font-weight:400}
+   padding:12px 14px;width:400px;text-transform:none;letter-spacing:normal;font-weight:400}
  .leg:hover .legbox{display:block}
- .legrow{display:flex;align-items:flex-start;gap:8px;margin:6px 0;font-size:12.5px;color:var(--text);white-space:normal;line-height:1.35}
- .legrow .pill{flex:none}
- .legrow .desc{color:var(--muted)}
+ .leggrid{display:grid;grid-template-columns:max-content 1fr;gap:8px 12px;align-items:start;font-size:12.5px;color:var(--text)}
+ .leggrid .pill{justify-self:start;white-space:nowrap}
+ .leggrid .desc{color:var(--muted);line-height:1.4}
  .modal.wide{max-width:760px}
  .flash{animation:flash .8s ease}
  @keyframes flash{0%{background:rgba(0,113,227,.10)}100%{background:transparent}}
@@ -780,18 +780,23 @@ function pillFor(v,m){
 }
 // statusLegend renders a hover legend that shows each status as its ACTUAL
 // colored pill (so you can match what you see in the table to its meaning).
-const STATE_DESCS=[['awaiting_agent','enrolled; the agent has not connected yet'],
-  ['replicating','agent connected; copying the baseline, then ongoing changes'],
-  ['ready','baseline done and lag is low — safe to cut over'],
-  ['awaiting_cutover','guided cutover: replication stopped & image frozen — power off the source, then Launch instance'],
-  ['migrating','converting the boot disk and cloning volumes'],
-  ['image_ready','image volume(s) ready to launch'],
-  ['launched','a new Linode was launched from the image'],
-  ['failed','something went wrong — see the error shown on the card']];
+const STATE_DESCS=[
+  ['waiting for agent','warn','enrolled; the agent hasn’t connected yet'],
+  ['agent connected','ok','agent connected & validated — ready to start replication'],
+  ['connection failed','bad','the agent hasn’t checked in — confirm it’s installed and TCP 5000–5100 is open'],
+  ['starting replication','warn','replication started; the agent streams the first full sync on its next pass'],
+  ['replicating','warn','copying the baseline, then ongoing changes'],
+  ['paused','warn','replication paused; resume to continue with an incremental delta'],
+  ['ready to cut over','ok','baseline done and lag is low — safe to cut over'],
+  ['power off source, then launch','warn','guided cutover: replication stopped & image frozen — power off the source, then Launch instance'],
+  ['finalizing','warn','converting the boot disk and cloning volumes'],
+  ['image ready','ok','image volume(s) ready to launch'],
+  ['launched','ok','a new Linode was launched from the image'],
+  ['failed','bad','something went wrong — see the error shown on the card']];
 function statusLegend(){
-  let h='<span class="leg">i<span class="legbox"><div style="font-weight:600;font-size:12px;margin-bottom:6px">Source &rarr; Appliance status</div>';
-  for(const [s,d] of STATE_DESCS)h+='<div class="legrow"><span class="pill '+stateClass(s)+'">'+esc(stateLabel(s))+'</span><span class="desc">'+esc(d)+'</span></div>';
-  return h+'</span></span>';
+  let rows='';
+  for(const [label,cls,d] of STATE_DESCS)rows+='<span class="pill '+cls+'">'+esc(label)+'</span><span class="desc">'+esc(d)+'</span>';
+  return '<span class="leg">i<span class="legbox"><div style="font-weight:600;font-size:12px;margin-bottom:8px">Source &rarr; Appliance status</div><div class="leggrid">'+rows+'</div></span></span>';
 }
 // Per-migration UI state that must survive the 5s rebuild.
 const collapsedMigs=new Set();   // migration ids the user collapsed
