@@ -550,10 +550,13 @@ async function startMig(id,btn){
   // replicated copy as the image — crash-consistent (like a power-loss), repaired
   // with fsck on convert; it never attempts a read-only remount, so it can't get
   // stuck on a busy root. Step 2 (after you power off the source) launches.
-  const how='<div style="margin-bottom:8px"><b>Step 1 of 2.</b> This <b>stops replication</b> and freezes the current replicated copy as the image to launch'+(disk?(' — step 2 then creates a new Linode'+planNote+' booting from its local disk.'):(meta.linode_type?(' — step 2 then launches a new Linode'+planNote+'.'):' and clones every disk into launchable volumes.'))+' Next you’ll <b>power off the source</b>, then launch.</div>';
+  const how='<div style="margin-bottom:8px"><b>Cutover has 3 steps:</b>'+
+    '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> stop replication and freeze the current replicated copy as the image.</div>'+
+    '<div style="margin-top:4px"><b>Step 2:</b> power off the source server.</div>'+
+    '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(disk?('boots a new Linode'+planNote+' from its local disk.'):(meta.linode_type?('launches a new Linode'+planNote+' from the frozen image.'):'clones every disk into launchable volumes.'))+'</div></div>';
   const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the frozen copy is current. The image is crash-consistent and repaired with fsck on convert — no LVM or read-only remount needed.</div>';
   const opts={
-    title:'Cut over migration #'+id+' — step 1: stop replication & freeze the image',
+    title:'Cut over migration #'+id+' — step 1 of 3: stop replication & freeze',
     okText:'Stop replication & continue',
     html:how+access+prep,
     fields:[
@@ -912,7 +915,10 @@ function migCard(v){
   }else if(m.state==='awaiting_cutover'){
     // Guided cutover: phase 1 captured a consistent image and froze it (receivers
     // stopped). Now the operator powers off the source and confirms.
-    b+='<div class="warn" style="font-size:12px;margin-bottom:6px">✓ <b>Step 1 done</b> — replication is stopped and the current copy is frozen as the image. <b>Step 2:</b> <b>power off the source server now</b> (so the old and new machines aren’t both running), then click <b>Launch instance</b>.</div>';
+    b+='<div class="warn" style="font-size:12px;margin-bottom:6px">'+
+      '<div>✓ <b>Step 1 done</b> — replication is stopped and the current copy is frozen as the image.</div>'+
+      '<div style="margin-top:5px"><b>Step 2 — now:</b> <b>power off the source server</b> (so the old and new machines aren’t both running at once).</div>'+
+      '<div style="margin-top:5px"><b>Step 3:</b> click <b>Launch instance</b> below to convert, clone and launch.</div></div>';
     b+='<button class="primary" onclick="completeCutover('+m.id+',this)">Launch instance</button>'+
       infoIcon('Converts the frozen image, clones the disk(s), and launches the new Linode. Power off the source first. Final step.')+
       '<button class="danger" onclick="stopMig('+m.id+',this)">Cancel</button>';
