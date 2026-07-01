@@ -130,6 +130,7 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/migrations/{id}", s.auth(s.handleGetMigration))
 	s.mux.Handle("GET /api/v1/migrations/{id}/events", s.auth(s.handleMigrationEvents))
 	s.mux.Handle("DELETE /api/v1/migrations/{id}", s.auth(s.handleDeleteMigration))
+	s.mux.Handle("POST /api/v1/migrations/{id}/close", s.auth(s.handleCloseMigration))
 	s.mux.Handle("POST /api/v1/migrations/{id}/replicate", s.auth(s.handleStartReplication))
 	s.mux.Handle("POST /api/v1/migrations/{id}/pause", s.auth(s.handlePauseReplication))
 	s.mux.Handle("POST /api/v1/migrations/{id}/start", s.auth(s.handleStartMigration))
@@ -318,9 +319,11 @@ func (s *Server) handleSetLinodeToken(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDeleteLinodeToken removes the stored token (e.g. expired/rotated). It is
-// refused while any migration still exists: deleting a migration uses the token
-// to remove its Linode volumes, so removing the token first would orphan those
-// volumes (the operator would have to clean them up by hand in Cloud Manager).
+// refused while any migration is still ACTIVE (created or running): deleting such
+// a migration uses the token to remove its Linode volumes, so removing the token
+// first would orphan those volumes (the operator would have to clean them up by
+// hand in Cloud Manager). Completed migrations (launched / image ready) or failed
+// ones do not block removal.
 func (s *Server) handleDeleteLinodeToken(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	migs, err := s.st.ListMigrations(ctx)
@@ -328,8 +331,8 @@ func (s *Server) handleDeleteLinodeToken(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if n := len(migs); n > 0 {
-		writeErr(w, http.StatusConflict, fmt.Sprintf("cannot remove the Linode API token while %d migration(s) exist — deleting a migration uses the token to remove its Linode volumes, so removing it now would orphan those volumes (you'd have to delete them by hand in Cloud Manager). Delete all migrations first, then remove the token.", n))
+	if n := activeMigrationCount(migs); n > 0 {
+		writeErr(w, http.StatusConflict, fmt.Sprintf("cannot remove the Linode API token while %d migration(s) are still active (created or running) — deleting such a migration uses the token to remove its Linode volumes, so removing it now would orphan those volumes (you'd have to delete them by hand in Cloud Manager). Finish, launch, or delete those migrations first. Completed migrations don't block removal.", n))
 		return
 	}
 	if err := s.st.DeleteLinodeToken(ctx); err != nil {
@@ -391,12 +394,7 @@ func (s *Server) handleDeleteAuditBucket(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	active := 0
-	for _, m := range migs {
-		if isMigrationActive(m.State) {
-			active++
-		}
-	}
+	active := activeMigrationCount(migs)
 	if active > 0 {
 		writeErr(w, http.StatusConflict, fmt.Sprintf("cannot delete the audit bucket while %d migration(s) are still active (created or running) — finish, launch, or delete them first", active))
 		return

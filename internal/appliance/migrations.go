@@ -907,7 +907,38 @@ func (s *Server) handleDeleteMigration(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not found")
 		return
 	}
-	s.cleanupMigrationResources(ctx, m, true) // keep (detach) the replication volume
+	s.cleanupMigrationResources(ctx, m, cleanupOpts{keepReplVolume: true}) // keep (detach) the replication volume
+	if err := s.st.DeleteMigration(ctx, id); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleCloseMigration finishes a successful migration: it removes the temporary
+// vmrep-<name> replication volume (no longer needed once the server is migrated)
+// and the migration row, while KEEPING the launched cutover instance and its
+// clone volumes — those are the user's new server. Only allowed once the
+// migration has launched (or its image is ready); the console asks the operator
+// to confirm first. This is the safe counterpart to Delete, which instead tears
+// down the launched instance.
+func (s *Server) handleCloseMigration(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	m, err := s.st.Migration(ctx, id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	if !canCloseMigration(m.State) {
+		writeErr(w, http.StatusConflict, "only a completed migration (launched or image ready) can be closed — use Delete for one that is still in progress")
+		return
+	}
+	// Delete the replication volume, keep the launched instance + clone volumes.
+	s.cleanupMigrationResources(ctx, m, cleanupOpts{keepLaunched: true})
 	if err := s.st.DeleteMigration(ctx, id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -920,21 +951,34 @@ func (s *Server) handleDeleteMigration(w http.ResponseWriter, r *http.Request) {
 // removes the migration row so nothing lingers in the console.
 func (s *Server) rollbackCreate(ctx context.Context, id int64) {
 	if m, err := s.st.Migration(ctx, id); err == nil {
-		s.cleanupMigrationResources(ctx, m, false) // failed create: delete everything
+		s.cleanupMigrationResources(ctx, m, cleanupOpts{}) // failed create: delete everything
 	}
 	_ = s.st.DeleteMigration(ctx, id)
 }
 
+// cleanupOpts controls which resources cleanupMigrationResources removes.
+type cleanupOpts struct {
+	// keepReplVolume: only DETACH the vmrep-<name> replication volume (keep it in
+	// the account for reference) instead of deleting it. Used by user delete.
+	keepReplVolume bool
+	// keepLaunched: keep the launched cutover instance and its <name>-cutover
+	// clone volumes. Used by "Close migration" (finish a successful migration):
+	// the migrated server and its volumes are the user's to keep — only the
+	// temporary replication volume is removed.
+	keepLaunched bool
+}
+
 // cleanupMigrationResources stops a migration's receivers/finalize and removes
-// its replication volumes (or file-fallback images) and manifests. It does NOT
-// delete the migration row — the caller decides that. Safe to call repeatedly.
-// cleanupMigrationResources stops a migration's receivers/finalize, deletes the
-// cutover artifacts (launched instance + <name>-cutover clone volumes), and
-// handles the replication volume. When keepReplVolume is true (user delete) the
-// vrep-<name> replication volume is only DETACHED — kept in the account so the
-// operator can still reference it — otherwise it is deleted (failed-create
-// rollback). File-fallback images are always removed.
-func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration, keepReplVolume bool) {
+// its Linode resources (or file-fallback images) and manifests per opts. It does
+// NOT delete the migration row — the caller decides that. Safe to call
+// repeatedly.
+//
+//   - The cutover artifacts (launched instance + <name>-cutover clone volumes)
+//     are deleted unless opts.keepLaunched is set.
+//   - The vmrep-<name> replication volume is deleted, or only DETACHED and kept
+//     when opts.keepReplVolume is set.
+//   - File-fallback images and manifests are always removed.
+func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration, opts cleanupOpts) {
 	s.recMu.Lock()
 	if cancel := s.finalizes[m.ID]; cancel != nil {
 		cancel()
@@ -944,15 +988,16 @@ func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration,
 	s.stopReceivers(m)
 
 	cl, haveLinode := s.linodeClient(ctx)
-	// Always remove cutover artifacts: the launched instance and clone volumes.
-	if haveLinode && m.LaunchedID != 0 {
+	// Remove cutover artifacts (launched instance + clone volumes) unless the
+	// caller is closing a successful migration and wants to keep the new server.
+	if haveLinode && m.LaunchedID != 0 && !opts.keepLaunched {
 		if err := cl.DeleteInstance(ctx, m.LaunchedID); err != nil {
 			log.Printf("appliance: delete cutover Linode %d failed (remove it in Cloud Manager): %v", m.LaunchedID, err)
 		}
 	}
 	for _, d := range m.Disks {
 		s.progress.Delete(d.ID)
-		if haveLinode {
+		if haveLinode && !opts.keepLaunched {
 			if avid := artifactVolumeID(d.ArtifactID); avid != 0 {
 				_ = cl.DetachVolume(ctx, avid)
 				for i := 0; i < 10; i++ {
@@ -965,7 +1010,7 @@ func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration,
 		}
 		if d.VolumeID != 0 && haveLinode {
 			_ = cl.DetachVolume(ctx, d.VolumeID) // always detach from the appliance
-			if !keepReplVolume {
+			if !opts.keepReplVolume {
 				var derr error
 				for i := 0; i < 10; i++ {
 					if derr = cl.DeleteVolume(ctx, d.VolumeID); derr == nil {
@@ -1897,6 +1942,34 @@ func isMigrationActive(st api.MigrationState) bool {
 		return false
 	default:
 		return true
+	}
+}
+
+// activeMigrationCount counts migrations that are still in progress (created or
+// running). A "migration complete" (launched/image_ready) or failed migration
+// is not active, so account-level actions (remove the Linode token, delete the
+// audit bucket) may proceed once every remaining migration has finished.
+func activeMigrationCount(migs []api.Migration) int {
+	n := 0
+	for _, m := range migs {
+		if isMigrationActive(m.State) {
+			n++
+		}
+	}
+	return n
+}
+
+// canCloseMigration reports whether a migration may be "closed" (finished): only
+// after it has launched (or its image is ready). Closing removes the temporary
+// vmrep- replication volume while keeping the launched instance and its clone
+// volumes — the migrated server. Anything still in progress (or failed) must be
+// deleted instead.
+func canCloseMigration(st api.MigrationState) bool {
+	switch st {
+	case api.MigImageReady, api.MigLaunched:
+		return true
+	default:
+		return false
 	}
 }
 

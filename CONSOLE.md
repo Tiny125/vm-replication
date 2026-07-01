@@ -236,6 +236,12 @@ Singapore appliance gets a Singapore bucket). Override with the
   created/running state — finish, launch, or delete them first) and it requires
   you to **type the console password**. Re-create afterwards to start a fresh,
   empty bucket.
+- **Remove token** — deletes the stored Linode API token. Allowed once **no
+  migration is active** — **completed** migrations (launched / image ready) don't
+  block it, so you can remove the token after your servers are migrated. It's
+  refused only while a migration is still created/running, because deleting such a
+  migration uses the token to remove its Linode volumes (removing it first would
+  orphan them). This never deletes anything in your Linode account.
 
 > The launched instance's own OS boot console isn't available through the Linode
 > API, so the per-migration log captures the instance's **status transitions**
@@ -367,6 +373,29 @@ local-disk boot):
 So **a multi-disk migration produces multiple image volumes** — one per source
 disk. When it finishes, the completed banner lists them and links to
 **cloud.linode.com/volumes**.
+
+Once launched, the card shows a green **✓ Migration complete** header, and the
+**RPO** column switches to a dash **—** (replication has stopped, so a lag figure
+would only mislead).
+
+### Finishing up: remove the agent, then Close the migration
+
+A completed migration keeps a temporary **replication volume** (`vmrep-<name>`)
+attached to the appliance — the target the agent streamed into. Once the launched
+Linode is up you no longer need it. Finish the cycle from the card:
+
+1. Click **✓ Migration complete — remove source agent**. It shows the one-line
+   command to uninstall the agent from the source (Copy it, run it), then click
+   **Done**.
+2. A **Close migration** button now appears next to it. Click it and confirm:
+   the appliance **deletes the `vmrep-<name>` replication volume** and clears the
+   card. **Your launched Linode and its volumes are kept, untouched** — only the
+   temporary replication volume is removed.
+
+> The **Delete** button is **hidden once a migration is complete** so the migrated
+> server can't be torn down by accident. (Delete is the opposite of Close: it
+> removes the *launched* Linode and its cutover volumes but keeps the replication
+> volume — use it only for a migration you're abandoning before it launched.)
 
 > **Why freeze then power off?** It gives a clean, final copy without needing LVM
 > or a read-only remount of the running root (which fails on most cloud images
