@@ -1982,7 +1982,7 @@ func convertFailureNoRoot(out string) bool {
 
 // wrongDiskMsg guides the operator to replicate the disk that actually holds the
 // OS root, used when the converted disk has no root filesystem.
-const wrongDiskMsg = "the replicated disk has no root/OS filesystem — it looks like a swap or non-OS disk, so a launched instance would only reach a grub> prompt. You most likely selected the WRONG source device. On the source run `lsblk -f` (or `findmnt -no SOURCE /`) to find the disk holding the filesystem mounted at `/`, then create a new migration against that whole disk (e.g. /dev/sda or /dev/vda) and cut over again. Nothing was launched; delete this migration first."
+const wrongDiskMsg = "the converted disk has no root/OS filesystem, so a launched instance would only reach a grub> prompt. Two common causes: (1) the WRONG source device was selected — a swap or data disk has no OS; on the source run `lsblk -f` (or `findmnt -no SOURCE /`) to find the disk mounted at `/`, then migrate that whole disk (e.g. /dev/sda or /dev/vda). Or (2) the initial full sync was INCOMPLETE — e.g. a stale change-tracking checkpoint from an earlier migration on the same source, so only part of the disk was copied; check that the initial full sync transferred roughly the disk's used size, and if not, run `sudo rm -f /var/lib/vmrepl-source-*.cbt` on the source (or the uninstall one-liner) and re-sync. Nothing was launched; delete this migration first."
 
 func orDefault(v, def string) string {
 	if v == "" {
