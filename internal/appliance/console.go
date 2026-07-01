@@ -845,10 +845,10 @@ function migCard(v){
 
   h+='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+statusLegend()+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
     '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_ip||m.source_hostname||'-')+'</span></td>'+
-    '<td>'+pillFor(v,m)+'</td>'+
-    '<td class="muted">'+disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining')+'</td>'+
+    '<td id="stat'+m.id+'">'+pillFor(v,m)+'</td>'+
+    '<td class="muted" id="disks'+m.id+'">'+disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining')+'</td>'+
     '<td id="prog'+m.id+'">'+progressLine(v,m)+'</td>'+
-    '<td class="muted">'+(v.rpo_seconds?Math.round(v.rpo_seconds)+'s':'—')+'</td></tr></table>';
+    '<td class="muted" id="rpo'+m.id+'">'+(v.rpo_seconds?Math.round(v.rpo_seconds)+'s':'—')+'</td></tr></table>';
 
   // Everything below the status table is hidden when the card is collapsed.
   let b='';
@@ -944,9 +944,12 @@ function migCard(v){
 
   h+='<div class="migbody">'+b+'</div>';
   const card=document.createElement('div');card.className='mig'+(collapsed?' collapsed':'');card.id='mig'+m.id;card.innerHTML=h;
-  // Mark cards whose progress is actively moving (initial sync streaming) so the
-  // 1s poller can update just those in place for a live progress bar.
-  card.dataset.live=(v.percent_done>=0)?'1':'';
+  // The 1s poller live-updates any migration that isn't finished (so the status,
+  // progress, transferred/speed and RPO all refresh on their own, every second,
+  // without a manual Refresh). dataset.state lets the poller tell an in-place cell
+  // update (same state → smooth) from a state change (rebuild the whole card).
+  card.dataset.live=['image_ready','launched','failed'].includes(m.state)?'':'1';
+  card.dataset.state=m.state;
   return card;
 }
 
@@ -1000,19 +1003,25 @@ async function init(){
     setInterval(()=>{if(!$('app').classList.contains('hide'))refresh(false)},5000);
     // Tick visible elapsed timers every second between server refreshes.
     setInterval(()=>{document.querySelectorAll('.livedur[data-since]').forEach(s=>{const t=+s.dataset.since;if(t)s.textContent=fmtDur((Date.now()-t)/1000)})},1000);
-    // Live progress: every second, update just the progress cell of migrations
-    // whose initial sync is actively streaming (data-live) — so the bar, %, ETA,
-    // transferred and speed move smoothly without waiting for the 5s full refresh.
-    // Surgical: one GET per live migration, replacing only the progress <td> — no
-    // card rebuild, no log/settings reload, so it never disrupts the rest of the UI.
+    // Live auto-refresh: every second, update each not-yet-finished migration in
+    // place so its STATUS, progress bar / %, ETA, transferred+speed and RPO all
+    // move on their own — no manual Refresh needed. When only those values change
+    // (same state) it swaps just those cells (smooth, no flicker); when the state
+    // itself changes (e.g. replicating → ready → launched) it rebuilds the whole
+    // card so the banner/buttons update too. The 5s full refresh still runs as a
+    // catch-all (new/deleted migrations, settings, open activity logs).
     setInterval(()=>{
       if($('app').classList.contains('hide'))return;
       document.querySelectorAll('#migs .mig[data-live="1"]').forEach(card=>{
         const id=card.id.slice(3);
         api('GET','/api/v1/migrations/'+id).then(v=>{
-          const td=card.querySelector('#prog'+id);
-          if(td)td.innerHTML=progressLine(v,v.migration);
-          card.dataset.live=(v.percent_done>=0)?'1':'';
+          const m=v.migration;
+          if(String(m.state)!==card.dataset.state){replaceCard(id,v);return;} // structure changed
+          const set=(sel,html)=>{const el=card.querySelector(sel);if(el)el.innerHTML=html;};
+          set('#stat'+id,pillFor(v,m));
+          set('#disks'+id,disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining'));
+          set('#prog'+id,progressLine(v,m));
+          set('#rpo'+id,v.rpo_seconds?Math.round(v.rpo_seconds)+'s':'—');
         }).catch(()=>{});
       });
     },1000);}
