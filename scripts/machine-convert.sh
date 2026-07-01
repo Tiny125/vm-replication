@@ -35,6 +35,21 @@ DEV="${1:-/dev/sda}"
 MNT="$(mktemp -d)"
 KPARTX_USED=0
 log() { echo ">> $*"; }
+# ensure_dir_mount guarantees a chroot pseudo-filesystem mount point exists AS A
+# DIRECTORY before we mount onto it. A crash-consistent copy (or a stripped-down
+# source image) can leave /proc, /sys, /run — or even /dev — missing, or present
+# as a non-directory. Mounting onto a non-directory fails with
+#   mount: <mnt>/proc: mount point is not a directory
+# which aborts the conversion of an otherwise-healthy disk (exit 32) and gets
+# mis-reported as an "inconsistent filesystem". Drop any stray non-directory,
+# then create the directory so the mount always has a valid target.
+ensure_dir_mount() {
+  local d="$1"
+  if [ -e "$d" ] && [ ! -d "$d" ]; then
+    rm -f "$d"
+  fi
+  mkdir -p "$d"
+}
 cleanup() {
   for m in dev/pts dev proc sys run; do
     mountpoint -q "$MNT/$m" && umount -l "$MNT/$m" 2>/dev/null || true
@@ -43,6 +58,10 @@ cleanup() {
   rmdir "$MNT" 2>/dev/null || true
   [ "$KPARTX_USED" = 1 ] && kpartx -d "$DEV" 2>/dev/null || true
 }
+# Test hook: sourcing with VMREPL_CONVERT_LIB=1 loads the helper functions above
+# without running the conversion (no root, block device, traps or mounts), so
+# scripts/machine-convert-test.sh can exercise ensure_dir_mount in isolation.
+if [ -n "${VMREPL_CONVERT_LIB:-}" ]; then return 0 2>/dev/null || exit 0; fi
 trap cleanup EXIT
 
 [ "$(id -u)" -eq 0 ] || { echo "must run as root"; exit 1; }
@@ -264,6 +283,12 @@ if grep -qE '^\S+\s+/boot\s' "$MNT/etc/fstab"; then
     mount "$BOOT_DEV" "$MNT/boot" 2>/dev/null || true
   fi
 fi
+# Make sure every pseudo-filesystem mount point exists as a directory first, so
+# the binds/mounts below can't fail with "mount point is not a directory" on a
+# source whose /dev, /proc, /sys or /run came across missing or as a stray file.
+for _pd in dev dev/pts proc sys run; do
+  ensure_dir_mount "$MNT/$_pd"
+done
 mount --bind /dev "$MNT/dev"
 mount --bind /dev/pts "$MNT/dev/pts"
 mount -t proc proc "$MNT/proc"

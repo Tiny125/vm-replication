@@ -1126,8 +1126,9 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 	//    which must boot via a Linode-supplied kernel instead.
 	kernel, rootDevice := "linode/grub2", "/dev/sda"
 	convertFailed := false
-	convertEnvIssue := false // failure was a missing command / bad env, not inconsistent data
-	convertNoRoot := false   // no root/OS filesystem on the disk (wrong source device)
+	convertEnvIssue := false   // failure was a missing command / bad env, not inconsistent data
+	convertNoRoot := false     // no root/OS filesystem on the disk (wrong source device)
+	convertMountIssue := false // chroot setup failed (a pseudo-fs mount point was not a directory)
 	if s.cfg.ConvertScript != "" && isBlockDevice(bootDevice) {
 		log.Printf("appliance: migration %d: machine conversion on boot disk %s", m.ID, bootDevice)
 		// machine-convert.sh requires bash (set -o pipefail, etc). Run it under
@@ -1172,9 +1173,12 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 			convertFailed = true
 			convertEnvIssue = convertFailureEnvIssue(err, string(out))
 			convertNoRoot = convertFailureNoRoot(string(out))
+			convertMountIssue = convertFailureMountIssue(string(out))
 			log.Printf("appliance: migration %d: machine-convert failed: %v\n%s", m.ID, err, trimOut(out))
 			if convertNoRoot {
 				_ = s.st.AddEvent(sctx, m.ID, "error", "boot disk conversion failed: "+wrongDiskMsg+" Detail: "+oneLine(trimOut(out)))
+			} else if convertMountIssue {
+				_ = s.st.AddEvent(sctx, m.ID, "warn", convertMountMsg+" Detail: "+oneLine(trimOut(out)))
 			} else if convertEnvIssue {
 				_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish because a command was missing in the conversion environment (exit 127 / \"command not found\"). This is an appliance/PATH problem, NOT an inconsistent source — re-syncing won't help. Update the appliance to the latest build (the convert step now pins a full PATH) and retry the cutover. Detail: "+oneLine(trimOut(out)))
 			} else {
@@ -1212,6 +1216,8 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 		if convertFailed {
 			if convertNoRoot {
 				s.fail(m.ID, "cutover aborted — "+wrongDiskMsg)
+			} else if convertMountIssue {
+				s.fail(m.ID, convertMountMsg)
 			} else if convertEnvIssue {
 				s.fail(m.ID, "boot disk conversion failed because a required command was missing in the conversion environment (exit 127 / \"command not found\"). This is an appliance/PATH bug, NOT an inconsistent source — re-syncing won't help. Update the appliance to the latest build (the convert step now pins a full PATH), restart applianced, and retry the cutover. The replication volume is left intact for inspection; see the conversion detail above.")
 			} else {
@@ -2052,6 +2058,20 @@ func convertFailureEnvIssue(err error, out string) bool {
 func convertFailureNoRoot(out string) bool {
 	return strings.Contains(out, "could not locate a root filesystem")
 }
+
+// convertFailureMountIssue reports whether the conversion died while setting up
+// the chroot because a pseudo-filesystem mount point (/proc, /sys, /dev or /run)
+// was missing or not a directory ("mount point is not a directory"). The fsck has
+// already passed by that point, so this is a conversion-ENVIRONMENT problem, not
+// an inconsistent source: the remedy is to update the appliance (which now
+// normalises those mount points) and retry — NOT to re-sync a quiesced source.
+func convertFailureMountIssue(out string) bool {
+	return strings.Contains(strings.ToLower(out), "mount point is not a directory")
+}
+
+// convertMountMsg explains a chroot-setup mount failure and its correct remedy
+// (update the appliance + retry, not a re-sync).
+const convertMountMsg = "boot disk conversion failed while preparing the chroot: a pseudo-filesystem mount point (/proc, /sys, /dev or /run) was missing or not a directory (\"mount point is not a directory\"). This is a conversion-environment issue, NOT an inconsistent source — the filesystem check already passed. Update the appliance to the latest build (the convert step now creates these mount points before mounting) and retry the cutover; re-syncing won't help. The replication volume is left intact for inspection."
 
 // wrongDiskMsg guides the operator to replicate the disk that actually holds the
 // OS root, used when the converted disk has no root filesystem.
