@@ -344,7 +344,7 @@ instance** button enables.
 
 ## 7. Cut over the instance
 
-Cutover is **two steps with a power-off in between** (the same for volume-boot and
+Cutover is **three steps: freeze the image, power off the source, launch** (the same for volume-boot and
 local-disk boot):
 
 1. Stop the source's apps/databases and let the **RPO lag drop to ~0** (shown on
