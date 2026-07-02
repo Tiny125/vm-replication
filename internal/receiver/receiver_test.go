@@ -133,6 +133,16 @@ func TestHelloCheckReject(t *testing.T) {
 	if !ack.Accepted {
 		t.Fatalf("expected the session to be accepted with a passing check: %s", ack.Message)
 	}
+
+	// The check must run BEFORE the quiesce-failure branch too: a rogue agent
+	// must not be able to spoof a "could not quiesce" report (which would fail a
+	// cutover fast) any more than it can deliver data.
+	rogueQuiesce := h
+	rogueQuiesce.QuiesceError = "spoofed: root busy"
+	ack = exchangeHelloCheck(t, target, rogueQuiesce, nil, reject)
+	if ack.Accepted || !strings.Contains(ack.Message, "wrong source disk") {
+		t.Fatalf("quiesce report from a rejected agent must be refused, got accepted=%v msg=%q", ack.Accepted, ack.Message)
+	}
 }
 
 // exchangeHello drives Handle over an in-memory pipe: it sends one Hello and

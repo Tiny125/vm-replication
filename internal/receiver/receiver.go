@@ -54,13 +54,15 @@ type ConsistencyFunc func(hello protocol.Hello) bool
 type ReplicationGate func(hello protocol.Hello) bool
 
 // HelloCheck validates the agent's Hello against what the session is EXPECTED
-// to replicate, before anything is recorded, opened or written. Returning a
-// non-nil error rejects the session with that message. The appliance uses it to
-// catch a wrong source disk — e.g. an agent whose device size grossly
-// mismatches the size the migration was created with (replicating a 512 MiB
-// swap disk into an "80 GiB" migration) — at first contact, instead of
-// completing a bogus "full sync" that only fails much later at cutover. A nil
-// check accepts every valid Hello.
+// to be, before anything is recorded, opened or written. Returning a non-nil
+// error rejects the session with that message. The appliance uses it to verify
+// both the agent's IDENTITY (its job id must match this migration's enrollment
+// — agent certs are global and receiver ports repeat across appliance
+// reinstalls, so a stale agent from an old enrollment on another machine can
+// otherwise stream its disk into a new migration's volume) and its GEOMETRY
+// (a device size grossly mismatching the declared disk means the wrong disk).
+// Both fail at first contact instead of completing a bogus "full sync" that
+// only fails much later at cutover. A nil check accepts every valid Hello.
 type HelloCheck func(hello protocol.Hello) error
 
 // errConsistentResync is returned by Handle when it deliberately bounced a live
@@ -136,6 +138,19 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress,
 	if err := json.Unmarshal(payload, &hello); err != nil {
 		return Stats{}, fmt.Errorf("decode hello: %w", err)
 	}
+	// Identity/geometry check: reject an agent that is replicating the WRONG
+	// THING — a session from another (older) enrollment, or a device whose size
+	// grossly mismatches what the migration declared — with a clear reason. It
+	// runs FIRST: before the quiesce branch (a rogue must not spoof a quiesce
+	// failure either), before the gate records the agent as connected/validated,
+	// and before any data can land on the target.
+	if helloCheck != nil {
+		if cerr := helloCheck(hello); cerr != nil {
+			_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, Message: cerr.Error()})
+			_ = w.Flush()
+			return Stats{Hello: hello}, cerr
+		}
+	}
 	// Quiesce-failure report: not a data session. The agent couldn't capture a
 	// crash-consistent image (e.g. the root could not be remounted read-only) and is
 	// telling us so the appliance can fail the cutover fast. It carries no valid
@@ -153,17 +168,6 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress,
 		_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, Message: err.Error()})
 		_ = w.Flush()
 		return Stats{}, err
-	}
-	// Device-identity check: reject an agent that is replicating the WRONG THING
-	// (e.g. its device size grossly mismatches what the migration declared) with a
-	// clear reason, BEFORE the gate records it as connected/validated and before
-	// any data can land on the target.
-	if helloCheck != nil {
-		if cerr := helloCheck(hello); cerr != nil {
-			_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, Message: cerr.Error()})
-			_ = w.Flush()
-			return Stats{Hello: hello}, cerr
-		}
 	}
 	// Replication gate: a validated agent has connected. If the operator hasn't
 	// started replication yet, acknowledge the connection (so the console shows it
