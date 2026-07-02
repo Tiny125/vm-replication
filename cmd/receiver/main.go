@@ -47,7 +47,7 @@ func main() {
 	defer ln.Close()
 	log.Printf("receiver listening on %s, applying to %s", *listen, *device)
 
-	if err := receiver.Serve(context.Background(), ln, *device, *manifest, *once, nil, nil, nil, nil, nil); err != nil {
+	if err := receiver.Serve(context.Background(), ln, *device, *manifest, *once, nil, nil, nil, nil, nil, nil); err != nil {
 		log.Fatalf("receiver: %v", err)
 	}
 }

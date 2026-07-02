@@ -53,6 +53,16 @@ type ConsistencyFunc func(hello protocol.Hello) bool
 // call to record that the agent connected (a connection heartbeat).
 type ReplicationGate func(hello protocol.Hello) bool
 
+// HelloCheck validates the agent's Hello against what the session is EXPECTED
+// to replicate, before anything is recorded, opened or written. Returning a
+// non-nil error rejects the session with that message. The appliance uses it to
+// catch a wrong source disk — e.g. an agent whose device size grossly
+// mismatches the size the migration was created with (replicating a 512 MiB
+// swap disk into an "80 GiB" migration) — at first contact, instead of
+// completing a bogus "full sync" that only fails much later at cutover. A nil
+// check accepts every valid Hello.
+type HelloCheck func(hello protocol.Hello) error
+
 // errConsistentResync is returned by Handle when it deliberately bounced a live
 // pass to request a crash-consistent resync. It is an expected control outcome,
 // not a failure, so Serve does not surface it via onError.
@@ -68,7 +78,7 @@ var errReplicationHeld = errors.New("receiver: replication not started (connecti
 // cancelled or the listener closes. onComplete (if non-nil) is called after each
 // successful session; onProgress (if non-nil) is called periodically during a
 // session. If once is true, Serve returns after the first successful session.
-func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress, onError func(error), requestConsistent ConsistencyFunc, replicationGate ReplicationGate) error {
+func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress, onError func(error), requestConsistent ConsistencyFunc, replicationGate ReplicationGate, helloCheck HelloCheck) error {
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
@@ -81,7 +91,7 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 			}
 			return err
 		}
-		stats, herr := Handle(conn, devicePath, manifestPath, onProgress, requestConsistent, replicationGate)
+		stats, herr := Handle(conn, devicePath, manifestPath, onProgress, requestConsistent, replicationGate, helloCheck)
 		switch {
 		case errors.Is(herr, errConsistentResync):
 			// Expected: we asked the agent to re-read crash-consistently. Not an error.
@@ -110,7 +120,7 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 // every block to devicePath, fsyncs, and writes the applied manifest.
 // onProgress (optional) is invoked at session start and every progressEvery
 // applied blocks.
-func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress, requestConsistent ConsistencyFunc, replicationGate ReplicationGate) (Stats, error) {
+func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress, requestConsistent ConsistencyFunc, replicationGate ReplicationGate, helloCheck HelloCheck) (Stats, error) {
 	defer conn.Close()
 	r := bufio.NewReaderSize(conn, 1<<20)
 	w := bufio.NewWriterSize(conn, 1<<16)
@@ -143,6 +153,17 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress,
 		_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, Message: err.Error()})
 		_ = w.Flush()
 		return Stats{}, err
+	}
+	// Device-identity check: reject an agent that is replicating the WRONG THING
+	// (e.g. its device size grossly mismatches what the migration declared) with a
+	// clear reason, BEFORE the gate records it as connected/validated and before
+	// any data can land on the target.
+	if helloCheck != nil {
+		if cerr := helloCheck(hello); cerr != nil {
+			_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, Message: cerr.Error()})
+			_ = w.Flush()
+			return Stats{Hello: hello}, cerr
+		}
 	}
 	// Replication gate: a validated agent has connected. If the operator hasn't
 	// started replication yet, acknowledge the connection (so the console shows it

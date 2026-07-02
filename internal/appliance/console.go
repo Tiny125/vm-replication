@@ -856,8 +856,8 @@ function cleanupCard(id){
       '<div style="display:flex;gap:8px;align-items:flex-start"><pre id="uclean'+id+'" style="flex:1;margin:0">'+esc(p.cmd)+'</pre>'+
       '<button onclick="copyText(document.getElementById(\'uclean'+id+'\').textContent,this)">Copy</button></div>')
       :'<div class="muted" style="font-size:13px">Remove the agent on the source: <code style="display:inline;padding:1px 5px">curl -fsSL .../install/uninstall.sh | sudo bash</code></div>')+
-    '<div class="actions"><button class="primary" onclick="dismissCleanup('+id+')">✓ Done — agent removed</button>'+
-    '<span class="muted" style="font-size:12px">Reminder only — the migration is already deleted. Dismiss when the agent is gone.</span></div>';
+    '<div class="muted" style="font-size:12px;margin-top:12px">Reminder only — the migration is already deleted. Dismiss when the agent is gone.</div>'+
+    '<div class="actions"><button class="primary" onclick="dismissCleanup('+id+')">✓ Done — agent removed</button></div>';
   return card;
 }
 function dismissCleanup(id){delete pendingCleanup[id];const c=$('mig'+id);if(c)c.remove();}
@@ -944,6 +944,15 @@ function migCard(v){
        '<button onclick="copyText(document.getElementById(\'unin'+m.id+'\').textContent,this)">Copy</button></div></details>';
   }
 
+  // Guided-cutover step banner. Emitted BEFORE the actions row (which is a flex
+  // ROW) so the text gets its own full-width block and the buttons below stay on
+  // their own aligned line — button positions must never be pushed around by text.
+  if(m.state==='awaiting_cutover'){
+    b+='<div style="font-size:12.5px;margin-bottom:2px">'+
+      '<div>✓ <b>Step 1 done</b> — replication is stopped and the current copy is frozen as the image.</div>'+
+      '<div style="margin-top:5px"><b>Step 2 — now:</b> <b>power off the source server</b> (so the old and new machines aren’t both running at once).</div>'+
+      '<div style="margin-top:5px"><b>Step 3:</b> click <b>Launch instance</b> below to convert, clone and launch.</div></div>';
+  }
   b+='<div class="actions">';
   const migDone=['image_ready','launched'].includes(m.state);
   if(migDone){
@@ -958,11 +967,7 @@ function migCard(v){
     b+='<button class="danger" onclick="stopMig('+m.id+',this)">Stop</button>';
   }else if(m.state==='awaiting_cutover'){
     // Guided cutover: phase 1 captured a consistent image and froze it (receivers
-    // stopped). Now the operator powers off the source and confirms.
-    b+='<div class="warn" style="font-size:12px;margin-bottom:6px">'+
-      '<div>✓ <b>Step 1 done</b> — replication is stopped and the current copy is frozen as the image.</div>'+
-      '<div style="margin-top:5px"><b>Step 2 — now:</b> <b>power off the source server</b> (so the old and new machines aren’t both running at once).</div>'+
-      '<div style="margin-top:5px"><b>Step 3:</b> click <b>Launch instance</b> below to convert, clone and launch.</div></div>';
+    // stopped). The step banner is rendered above this row; only buttons here.
     b+='<button class="primary" onclick="completeCutover('+m.id+',this)">Launch instance</button>'+
       infoIcon('Converts the frozen image, clones the disk(s), and launches the new Linode. Power off the source first. Final step.')+
       '<button class="danger" onclick="stopMig('+m.id+',this)">Cancel</button>';

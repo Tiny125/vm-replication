@@ -98,6 +98,12 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 
 	diskIdx := d.Index
 	dev0 := d.SourceDevice
+	declaredSize := d.SizeBytes
+	// Consecutive identical failures (the agent retries every ~60s, so a
+	// persistent problem like a wrong source disk repeats verbatim) produce ONE
+	// activity-log event, not one per minute. onError runs from this receiver's
+	// single accept loop, so no locking is needed.
+	lastErrEvt := ""
 	go func() {
 		err := receiver.Serve(ctx, ln, device, manifest, false, func(st receiver.Stats) {
 			// Quiesce-failure report (not a data session): the agent tried and could
@@ -110,6 +116,7 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 				}
 				return
 			}
+			lastErrEvt = "" // a pass landed; log the next failure even if it repeats
 			total := blockdiff.NumBlocks(st.Hello.DeviceSize, st.Hello.BlockSize)
 			bytes := st.BlocksWritten * int64(st.Hello.BlockSize)
 			wasBaselined := false
@@ -145,7 +152,10 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 				return
 			}
 			_ = s.st.RecordDiskError(s.ctx, diskID, serr.Error())
-			_ = s.st.AddEvent(s.ctx, migID, "error", fmt.Sprintf("disk %d (%s): replication attempt failed: %s", diskIdx, dev0, serr.Error()))
+			if serr.Error() != lastErrEvt {
+				lastErrEvt = serr.Error()
+				_ = s.st.AddEvent(s.ctx, migID, "error", fmt.Sprintf("disk %d (%s): replication attempt failed: %s", diskIdx, dev0, serr.Error()))
+			}
 		}, func(h protocol.Hello) bool {
 			// Bounce a live pass into a crash-consistent re-read while we're quiescing
 			// this disk for cutover (but never re-request a pass already consistent).
@@ -158,6 +168,17 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 				log.Printf("appliance: record agent connected (migration %d disk %d): %v", migID, diskID, err)
 			}
 			return s.replicationEnabled(migID)
+		}, func(h protocol.Hello) error {
+			// Wrong-source-disk guard: reject an agent whose device size grossly
+			// mismatches the size this disk was declared with (e.g. the migration
+			// says 80 GiB but the agent's device is a 512 MiB swap disk). Rejecting
+			// at the Hello keeps the bogus data off the target and surfaces the real
+			// problem immediately, instead of a confusing convert failure at cutover.
+			if deviceSizeMismatch(declaredSize, h.DeviceSize) {
+				return fmt.Errorf("refusing to replicate: the agent's %s is %s but this migration's disk %d (%s) was declared as %s — the agent is reading the WRONG DISK (a device that small/large is usually swap or a data disk, not the OS disk). On the source run `lsblk -f` (or `findmnt -no SOURCE /`) to see which disk holds the root filesystem `/`, then delete this migration and create a new one with that device and its real size",
+					h.DevicePath, humanBytes(h.DeviceSize), diskIdx, dev0, humanBytes(declaredSize))
+			}
+			return nil
 		})
 		if err != nil && ctx.Err() == nil {
 			log.Printf("appliance: receiver (migration %d disk %d) stopped: %v", migID, diskID, err)
@@ -2134,6 +2155,21 @@ func oneLine(s string) string {
 		s = s[:max] + "…"
 	}
 	return s
+}
+
+// deviceSizeMismatch reports whether the device size an agent declared in its
+// Hello is grossly different from the size the migration's disk was created
+// with — the signature of the agent reading the WRONG DISK (e.g. a ~512 MiB
+// swap disk enrolled as an "80 GiB" migration). The tolerance is deliberately
+// generous: operators enter sizes in whole GB rounded up and real disks run a
+// little smaller than nominal, so only a reported size under HALF or over
+// DOUBLE the declared size counts as a mismatch. Either size being unknown
+// (<= 0) disables the check.
+func deviceSizeMismatch(declared, reported int64) bool {
+	if declared <= 0 || reported <= 0 {
+		return false
+	}
+	return reported < declared/2 || reported > declared*2
 }
 
 func humanBytes(n int64) string {

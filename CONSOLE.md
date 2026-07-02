@@ -320,6 +320,17 @@ sudo systemctl start vmrepl-agent.service
 Re-running the enrollment one-liner is also safe at any time — it stops the
 previous agent and replaces it atomically.
 
+### Wrong-disk protection
+
+At every handshake the appliance compares the size of the device the agent is
+actually reading against the size the migration was created with. A gross
+mismatch — e.g. the migration says **80 GiB** but the agent's `/dev/sda` is a
+**512 MiB swap disk** — is **rejected on the spot** with a
+`refusing to replicate: … WRONG DISK` error on the card, before any wrong data
+lands. If you see it: run `lsblk -f` (or `findmnt -no SOURCE /`) on the source
+to find the disk that holds `/`, then delete the migration and re-create it
+with that device and its real size.
+
 ### Removing the agent (after migration completes)
 
 One command removes everything enrollment installed (binary, timer, certs,

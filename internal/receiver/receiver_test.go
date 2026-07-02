@@ -4,8 +4,11 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tiny125/vm-replication/internal/blockdiff"
@@ -96,13 +99,53 @@ func TestConsistentResyncRequest(t *testing.T) {
 	}
 }
 
+// TestHelloCheckReject verifies the device-identity guard: a HelloCheck that
+// returns an error (e.g. the agent's device size grossly mismatches the disk the
+// migration declared — the "replicated a 512 MiB swap disk into an 80 GiB
+// migration" failure) must reject the session in the HelloAck with that message,
+// BEFORE any data is applied. A passing check must leave the session accepted.
+func TestHelloCheckReject(t *testing.T) {
+	const blockSize = 4096
+	target := filepath.Join(t.TempDir(), "target.img")
+	h := protocol.Hello{
+		ProtocolVersion: 1, BlockSize: blockSize, DeviceSize: blockSize,
+		DevicePath: "/dev/sda", Consistent: true,
+	}
+
+	// Failing check: session must be refused with the check's message.
+	reject := func(hello protocol.Hello) error {
+		return errors.New("agent device size mismatch: wrong source disk")
+	}
+	ack := exchangeHelloCheck(t, target, h, nil, reject)
+	if ack.Accepted {
+		t.Fatal("expected the session to be rejected by the hello check")
+	}
+	if !strings.Contains(ack.Message, "wrong source disk") {
+		t.Fatalf("rejection message %q should carry the check's reason", ack.Message)
+	}
+	// Nothing may have been written to the target.
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Errorf("target %s must not be created for a rejected session", target)
+	}
+
+	// Passing check: session proceeds normally.
+	ack = exchangeHelloCheck(t, target, h, nil, func(protocol.Hello) error { return nil })
+	if !ack.Accepted {
+		t.Fatalf("expected the session to be accepted with a passing check: %s", ack.Message)
+	}
+}
+
 // exchangeHello drives Handle over an in-memory pipe: it sends one Hello and
 // returns the receiver's HelloAck (then drops the connection).
 func exchangeHello(t *testing.T, target string, h protocol.Hello, want ConsistencyFunc) protocol.HelloAck {
+	return exchangeHelloCheck(t, target, h, want, nil)
+}
+
+func exchangeHelloCheck(t *testing.T, target string, h protocol.Hello, want ConsistencyFunc, check HelloCheck) protocol.HelloAck {
 	t.Helper()
 	c, srv := net.Pipe()
 	go func() {
-		_, _ = Handle(srv, target, "", nil, want, nil)
+		_, _ = Handle(srv, target, "", nil, want, nil, check)
 	}()
 	defer c.Close()
 
