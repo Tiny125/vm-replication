@@ -320,6 +320,28 @@ sudo systemctl start vmrepl-agent.service
 Re-running the enrollment one-liner is also safe at any time — it stops the
 previous agent and replaces it atomically.
 
+### Wrong-disk & stale-agent protection
+
+Every agent session is checked at the handshake, before it can show as
+"connected" or write a byte:
+
+- **Identity.** Each enrollment runs its agent with a unique **job id** (baked
+  into the install command). The receiver refuses any session with a different
+  job id — so a stale, never-uninstalled agent from an **old migration**
+  (possibly on another machine), whose timer still fires at a port that a new
+  migration now uses, can no longer stream its disk into the new migration's
+  volume. The rejection names the offending host: run the **uninstall
+  one-liner** there. After **updating the appliance**, agents enrolled before
+  the update are also refused until you re-run their enrollment command (safe
+  and atomic).
+- **Geometry.** The size of the device the agent is actually reading must
+  roughly match the size the migration was created with. A gross mismatch —
+  e.g. the migration says **80 GiB** but the agent's `/dev/sda` is a **512 MiB
+  swap disk** — is rejected with a `refusing to replicate: … WRONG DISK` error.
+  Run `lsblk -f` (or `findmnt -no SOURCE /`) on the source to find the disk
+  that holds `/`, then delete the migration and re-create it with that device
+  and its real size.
+
 ### Removing the agent (after migration completes)
 
 One command removes everything enrollment installed (binary, timer, certs,

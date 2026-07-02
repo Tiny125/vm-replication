@@ -96,12 +96,25 @@ TOKEN=$(echo "$ENROLL" | grep -o 'token=[a-f0-9]*' | cut -d= -f2)
 SH=$(curl -fsS --cacert "$CACERT" "$BASE/install/agent.sh?token=$TOKEN")
 [ "$(echo "$SH" | grep -c '^ExecStart=')" = "2" ] || { echo "FAIL: installer should have 2 ExecStart lines"; exit 1; }
 echo "$SH" | grep -q 'systemctl stop vmrepl-agent' || { echo "FAIL: installer not re-run safe"; exit 1; }
-echo "   OK: 2 ExecStart lines, stop-before-replace"
+echo "$SH" | grep -q ' -job ' || { echo "FAIL: installer must bake the enrollment job id into ExecStart"; exit 1; }
+echo "   OK: 2 ExecStart lines, stop-before-replace, per-enrollment job id"
 
+# Every session must present this enrollment's job id (token prefix) — the
+# receiver refuses any other, so stale agents can't feed this migration.
+JOB="${TOKEN:0:16}"
 run_disk(){ local dev=$1 port=$2 man=$3; local ok=0; for _ in 1 2 3 4 5; do
   if "$WORK/agent" -device "$dev" -target "127.0.0.1:$port" -server-name 127.0.0.1 \
-     -manifest "$man" -cert "$WORK/certs/agent.crt" -key "$WORK/certs/agent.key" -ca "$WORK/certs/ca.crt"; then ok=1; break; fi
+     -job "$JOB" -manifest "$man" -cert "$WORK/certs/agent.crt" -key "$WORK/certs/agent.key" -ca "$WORK/certs/ca.crt"; then ok=1; break; fi
   sleep 0.5; done; [ "$ok" = 1 ]; }
+
+echo "== Identity guard: an agent from another enrollment is refused =="
+# Simulates a stale agent from an old migration still firing at this port: valid
+# certs, wrong job id. The receiver must reject it (and write nothing).
+if "$WORK/agent" -device "$WORK/sda.img" -target "127.0.0.1:$PORT0" -server-name 127.0.0.1 \
+   -job "stale-enrollment" -manifest "$WORK/rogue.cbt" -cert "$WORK/certs/agent.crt" -key "$WORK/certs/agent.key" -ca "$WORK/certs/ca.crt" 2>/dev/null; then
+  echo "FAIL: a wrong-job (stale) agent session was accepted"; exit 1
+fi
+echo "   OK: wrong-job session rejected"
 
 echo "== Gated start: a first agent pass only VALIDATES the connection (no data) =="
 # Replication is not auto-started: the receiver acknowledges the agent and holds.
@@ -182,8 +195,19 @@ echo "== Delete a migration removes BOTH disk files =="
 M2=$(api -X POST "$BASE/api/v1/migrations" -H 'Content-Type: application/json' \
   -d "{\"name\":\"throwaway\",\"source_hostname\":\"x\",\"devices\":[{\"device\":\"$WORK/sda.img\",\"size_bytes\":$SZA},{\"device\":\"$WORK/sdb.img\",\"size_bytes\":$SZB}]}")
 M2ID=$(echo "$M2" | jq -r '.migration.id')
-# replicate one block so the fallback files exist
-run_disk "$WORK/sda.img" "$(echo "$M2" | jq -r '.migration.disks[0].receiver_port')" "$WORK/d2a.cbt" || true
+# This migration has its OWN enrollment job id — sessions run with the previous
+# migration's job would (correctly) be refused by the identity guard.
+JOB="$(echo "$M2" | jq -r '.enroll_cmd' | grep -o 'token=[a-f0-9]*' | cut -d= -f2 | cut -c1-16)"
+M2P0="$(echo "$M2" | jq -r '.migration.disks[0].receiver_port')"
+M2P1="$(echo "$M2" | jq -r '.migration.disks[1].receiver_port')"
+# Gated start: validate the connection on BOTH disks (held passes), then start
+# replication and land one real pass so the fallback file exists (proving the
+# delete below actually removes it, not that it never existed).
+run_disk "$WORK/sda.img" "$M2P0" "$WORK/d2a.cbt" || { echo "FAIL: throwaway disk0 validation"; exit 1; }
+run_disk "$WORK/sdb.img" "$M2P1" "$WORK/d2b.cbt" || { echo "FAIL: throwaway disk1 validation"; exit 1; }
+api -X POST "$BASE/api/v1/migrations/$M2ID/replicate" >/dev/null
+run_disk "$WORK/sda.img" "$M2P0" "$WORK/d2a.cbt" || { echo "FAIL: throwaway migration sync"; exit 1; }
+[ -f "$WORK/data/migration-$M2ID-disk0.img" ] || { echo "FAIL: fallback file missing before delete"; exit 1; }
 api -X DELETE "$BASE/api/v1/migrations/$M2ID" >/dev/null
 COUNT=$(api "$BASE/api/v1/migrations" | jq '[.[] | select(.migration.id=='"$M2ID"')] | length')
 [ "$COUNT" = "0" ] || { echo "FAIL: migration still present after delete"; exit 1; }
@@ -193,7 +217,7 @@ echo "   OK: migration deleted (record + disk files)"
 echo
 echo "== Duplicate name rejected with friendly error =="
 ERR=$(curl -sS --cacert "$CACERT" -b "$JAR" -X POST "$BASE/api/v1/migrations" -H 'Content-Type: application/json' \
-  -d "{\"name\":\"ec2-3disk\",\"devices\":[{\"device\":\"$WORK/sda.img\",\"size_bytes\":$SZA}]}")
+  -d "{\"name\":\"ec2-3disk\",\"source_hostname\":\"dup.example\",\"devices\":[{\"device\":\"$WORK/sda.img\",\"size_bytes\":$SZA}]}")
 echo "$ERR" | grep -qi 'already exists' || { echo "FAIL: expected friendly duplicate-name error, got: $ERR"; exit 1; }
 echo "   OK: friendly duplicate-name error"
 

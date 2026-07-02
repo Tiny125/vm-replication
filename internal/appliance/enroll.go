@@ -9,6 +9,19 @@ import (
 	"github.com/tiny125/vm-replication/internal/api"
 )
 
+// enrollJobID derives the per-enrollment job identifier from the migration's
+// enrollment token (its first 16 chars — the same prefix that scopes the
+// source-side manifest). The installer bakes it into every agent ExecStart as
+// -job, and the receiver refuses any session whose Hello carries a different
+// job id (checkAgentHello) — so a stale agent from an old enrollment can never
+// feed this migration's volume. Tokens never repeat, so neither do job ids.
+func enrollJobID(token string) string {
+	if len(token) > 16 {
+		return token[:16]
+	}
+	return token
+}
+
 // migrationFromToken resolves the ?token= query to a migration, or writes an
 // error response and returns ok=false.
 func (s *Server) migrationFromToken(w http.ResponseWriter, r *http.Request) (api.Migration, bool) {
@@ -48,14 +61,13 @@ func (s *Server) handleAgentInstaller(w http.ResponseWriter, r *http.Request) {
 		// manifest and writes only the changed blocks onto the fresh, empty target
 		// volume, leaving the baseline incomplete (the launched instance drops to
 		// grub>). The token never repeats, so a new migration always full-syncs.
-		tok := token
-		if len(tok) > 16 {
-			tok = tok[:16]
-		}
+		tok := enrollJobID(token)
 		manifest := fmt.Sprintf("/var/lib/vmrepl-source-%s-disk%d.cbt", tok, d.Index)
 		fmt.Fprintf(&checks, "[ -e %q ] || { echo \"source device %s not found — re-check the device in the console\"; exit 1; }\n", d.SourceDevice, d.SourceDevice)
-		fmt.Fprintf(&execs, "ExecStart=$BIN -device %s -target %s -server-name $SERVER_NAME -manifest %s -cert $ETC/agent.crt -key $ETC/agent.key -ca $ETC/ca.crt -cutover-quiesce=remountro\n",
-			d.SourceDevice, target, manifest)
+		// -job ties every session to THIS enrollment: the receiver refuses any
+		// other job id, so stale agents from old enrollments can't write here.
+		fmt.Fprintf(&execs, "ExecStart=$BIN -device %s -target %s -server-name $SERVER_NAME -job %s -manifest %s -cert $ETC/agent.crt -key $ETC/agent.key -ca $ETC/ca.crt -cutover-quiesce=remountro\n",
+			d.SourceDevice, target, tok, manifest)
 	}
 
 	script := fmt.Sprintf(`#!/usr/bin/env bash

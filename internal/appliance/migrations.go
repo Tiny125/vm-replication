@@ -98,6 +98,19 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 
 	diskIdx := d.Index
 	dev0 := d.SourceDevice
+	declaredSize := d.SizeBytes
+	// The enrollment job id this migration's agent runs with (checkAgentHello).
+	// A lookup failure leaves it empty, which skips the identity check rather
+	// than locking out a healthy agent on a transient store error.
+	expectJob := ""
+	if tok, err := s.st.EnrollToken(s.ctx, m.ID); err == nil {
+		expectJob = enrollJobID(tok)
+	}
+	// Consecutive identical failures (the agent retries every ~60s, so a
+	// persistent problem like a wrong source disk repeats verbatim) produce ONE
+	// activity-log event, not one per minute. onError runs from this receiver's
+	// single accept loop, so no locking is needed.
+	lastErrEvt := ""
 	go func() {
 		err := receiver.Serve(ctx, ln, device, manifest, false, func(st receiver.Stats) {
 			// Quiesce-failure report (not a data session): the agent tried and could
@@ -110,6 +123,7 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 				}
 				return
 			}
+			lastErrEvt = "" // a pass landed; log the next failure even if it repeats
 			total := blockdiff.NumBlocks(st.Hello.DeviceSize, st.Hello.BlockSize)
 			bytes := st.BlocksWritten * int64(st.Hello.BlockSize)
 			wasBaselined := false
@@ -145,7 +159,10 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 				return
 			}
 			_ = s.st.RecordDiskError(s.ctx, diskID, serr.Error())
-			_ = s.st.AddEvent(s.ctx, migID, "error", fmt.Sprintf("disk %d (%s): replication attempt failed: %s", diskIdx, dev0, serr.Error()))
+			if serr.Error() != lastErrEvt {
+				lastErrEvt = serr.Error()
+				_ = s.st.AddEvent(s.ctx, migID, "error", fmt.Sprintf("disk %d (%s): replication attempt failed: %s", diskIdx, dev0, serr.Error()))
+			}
 		}, func(h protocol.Hello) bool {
 			// Bounce a live pass into a crash-consistent re-read while we're quiescing
 			// this disk for cutover (but never re-request a pass already consistent).
@@ -158,6 +175,12 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 				log.Printf("appliance: record agent connected (migration %d disk %d): %v", migID, diskID, err)
 			}
 			return s.replicationEnabled(migID)
+		}, func(h protocol.Hello) error {
+			// Identity + wrong-disk guard: only THIS migration's enrolled agent
+			// (matching job id), reading a plausibly-sized device, may feed this
+			// disk. Everything else is rejected at the Hello, before any data
+			// lands and before the console shows "agent connected".
+			return checkAgentHello(expectJob, declaredSize, diskIdx, dev0, h)
 		})
 		if err != nil && ctx.Err() == nil {
 			log.Printf("appliance: receiver (migration %d disk %d) stopped: %v", migID, diskID, err)
@@ -2134,6 +2157,48 @@ func oneLine(s string) string {
 		s = s[:max] + "…"
 	}
 	return s
+}
+
+// checkAgentHello guards every receiver session for a disk: it verifies the
+// agent's IDENTITY and its device GEOMETRY at the handshake, before the agent
+// is recorded as connected and before any data can land on the target.
+//
+// Identity: agent mTLS certs are GLOBAL (every source ever enrolled keeps valid
+// credentials) and receiver ports repeat across appliance reinstalls (port =
+// base + disk id; ids restart with a fresh DB) — so a stale, never-uninstalled
+// agent from an OLD enrollment, possibly on a different machine, can connect to
+// a new migration's port and stream its disk into the fresh volume. Each
+// enrollment therefore runs its agent with a unique job id (the enrollment-token
+// prefix); a session with any other job id is refused. expectJob=="" (token
+// unavailable) skips the identity check.
+//
+// Geometry: a reported device size grossly different from the declared disk
+// size means the agent is reading the wrong disk; see deviceSizeMismatch.
+func checkAgentHello(expectJob string, declaredSize int64, diskIdx int, dev0 string, h protocol.Hello) error {
+	if expectJob != "" && h.JobID != expectJob {
+		return fmt.Errorf("refusing session: the connecting agent (host %q, device %s) belongs to a DIFFERENT enrollment (job %q) than this migration's disk %d (%s). This usually means an old agent from a previous migration — possibly on another server — is still installed and pointed at this port, or the agent on the source predates this appliance's identity check. Run the uninstall one-liner on any old source machines, then re-run THIS migration's enrollment command on the intended source",
+			h.SourceHostname, orDefault(h.DevicePath, "?"), orDefault(h.JobID, "none"), diskIdx, dev0)
+	}
+	if deviceSizeMismatch(declaredSize, h.DeviceSize) {
+		return fmt.Errorf("refusing to replicate: the agent's %s is %s but this migration's disk %d (%s) was declared as %s — the agent is reading the WRONG DISK (a device that small/large is usually swap or a data disk, not the OS disk). On the source run `lsblk -f` (or `findmnt -no SOURCE /`) to see which disk holds the root filesystem `/`, then delete this migration and create a new one with that device and its real size",
+			h.DevicePath, humanBytes(h.DeviceSize), diskIdx, dev0, humanBytes(declaredSize))
+	}
+	return nil
+}
+
+// deviceSizeMismatch reports whether the device size an agent declared in its
+// Hello is grossly different from the size the migration's disk was created
+// with — the signature of the agent reading the WRONG DISK (e.g. a ~512 MiB
+// swap disk enrolled as an "80 GiB" migration). The tolerance is deliberately
+// generous: operators enter sizes in whole GB rounded up and real disks run a
+// little smaller than nominal, so only a reported size under HALF or over
+// DOUBLE the declared size counts as a mismatch. Either size being unknown
+// (<= 0) disables the check.
+func deviceSizeMismatch(declared, reported int64) bool {
+	if declared <= 0 || reported <= 0 {
+		return false
+	}
+	return reported < declared/2 || reported > declared*2
 }
 
 func humanBytes(n int64) string {
