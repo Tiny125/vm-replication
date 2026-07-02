@@ -358,6 +358,13 @@ server's data or OS.
 
 ## 6. Watch status and validation in the console
 
+The card is fully live: an in-progress migration's **status pill, progress
+bar/%, ETA, transferred + speed, and RPO** update **every second** on their own,
+and the whole list refreshes every 5 seconds — no manual **Refresh** needed
+(the button remains as a force-refresh). This works on both entry paths: a page
+load with an existing session and a fresh sign-in through the login form (e.g.
+right after the appliance was updated/restarted).
+
 Each migration shows aggregate progress and a **per-disk table** (expand
 **Disks**), plus a checklist that requires **all disks**:
 - ✔ Agent connected — _N/N disks checked in_

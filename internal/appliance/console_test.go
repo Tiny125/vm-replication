@@ -1,0 +1,55 @@
+package appliance
+
+import (
+	"strings"
+	"testing"
+)
+
+// The console's auto-refresh timers (5s full refresh + 1s live progress/status
+// poll + 1s elapsed ticker) must be started by start(), which BOTH entry paths
+// run: a page load with an existing session (init) and an explicit sign-in
+// through the login form. They used to be registered only on the init path, so
+// after an appliance restart (sessions wiped → login form) the console had NO
+// auto-refresh until a manual page reload — progress only moved when the
+// operator clicked Refresh.
+func TestConsoleTimersStartOnBothLoginPaths(t *testing.T) {
+	if !strings.Contains(consoleHTML, "function startTimers()") {
+		t.Fatal("console must define startTimers() so timer registration is shared by both login paths")
+	}
+	// start() is the common path (init success AND login form) — it must start
+	// the timers.
+	startFn := extractJSFunc(t, "async function start()")
+	if !strings.Contains(startFn, "startTimers()") {
+		t.Error("start() must call startTimers() — otherwise signing in through the login form leaves the console without auto-refresh")
+	}
+	// startTimers must be idempotent (guarded), since start() runs on every
+	// sign-in and timers must not stack.
+	timersFn := extractJSFunc(t, "function startTimers()")
+	if !strings.Contains(timersFn, "timersOn") {
+		t.Error("startTimers() must guard against double registration")
+	}
+	for _, want := range []string{"refresh(false)},5000", "},1000"} {
+		if !strings.Contains(timersFn, want) {
+			t.Errorf("startTimers() should register the interval %q", want)
+		}
+	}
+}
+
+// extractJSFunc returns the source of the embedded-JS function that begins with
+// header, up to the next top-level (column-0) "function"/"async function"
+// declaration — enough to assert what a given function contains.
+func extractJSFunc(t *testing.T, header string) string {
+	t.Helper()
+	i := strings.Index(consoleHTML, header)
+	if i < 0 {
+		t.Fatalf("console JS does not define %q", header)
+	}
+	rest := consoleHTML[i+len(header):]
+	end := len(rest)
+	for _, next := range []string{"\nfunction ", "\nasync function ", "\ninit();"} {
+		if j := strings.Index(rest, next); j >= 0 && j < end {
+			end = j
+		}
+	}
+	return rest[:end]
+}
