@@ -36,16 +36,16 @@ MNT="$(mktemp -d)"
 KPARTX_USED=0
 log() { echo ">> $*"; }
 # ensure_dir_mount guarantees a chroot pseudo-filesystem mount point exists AS A
-# DIRECTORY before we mount onto it. A crash-consistent copy (or a stripped-down
-# source image) can leave /proc, /sys, /run — or even /dev — missing, or present
-# as a non-directory. Mounting onto a non-directory fails with
-#   mount: <mnt>/proc: mount point is not a directory
-# which aborts the conversion of an otherwise-healthy disk (exit 32) and gets
-# mis-reported as an "inconsistent filesystem". Drop any stray non-directory,
-# then create the directory so the mount always has a valid target.
+# REAL DIRECTORY before we mount onto it. A crash-consistent copy, a heavy fsck
+# repair, or a stripped-down source image can leave /proc, /sys, /run — or even
+# /dev — missing, present as a non-directory, or as a SYMLINK (a dangling one
+# fails `mkdir -p` with "File exists" because `-e` follows symlinks and misses
+# it — the exact crash from migration testest). Mounts must land on a real
+# directory in the image, never wherever a symlink points, so any symlink or
+# stray non-directory is replaced with a directory.
 ensure_dir_mount() {
   local d="$1"
-  if [ -e "$d" ] && [ ! -d "$d" ]; then
+  if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
     rm -f "$d"
   fi
   mkdir -p "$d"
