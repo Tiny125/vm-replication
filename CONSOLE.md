@@ -410,6 +410,12 @@ local-disk boot):
    power the source off cannot damage it. The migration pauses in state
    `awaiting_cutover`. (No read-only remount of the source is attempted, so it
    can't get stuck on a busy root.)
+
+   The card guides the timing: while step 1 runs it shows **"Freezing the
+   image — keep the source server running"** (so the in-flight pass can finish
+   and the image carries your latest changes); once frozen it switches to
+   **"Action needed — power off the source server now"**. Follow the card —
+   there is no need to guess when it is safe.
 3. **Power off the source server**, then click **Launch instance**. The appliance:
    - runs the **machine conversion** on the boot disk so it boots on Linode
      (virtio initramfs, GRUB, fstab, Lish serial console, network reset),

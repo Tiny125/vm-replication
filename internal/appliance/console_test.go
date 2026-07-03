@@ -52,6 +52,26 @@ func TestConsoleRendersCutoverCopyCommand(t *testing.T) {
 	}
 }
 
+// The guided cutover must tell the operator, ON THE CARD, when it is safe to
+// power off the source: a "keep the source running" banner while step 1's
+// freeze/drain runs (cutover_freezing), then a "power off the source server
+// now" action banner once frozen (awaiting_cutover). Same visual style as the
+// disk-copy action box, and no emoji icons.
+func TestConsoleCutoverGuidance(t *testing.T) {
+	for _, want := range []string{
+		"cutover_freezing",                // freeze-in-progress view flag is consumed
+		"keep the source server running",  // the wait guidance
+		"power off the source server now", // the go-ahead action banner
+	} {
+		if !strings.Contains(consoleHTML, want) {
+			t.Errorf("console should render the cutover guidance (missing %q)", want)
+		}
+	}
+	if strings.Contains(consoleHTML, "⚡") {
+		t.Error("action banners must not carry the lightning icon")
+	}
+}
+
 // extractJSFunc returns the source of the embedded-JS function that begins with
 // header, up to the next top-level (column-0) "function"/"async function"
 // declaration — enough to assert what a given function contains.

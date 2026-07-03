@@ -314,6 +314,10 @@ type MigrationView struct {
 	// run the image copy in the rescue'd destination's Lish console — the one
 	// line to paste there. Empty at all other times.
 	CutoverCopyCmd string `json:"cutover_copy_cmd,omitempty"`
+	// CutoverFreezing is true while a guided cutover's step 1 (drain the
+	// in-flight pass, freeze the image) is running — the console shows "keep the
+	// source running" until this clears and the state parks in awaiting_cutover.
+	CutoverFreezing bool `json:"cutover_freezing,omitempty"`
 
 	// Gated replication start + pause/resume (computed for the console):
 	//   AgentConnected     — every disk's agent has handshaked recently (tick).

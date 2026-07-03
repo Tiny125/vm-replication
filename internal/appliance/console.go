@@ -915,7 +915,7 @@ function migCard(v){
   // instance off; the appliance finishes automatically from there).
   if(m.state==='migrating' && v.cutover_copy_cmd){
     b+='<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05">'+
-      '<b>⚡ Action needed — copy the image onto the local disk.</b>'+
+      '<b>Action needed — copy the image onto the local disk.</b>'+
       '<div style="margin-top:6px">1. Make sure the <b>source server is powered off</b>.</div>'+
       '<div style="margin-top:4px">2. Open the cutover instance’s <b>Lish console</b>'+(m.launched_linode_id?(' — <a href="https://cloud.linode.com/linodes/'+m.launched_linode_id+'/lish/weblish" target="_blank" rel="noopener">open Weblish</a>'):'')+' (it is booted in Rescue Mode).</div>'+
       '<div style="margin-top:4px">3. Paste this one line there:</div>'+
@@ -959,14 +959,23 @@ function migCard(v){
        '<button onclick="copyText(document.getElementById(\'unin'+m.id+'\').textContent,this)">Copy</button></div></details>';
   }
 
-  // Guided-cutover step banner. Emitted BEFORE the actions row (which is a flex
+  // Guided-cutover banners. Emitted BEFORE the actions row (which is a flex
   // ROW) so the text gets its own full-width block and the buttons below stay on
   // their own aligned line — button positions must never be pushed around by text.
+  // Step 1 in progress (drain + freeze): the operator must NOT power off yet.
+  if(m.state==='migrating' && v.cutover_freezing){
+    b+='<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05">'+
+      '<b>Freezing the image — keep the source server running.</b>'+
+      '<div style="margin-top:6px">The appliance is waiting for the replication pass currently in flight to finish, so the frozen image carries your latest changes (this can take a few minutes on a large disk).</div>'+
+      '<div style="margin-top:4px">This card will tell you when to power off the source — nothing to do yet. (Powering off early is safe: an unfinished pass is discarded whole and the image stays at the last complete pass, just slightly older.)</div></div>';
+  }
+  // Step 1 done: NOW the operator powers the source off, then launches.
   if(m.state==='awaiting_cutover'){
-    b+='<div style="font-size:12.5px;margin-bottom:2px">'+
-      '<div>✓ <b>Step 1 done</b> — replication is stopped and the current copy is frozen as the image.</div>'+
-      '<div style="margin-top:5px"><b>Step 2 — now:</b> <b>power off the source server</b> (so the old and new machines aren’t both running at once).</div>'+
-      '<div style="margin-top:5px"><b>Step 3:</b> click <b>Launch instance</b> below to convert, clone and launch.</div></div>';
+    b+='<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05">'+
+      '<b>Action needed — power off the source server now.</b>'+
+      '<div style="margin-top:6px">✓ <b>Step 1 done</b> — replication is stopped and the copy is frozen as the image.</div>'+
+      '<div style="margin-top:4px"><b>Step 2 — now:</b> <b>power off the source server</b> (so the old and new machines aren’t both running at once).</div>'+
+      '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> below to convert and launch.</div></div>';
   }
   b+='<div class="actions">';
   const migDone=['image_ready','launched'].includes(m.state);
@@ -1026,9 +1035,11 @@ function migCard(v){
   // update (same state → smooth) from a state change (rebuild the whole card).
   card.dataset.live=['image_ready','launched','failed'].includes(m.state)?'':'1';
   card.dataset.state=m.state;
-  // Rebuild promptly when the disk-cutover copy command appears/disappears, so
-  // the "action needed" banner shows within a second (not on the next 5s pass).
+  // Rebuild promptly when the disk-cutover copy command or the freeze phase
+  // appears/disappears, so the guidance banners show within a second (not on
+  // the next 5s pass).
   card.dataset.cutcmd=v.cutover_copy_cmd?'1':'';
+  card.dataset.frz=v.cutover_freezing?'1':'';
   return card;
 }
 
@@ -1104,6 +1115,7 @@ function startTimers(){
         const m=v.migration;
         if(String(m.state)!==card.dataset.state){replaceCard(id,v);return;} // structure changed
         if((v.cutover_copy_cmd?'1':'')!==card.dataset.cutcmd){replaceCard(id,v);return;} // copy step appeared/finished
+        if((v.cutover_freezing?'1':'')!==card.dataset.frz){replaceCard(id,v);return;} // freeze phase started/ended
         const set=(sel,html)=>{const el=card.querySelector(sel);if(el)el.innerHTML=html;};
         set('#stat'+id,pillFor(v,m));
         set('#disks'+id,disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining'));

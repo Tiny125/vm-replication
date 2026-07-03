@@ -64,6 +64,28 @@ func TestDrainReceivers(t *testing.T) {
 	}
 }
 
+// While a guided cutover's step 1 runs (drain + freeze), the console must tell
+// the operator to KEEP THE SOURCE RUNNING until the freeze completes — the
+// CutoverFreezing view flag drives that banner; it flips on when phase 1
+// starts and off when the migration parks in awaiting_cutover (or fails).
+func TestCutoverFreezingFlag(t *testing.T) {
+	s := &Server{}
+	if s.cutoverFreezingFor(1) {
+		t.Error("freezing must default to false")
+	}
+	s.setCutoverFreezing(1, true)
+	if !s.cutoverFreezingFor(1) {
+		t.Error("freezing not reported after set")
+	}
+	if s.cutoverFreezingFor(2) {
+		t.Error("other migrations must be unaffected")
+	}
+	s.setCutoverFreezing(1, false)
+	if s.cutoverFreezingFor(1) {
+		t.Error("freezing must clear")
+	}
+}
+
 // isSourceDisconnect classifies the receiver error produced when the SOURCE
 // vanishes mid-pass (powered off / rebooted): during cutover that is an
 // expected consequence of "power off the source" and must be logged softly,

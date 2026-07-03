@@ -438,6 +438,24 @@ func (s *Server) stopReceivers(m api.Migration) {
 	}
 }
 
+// setCutoverFreezing marks (or clears) a migration whose guided cutover step 1
+// — drain the in-flight pass, then freeze — is running. The console shows a
+// "keep the source running" banner while set; once the migration parks in
+// awaiting_cutover the card switches to "power off the source server now".
+func (s *Server) setCutoverFreezing(migID int64, on bool) {
+	if on {
+		s.cutoverFreezing.Store(migID, true)
+	} else {
+		s.cutoverFreezing.Delete(migID)
+	}
+}
+
+// cutoverFreezingFor reports whether a migration's freeze is in progress.
+func (s *Server) cutoverFreezingFor(migID int64) bool {
+	_, ok := s.cutoverFreezing.Load(migID)
+	return ok
+}
+
 // drainReceivers stops a migration's receivers like stopReceivers, but WAITS
 // (up to grace) for any replication pass already in flight to finish first —
 // a completed pass ends at one consistent instant, so a freeze that drains
@@ -1119,6 +1137,14 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	}()
 	canceled := func() bool { return ctx.Err() != nil }
 	sctx := s.ctx // store writes survive a Stop (which owns its own transition)
+
+	// Guided step 1 is now running (drain + freeze): light the console's "keep
+	// the source running" banner until the migration parks in awaiting_cutover
+	// (the state the deferred clear races benignly with) or this run ends.
+	if req.GuidedShutdown {
+		s.setCutoverFreezing(m.ID, true)
+		defer s.setCutoverFreezing(m.ID, false)
+	}
 
 	// 0) Quiesce for a crash-consistent cutover: ask each disk's agent for one
 	//    final point-in-time snapshot pass so the cloned image reflects a single
@@ -1924,6 +1950,7 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	}
 	v.UninstallCmd = s.uninstallCmd()
 	v.CutoverCopyCmd = s.cutoverCopyCmdFor(m.ID)
+	v.CutoverFreezing = s.cutoverFreezingFor(m.ID)
 
 	// Reflect readiness in the displayed status so the operator can see at a
 	// glance when it's safe to cut over: a replicating migration whose disks are
