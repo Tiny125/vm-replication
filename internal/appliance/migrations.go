@@ -1168,15 +1168,10 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 		if req.SSHAuthorizedKey != "" {
 			cmd.Env = append(cmd.Env, "VMREPL_SSH_AUTHORIZED_KEY="+req.SSHAuthorizedKey)
 		}
-		if m.BootTarget == api.BootTargetDisk {
-			// Bake in the one-shot that, on the volume-boot phase, copies the image
-			// onto the instance's local disk (see finalizeDisk). The whole-disk ext
-			// shrink that makes the image fit that local disk is NOT requested here: it
-			// runs in finalizeDisk, sized to the ACTUAL disk Linode creates rather than
-			// the plan's nominal size minus a guessed margin, because the real disk size
-			// is only known once the disk has been created.
-			cmd.Env = append(cmd.Env, "VMREPL_DISK_INSTALL=1")
-		}
+		// (Disk-boot: no in-guest installer is baked in any more — the copy runs
+		// in RESCUE MODE, streamed from the appliance; see finalizeDisk. The
+		// whole-disk ext shrink also runs in finalizeDisk, sized to the ACTUAL
+		// local disk Linode creates rather than the plan's nominal size.)
 		out, err := cmd.CombinedOutput()
 		if canceled() {
 			return
@@ -1396,13 +1391,15 @@ func retryableLinodeErr(err error) bool {
 }
 
 // finalizeDisk cuts a disk-mode migration over to a Linode that boots from its
-// local (plan) disk. Local Linode disks can't be attached to the appliance, so
-// instead of cloning a volume onto the instance we: clone the replicated volume,
-// create the target Linode plus a blank raw local disk, boot it ONCE from the
-// volume (raw disk attached as sdb) so the in-guest one-shot installed by
-// machine-convert copies the volume onto the local disk and powers off, then
-// boot the instance from that local disk and drop the volume. Single-disk only
-// (enforced at create time). The boot conversion already ran in finalize().
+// local (plan) disk. A local disk can only be written from INSIDE the instance,
+// so: create the target Linode plus a blank raw local disk, boot it into RESCUE
+// MODE (Finnix) with that disk as /dev/sda, and have the operator paste ONE
+// command in its Lish console — it streams the converted image straight off the
+// appliance's replication volume onto the disk, grows the root, and powers the
+// instance off; the appliance then boots it from the local disk. No clone
+// volume, no reliance on the migrated OS booting from a volume (see
+// cutover_stream.go). Single-disk only (enforced at create time). The boot
+// conversion already ran in finalize().
 func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.Client, kernel, rootDevice string) {
 	sctx := s.ctx
 	canceled := func() bool { return ctx.Err() != nil }
@@ -1496,6 +1493,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	//    nominal size. Only whole-disk ext{2,3,4} roots are shrunk; the convert
 	//    script no-ops other layouts. The first normal boot grows the root back to
 	//    fill the disk.
+	shrunkMB := 0 // resulting filesystem size, when the shrink ran and reported one
 	if s.cfg.ConvertScript != "" && isBlockDevice(bootDevice) && actualMB > 256 {
 		target := actualMB - 16 // headroom for block rounding, anchored to the real disk
 		_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: shrinking the image filesystem to fit the %s local disk (%d MiB; target %d MiB)", m.LinodeType, actualMB, target))
@@ -1505,79 +1503,65 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		if canceled() {
 			return
 		}
-		resultMB := 0
 		if sr := convertField(string(out), "vmrepl-shrink:"); sr != "" {
 			lvl := "info"
 			if strings.Contains(sr, "failed") || strings.Contains(sr, "skipped") {
 				lvl = "warn"
 			}
 			_ = s.st.AddEvent(sctx, m.ID, lvl, "cutover: filesystem shrink "+sr)
-			resultMB = shrinkResultMB(sr)
+			shrunkMB = shrinkResultMB(sr)
 		}
 		if serr != nil {
 			log.Printf("appliance: migration %d: filesystem shrink command failed: %v\n%s", m.ID, serr, trimOut(out))
 		}
 		// Authoritative fit check against the ACTUAL disk: if the filesystem still
-		// will not fit, fail fast now instead of hanging the install boot for an hour
-		// waiting for a power-off the in-guest copy will never send.
-		if resultMB > 0 && resultMB > actualMB {
-			s.fail(m.ID, fmt.Sprintf("image filesystem is %d MiB but the %s local disk is only %d MiB, so the copy cannot fit; recreate the migration on a larger plan", resultMB, m.LinodeType, actualMB))
+		// will not fit, fail fast now instead of waiting on a copy that can never
+		// complete.
+		if shrunkMB > 0 && shrunkMB > actualMB {
+			s.fail(m.ID, fmt.Sprintf("image filesystem is %d MiB but the %s local disk is only %d MiB, so the copy cannot fit; recreate the migration on a larger plan", shrunkMB, m.LinodeType, actualMB))
 			return
 		}
 	}
 
-	// 4) Clone the (now-shrunk) replication volume into the image we copy onto the
-	//    local disk.
-	label := cutoverVolumeLabel(m.Name, boot.Index, len(m.Disks))
-	clone, err := cl.CloneVolume(ctx, boot.VolumeID, label)
-	if canceled() {
-		return
+	// 4) Authorize the image download and boot the instance into RESCUE MODE with
+	//    the blank local disk attached as /dev/sda. Rescue (Finnix) always boots
+	//    and never touches the migrated OS: the operator pastes ONE command in
+	//    its Lish console, which streams the converted image straight off the
+	//    appliance's own (fully hydrated) replication volume onto the local disk,
+	//    grows the root, and powers the instance off — the "copy done" signal.
+	//    No clone volume is created, so there is nothing to hydrate slowly and
+	//    nothing extra to clean up.
+	streamBytes := boot.SizeBytes
+	if shrunkMB > 0 {
+		streamBytes = int64(shrunkMB) << 20 // only the (shrunk) filesystem needs copying
 	}
-	if err != nil {
-		s.fail(m.ID, "clone boot volume: "+err.Error())
-		return
-	}
-	if _, err := cl.WaitVolumeActive(ctx, clone.ID, 15*time.Minute); err != nil {
-		if canceled() {
-			return
-		}
-		s.fail(m.ID, "wait clone active: "+err.Error())
-		return
-	}
-	_ = s.st.SetDiskArtifact(sctx, boot.ID, fmt.Sprintf("volume:%d", clone.ID))
-	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("volume:%d", clone.ID), inst.ID)
+	copyBudget := diskCopyTimeout(streamBytes)
+	token := s.registerCutoverStream(m.ID, bootDevice, streamBytes, copyBudget+time.Hour)
+	defer s.dropCutoverStream(m.ID) // invalidate the token + hide the command however this run ends
+	s.setCutoverCopyCmd(m.ID, s.cutoverCopyCmd(token))
 
-	// 5) Boot once from the volume (sda) with the raw disk attached (sdb); the
-	//    in-guest one-shot copies sda->sdb and powers the instance off.
-	installCfg, err := cl.CreateConfig(ctx, inst.ID, "vmrepl-install", kernel, rootDevice,
-		map[string]any{"sda": map[string]any{"volume_id": clone.ID}, "sdb": map[string]any{"disk_id": rawDisk.ID}})
-	if err != nil {
+	if err := retryBusy(ctx, func() error {
+		return cl.RescueInstance(ctx, inst.ID, map[string]any{"sda": map[string]any{"disk_id": rawDisk.ID}})
+	}); err != nil {
 		if canceled() {
 			return
 		}
-		s.fail(m.ID, "create install config: "+err.Error())
+		s.fail(m.ID, "boot into rescue mode: "+err.Error())
 		return
 	}
-	if err := retryBusy(ctx, func() error { return cl.Boot(ctx, inst.ID, installCfg) }); err != nil {
-		if canceled() {
-			return
-		}
-		s.fail(m.ID, "boot for install: "+err.Error())
-		return
-	}
-	copyBudget := diskCopyTimeout(boot.SizeBytes)
-	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("booting from the volume to copy the image onto the local disk — %s to copy, allowing up to %s (block-storage reads are the bottleneck; progress is logged here every 15 minutes and on the Lish console as \"vmrepl-diskinstall: …\")", humanBytes(boot.SizeBytes), copyBudget.Round(time.Minute)))
 	if err := cl.WaitInstanceStatus(ctx, inst.ID, "running", 10*time.Minute); err != nil {
 		if canceled() {
 			return
 		}
-		s.fail(m.ID, "instance did not start the copy boot: "+err.Error())
+		s.fail(m.ID, "instance did not boot into rescue mode: "+err.Error())
 		return
 	}
-	// The in-guest one-shot signals completion by powering the instance off. Wait
-	// in 15-minute slices up to the size-aware budget, emitting a progress event
-	// per slice so a long copy is visibly alive rather than silently hanging (the
-	// old fixed 60m budget failed real ~80 GiB copies that were still running).
+	_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf("ACTION NEEDED — instance %q (id %d) is in RESCUE MODE. Open its Lish console (Cloud Manager → Linodes → %s → Launch LISH Console) and paste the copy command shown on this card. It streams %s onto the local disk with live progress, then powers the instance off; the appliance finishes automatically from there.", cutoverName(m.Name), inst.ID, cutoverName(m.Name), humanBytes(streamBytes)))
+
+	// The pasted command signals completion by powering the instance off. Wait in
+	// 15-minute slices up to the size-aware budget (which also absorbs the human
+	// delay before the paste), emitting a progress event per slice so the wait is
+	// visibly alive.
 	copyStart := time.Now()
 	for {
 		slice := 15 * time.Minute
@@ -1597,13 +1581,14 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 			break // powered off — copy complete
 		}
 		if time.Since(copyStart) < copyBudget {
-			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: still copying the image onto the local disk (%s elapsed of up to %s) — watch \"vmrepl-diskinstall\" on the Lish console for in-guest progress", time.Since(copyStart).Round(time.Minute), copyBudget.Round(time.Minute)))
+			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: waiting for the rescue copy to finish (%s elapsed of up to %s) — if you haven't yet, paste the copy command from this card into the instance's Lish console", time.Since(copyStart).Round(time.Minute), copyBudget.Round(time.Minute)))
 			continue
 		}
-		s.fail(m.ID, fmt.Sprintf("local-disk copy did not finish within %s (instance never powered off). Open the instance's Lish serial console: the copier logs progress as \"vmrepl-diskinstall: …\" (also /var/log/vmrepl-diskinstall.log inside the guest). If it is still copying, wait for the instance to power itself off, then Retry cutover — retry removes this instance and the temporary volume and redoes the copy. Last error: %s", copyBudget.Round(time.Minute), werr.Error()))
+		s.fail(m.ID, fmt.Sprintf("the rescue copy did not power the instance off within %s. Open the instance's Lish console: if the copy command was never run, click Retry cutover and paste the fresh command it shows; if a copy is still running there, let it finish (the instance powers itself off), then Retry cutover. Last error: %s", copyBudget.Round(time.Minute), werr.Error()))
 		return
 	}
-	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("image copied onto the local disk in %s; switching boot to the local disk", time.Since(copyStart).Round(time.Minute)))
+	s.dropCutoverStream(m.ID) // copy done: kill the token and hide the command now
+	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("image copied onto the local disk in %s; booting from the local disk", time.Since(copyStart).Round(time.Minute)))
 
 	// 6) Boot from the local disk (sda) and confirm it comes up.
 	bootCfg, err := cl.CreateConfig(ctx, inst.ID, "boot-migrated", kernel, rootDevice,
@@ -1630,24 +1615,14 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		return
 	}
 
-	// Re-enable Lassie now that the install poweroff dance is done, so the migrated
+	// Re-enable Lassie now that the copy's power-off dance is done, so the migrated
 	// production instance keeps the auto-reboot-on-crash watchdog (best-effort).
 	if err := cl.SetWatchdog(ctx, inst.ID, true); err != nil {
 		log.Printf("appliance: migration %d: could not re-enable shutdown watchdog on instance %d: %v", m.ID, inst.ID, err)
 	}
 
-	// 7) Drop the now-unneeded cutover volume.
-	_ = cl.DetachVolume(ctx, clone.ID)
-	var derr error
-	for i := 0; i < 10; i++ {
-		if derr = cl.DeleteVolume(ctx, clone.ID); derr == nil {
-			break
-		}
-		time.Sleep(2 * time.Second)
-	}
-	if derr != nil {
-		_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf("local-disk boot is up, but temporary volume %d could not be deleted (remove it in Cloud Manager): %v", clone.ID, derr))
-	}
+	// No temporary volume was created (the image streamed straight from the
+	// appliance's replication volume), so there is nothing to clean up here.
 	_ = s.st.SetDiskArtifact(sctx, boot.ID, fmt.Sprintf("disk:%d", rawDisk.ID))
 	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("disk:%d", rawDisk.ID), inst.ID)
 	_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
@@ -1882,6 +1857,7 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 		v.EnrollCmd = s.enrollCmd(token, m)
 	}
 	v.UninstallCmd = s.uninstallCmd()
+	v.CutoverCopyCmd = s.cutoverCopyCmdFor(m.ID)
 
 	// Reflect readiness in the displayed status so the operator can see at a
 	// glance when it's safe to cut over: a replicating migration whose disks are

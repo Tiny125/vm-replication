@@ -70,6 +70,11 @@ type Server struct {
 	// re-prompting (keyed by migrationID, guarded by recMu).
 	pendingCutover map[int64]api.FinalizeRequest
 	progress       sync.Map // migrationID -> *syncProgress
+	// Disk-boot cutover image streaming (see cutover_stream.go):
+	// cutoverStreams: token -> *cutoverStream (authorized image downloads);
+	// cutoverCmds:    migrationID -> the Lish copy command the console shows.
+	cutoverStreams sync.Map
+	cutoverCmds    sync.Map
 	ctx            context.Context
 
 	auditCh chan auditEntry // buffered audit entries -> DB (best-effort)
@@ -122,6 +127,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /install/uninstall.sh", s.handleUninstallScript)
 	s.mux.HandleFunc("GET /enroll/file", s.handleEnrollFile)
 	s.mux.HandleFunc("GET /download/agent", s.handleDownloadAgent)
+
+	// Disk-boot cutover copy (authenticated by a per-cutover token — the rescue
+	// instance downloading these has no console session).
+	s.mux.HandleFunc("GET /cutover/copy.sh", s.handleCutoverScript)
+	s.mux.HandleFunc("GET /cutover/image", s.handleCutoverImage)
 
 	// Console API (session-protected).
 	s.mux.Handle("GET /api/v1/session", s.auth(s.handleSession))

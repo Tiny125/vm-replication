@@ -283,14 +283,18 @@ Storage cost (≈ $0.10/GB) and an estimated total. For local-disk boot only
 plans whose disk fits your data are offered (single-disk migrations only). The
 launched instance uses this plan at cutover.
 
-> **Local-disk cutover timing.** Disk-boot cutover boots the instance once from
-> a temporary volume while an in-guest one-shot copies the image onto the local
-> disk, then powers off; the appliance then switches the boot to the local disk
-> and **deletes the temporary volume**. The copy is bounded by Block-Storage
-> read speed — expect roughly **1–3 hours for an 80 GiB disk**. The activity
-> log posts progress every 15 minutes and the copier logs
-> `vmrepl-diskinstall: …` on the **Lish serial console**; the wait budget
-> scales with the disk size (~10 MiB/s + slack).
+> **Local-disk cutover — one manual step.** A Linode local disk can only be
+> written from *inside* the instance, so the disk-boot cutover boots the new
+> Linode into **Rescue Mode** (Finnix) with the blank local disk as `/dev/sda`,
+> and the migration card shows a **one-line copy command**: open the instance's
+> **Lish console** (Weblish link on the card) and paste it. The command streams
+> the converted image **straight from the appliance's replication volume** onto
+> the local disk with live `dd` progress, grows the root to fill the disk, and
+> powers the instance off — the appliance then boots it from the local disk
+> automatically. Typical copy time for an 80 GiB image is **15–30 minutes**
+> (it reads the appliance's already-hydrated volume, not a slow fresh clone);
+> **no temporary volume is created**. The activity log posts a status line
+> every 15 minutes while it waits.
 
 The console then shows a **one-line command**, e.g.:
 

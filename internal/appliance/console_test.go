@@ -35,6 +35,23 @@ func TestConsoleTimersStartOnBothLoginPaths(t *testing.T) {
 	}
 }
 
+// The disk-boot cutover needs the operator to paste ONE command into the
+// rescue'd instance's Lish console. While that copy is pending the backend sets
+// cutover_copy_cmd on the migration view, and the card must render it as an
+// "action needed" banner with the command and a Copy button.
+func TestConsoleRendersCutoverCopyCommand(t *testing.T) {
+	for _, want := range []string{
+		"cutover_copy_cmd", // the view field is consumed
+		"Action needed",    // the banner headline
+		"cutcmd",           // the <pre> id the Copy button reads
+		"/lish/weblish",    // direct link to the instance's web Lish console
+	} {
+		if !strings.Contains(consoleHTML, want) {
+			t.Errorf("console should render the cutover copy step (missing %q)", want)
+		}
+	}
+}
+
 // extractJSFunc returns the source of the embedded-JS function that begins with
 // header, up to the next top-level (column-0) "function"/"async function"
 // declaration — enough to assert what a given function contains.
