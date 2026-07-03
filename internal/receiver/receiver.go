@@ -17,6 +17,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/tiny125/vm-replication/internal/blockdiff"
@@ -76,14 +77,31 @@ var errConsistentResync = errors.New("receiver: crash-consistent resync requeste
 // outcome, not a failure.
 var errReplicationHeld = errors.New("receiver: replication not started (connection held)")
 
+// DrainGrace bounds how long an in-flight session may keep running after
+// Serve's context is cancelled (e.g. a cutover freeze stopping this receiver).
+// The session gets this long to finish cleanly — a completed pass ends at one
+// consistent instant — and is then SEVERED, so nothing can keep writing to a
+// frozen image indefinitely. A variable (not a const) so tests can shorten it.
+var DrainGrace = 3 * time.Minute
+
 // Serve accepts connections on ln and applies each to devicePath until ctx is
 // cancelled or the listener closes. onComplete (if non-nil) is called after each
 // successful session; onProgress (if non-nil) is called periodically during a
 // session. If once is true, Serve returns after the first successful session.
+// On cancellation Serve stops accepting immediately; a session already in
+// flight gets DrainGrace to finish and is then severed.
 func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress, onError func(error), requestConsistent ConsistencyFunc, replicationGate ReplicationGate, helloCheck HelloCheck) error {
+	var connMu sync.Mutex
+	var active net.Conn
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
+		time.Sleep(DrainGrace)
+		connMu.Lock()
+		if active != nil {
+			_ = active.Close() // sever a session that outlived the drain grace
+		}
+		connMu.Unlock()
 	}()
 	for {
 		conn, err := ln.Accept()
@@ -93,7 +111,13 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 			}
 			return err
 		}
+		connMu.Lock()
+		active = conn
+		connMu.Unlock()
 		stats, herr := Handle(conn, devicePath, manifestPath, onProgress, requestConsistent, replicationGate, helloCheck)
+		connMu.Lock()
+		active = nil
+		connMu.Unlock()
 		switch {
 		case errors.Is(herr, errConsistentResync):
 			// Expected: we asked the agent to re-read crash-consistently. Not an error.

@@ -54,7 +54,7 @@ type Server struct {
 	sessions sync.Map // sessionID -> expiry (time.Time)
 
 	recMu     sync.Mutex
-	receivers map[int64]context.CancelFunc // migrationID -> stop receiver
+	receivers map[int64]*receiverHandle    // diskID -> its receiver (stop + drain)
 	finalizes map[int64]context.CancelFunc // migrationID -> cancel finalize run
 	// Crash-consistent cutover coordination (keyed by disk ID, guarded by recMu):
 	// consistReq marks a disk whose agent we want to re-read from a point-in-time
@@ -100,7 +100,7 @@ func New(ctx context.Context, cfg Config) *Server {
 	}
 	s := &Server{
 		cfg: cfg, st: cfg.Store, mux: http.NewServeMux(),
-		receivers:      map[int64]context.CancelFunc{},
+		receivers:      map[int64]*receiverHandle{},
 		finalizes:      map[int64]context.CancelFunc{},
 		consistReq:     map[int64]bool{},
 		consistDone:    map[int64]bool{},
