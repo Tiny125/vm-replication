@@ -1437,6 +1437,10 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	// cutover would hang until timeout. Re-enabled after the final boot below.
 	if err := cl.SetWatchdog(ctx, inst.ID, false); err != nil {
 		log.Printf("appliance: migration %d: could not disable shutdown watchdog on instance %d: %v", m.ID, inst.ID, err)
+		// Surface it: with Lassie still on, Linode auto-reboots the instance after
+		// the copy's power-off, so the copy loops and the cutover waits its full
+		// budget — the operator should know to disable the watchdog by hand.
+		_ = s.st.AddEvent(sctx, m.ID, "warn", "could not disable the shutdown watchdog (Lassie) on the cutover instance — if the copy finishes but the instance auto-reboots instead of staying off, disable the watchdog in Cloud Manager (instance Settings) and Retry cutover: "+err.Error())
 	}
 
 	// A brand-new Linode is still "provisioning" for a short while, during which
@@ -1561,7 +1565,8 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		s.fail(m.ID, "boot for install: "+err.Error())
 		return
 	}
-	_ = s.st.AddEvent(sctx, m.ID, "info", "booting from the volume to copy the image onto the local disk (several minutes)…")
+	copyBudget := diskCopyTimeout(boot.SizeBytes)
+	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("booting from the volume to copy the image onto the local disk — %s to copy, allowing up to %s (block-storage reads are the bottleneck; progress is logged here every 15 minutes and on the Lish console as \"vmrepl-diskinstall: …\")", humanBytes(boot.SizeBytes), copyBudget.Round(time.Minute)))
 	if err := cl.WaitInstanceStatus(ctx, inst.ID, "running", 10*time.Minute); err != nil {
 		if canceled() {
 			return
@@ -1569,14 +1574,36 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		s.fail(m.ID, "instance did not start the copy boot: "+err.Error())
 		return
 	}
-	if err := cl.WaitInstanceStatus(ctx, inst.ID, "offline", 60*time.Minute); err != nil {
+	// The in-guest one-shot signals completion by powering the instance off. Wait
+	// in 15-minute slices up to the size-aware budget, emitting a progress event
+	// per slice so a long copy is visibly alive rather than silently hanging (the
+	// old fixed 60m budget failed real ~80 GiB copies that were still running).
+	copyStart := time.Now()
+	for {
+		slice := 15 * time.Minute
+		if rem := copyBudget - time.Since(copyStart); rem < slice {
+			slice = rem
+		}
+		var werr error
+		if slice > 0 {
+			werr = cl.WaitInstanceStatus(ctx, inst.ID, "offline", slice)
+		} else {
+			werr = fmt.Errorf("copy budget exhausted")
+		}
 		if canceled() {
 			return
 		}
-		s.fail(m.ID, "local-disk copy did not finish (instance never powered off — check it in Lish): "+err.Error())
+		if werr == nil {
+			break // powered off — copy complete
+		}
+		if time.Since(copyStart) < copyBudget {
+			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: still copying the image onto the local disk (%s elapsed of up to %s) — watch \"vmrepl-diskinstall\" on the Lish console for in-guest progress", time.Since(copyStart).Round(time.Minute), copyBudget.Round(time.Minute)))
+			continue
+		}
+		s.fail(m.ID, fmt.Sprintf("local-disk copy did not finish within %s (instance never powered off). Open the instance's Lish serial console: the copier logs progress as \"vmrepl-diskinstall: …\" (also /var/log/vmrepl-diskinstall.log inside the guest). If it is still copying, wait for the instance to power itself off, then Retry cutover — retry removes this instance and the temporary volume and redoes the copy. Last error: %s", copyBudget.Round(time.Minute), werr.Error()))
 		return
 	}
-	_ = s.st.AddEvent(sctx, m.ID, "info", "image copied onto the local disk; switching boot to the local disk")
+	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("image copied onto the local disk in %s; switching boot to the local disk", time.Since(copyStart).Round(time.Minute)))
 
 	// 6) Boot from the local disk (sda) and confirm it comes up.
 	bootCfg, err := cl.CreateConfig(ctx, inst.ID, "boot-migrated", kernel, rootDevice,
@@ -2157,6 +2184,23 @@ func oneLine(s string) string {
 		s = s[:max] + "…"
 	}
 	return s
+}
+
+// diskCopyTimeout budgets how long the disk-mode cutover waits for the in-guest
+// copy (volume → local disk, which ends by powering the instance off). A fixed
+// 60 minutes failed real migrations — an ~80 GiB image at Block-Storage read
+// speeds can take well over an hour — so the budget scales with the disk size
+// at a conservative 10 MiB/s, plus 15 minutes of boot/fsck slack, floored at 1h
+// and capped at 8h as a runaway guard.
+func diskCopyTimeout(sizeBytes int64) time.Duration {
+	d := 15*time.Minute + time.Duration(sizeBytes/(10<<20))*time.Second
+	if d < time.Hour {
+		return time.Hour
+	}
+	if d > 8*time.Hour {
+		return 8 * time.Hour
+	}
+	return d
 }
 
 // checkAgentHello guards every receiver session for a disk: it verifies the

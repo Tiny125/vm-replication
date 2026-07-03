@@ -1058,34 +1058,45 @@ async function refresh(animate){
   }catch(e){/* 401 handled in api() */}
 }
 
-async function start(){show('app');if(!document.querySelector('#disks .row'))addDisk();bootTargetChanged();refresh(false);}
+// startTimers registers the console's auto-refresh timers. It MUST run on BOTH
+// entry paths — a page load with an existing session (init) AND an explicit
+// sign-in through the login form — so it is called from start(), their shared
+// step. (It used to be registered only on the init path: after an appliance
+// restart wiped the sessions, the operator signed in through the form and got a
+// console with NO auto-refresh — progress only moved on a manual Refresh.)
+// Idempotent: start() runs on every sign-in and timers must not stack.
+let timersOn=false;
+function startTimers(){
+  if(timersOn)return;timersOn=true;
+  setInterval(()=>{if(!$('app').classList.contains('hide'))refresh(false)},5000);
+  // Tick visible elapsed timers every second between server refreshes.
+  setInterval(()=>{document.querySelectorAll('.livedur[data-since]').forEach(s=>{const t=+s.dataset.since;if(t)s.textContent=fmtDur((Date.now()-t)/1000)})},1000);
+  // Live auto-refresh: every second, update each not-yet-finished migration in
+  // place so its STATUS, progress bar / %, ETA, transferred+speed and RPO all
+  // move on their own — no manual Refresh needed. When only those values change
+  // (same state) it swaps just those cells (smooth, no flicker); when the state
+  // itself changes (e.g. replicating → ready → launched) it rebuilds the whole
+  // card so the banner/buttons update too. The 5s full refresh still runs as a
+  // catch-all (new/deleted migrations, settings, open activity logs).
+  setInterval(()=>{
+    if($('app').classList.contains('hide'))return;
+    document.querySelectorAll('#migs .mig[data-live="1"]').forEach(card=>{
+      const id=card.id.slice(3);
+      api('GET','/api/v1/migrations/'+id).then(v=>{
+        const m=v.migration;
+        if(String(m.state)!==card.dataset.state){replaceCard(id,v);return;} // structure changed
+        const set=(sel,html)=>{const el=card.querySelector(sel);if(el)el.innerHTML=html;};
+        set('#stat'+id,pillFor(v,m));
+        set('#disks'+id,disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining'));
+        set('#prog'+id,progressLine(v,m));
+        set('#rpo'+id,rpoText(v,m));
+      }).catch(()=>{});
+    });
+  },1000);
+}
+async function start(){show('app');if(!document.querySelector('#disks .row'))addDisk();bootTargetChanged();refresh(false);startTimers();}
 async function init(){
-  try{await api('GET','/api/v1/session');start();
-    setInterval(()=>{if(!$('app').classList.contains('hide'))refresh(false)},5000);
-    // Tick visible elapsed timers every second between server refreshes.
-    setInterval(()=>{document.querySelectorAll('.livedur[data-since]').forEach(s=>{const t=+s.dataset.since;if(t)s.textContent=fmtDur((Date.now()-t)/1000)})},1000);
-    // Live auto-refresh: every second, update each not-yet-finished migration in
-    // place so its STATUS, progress bar / %, ETA, transferred+speed and RPO all
-    // move on their own — no manual Refresh needed. When only those values change
-    // (same state) it swaps just those cells (smooth, no flicker); when the state
-    // itself changes (e.g. replicating → ready → launched) it rebuilds the whole
-    // card so the banner/buttons update too. The 5s full refresh still runs as a
-    // catch-all (new/deleted migrations, settings, open activity logs).
-    setInterval(()=>{
-      if($('app').classList.contains('hide'))return;
-      document.querySelectorAll('#migs .mig[data-live="1"]').forEach(card=>{
-        const id=card.id.slice(3);
-        api('GET','/api/v1/migrations/'+id).then(v=>{
-          const m=v.migration;
-          if(String(m.state)!==card.dataset.state){replaceCard(id,v);return;} // structure changed
-          const set=(sel,html)=>{const el=card.querySelector(sel);if(el)el.innerHTML=html;};
-          set('#stat'+id,pillFor(v,m));
-          set('#disks'+id,disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining'));
-          set('#prog'+id,progressLine(v,m));
-          set('#rpo'+id,rpoText(v,m));
-        }).catch(()=>{});
-      });
-    },1000);}
+  try{await api('GET','/api/v1/session');start();}
   catch(e){show('login')}
 }
 init();

@@ -283,6 +283,15 @@ Storage cost (≈ $0.10/GB) and an estimated total. For local-disk boot only
 plans whose disk fits your data are offered (single-disk migrations only). The
 launched instance uses this plan at cutover.
 
+> **Local-disk cutover timing.** Disk-boot cutover boots the instance once from
+> a temporary volume while an in-guest one-shot copies the image onto the local
+> disk, then powers off; the appliance then switches the boot to the local disk
+> and **deletes the temporary volume**. The copy is bounded by Block-Storage
+> read speed — expect roughly **1–3 hours for an 80 GiB disk**. The activity
+> log posts progress every 15 minutes and the copier logs
+> `vmrepl-diskinstall: …` on the **Lish serial console**; the wait budget
+> scales with the disk size (~10 MiB/s + slack).
+
 The console then shows a **one-line command**, e.g.:
 
 ```bash
@@ -357,6 +366,13 @@ server's data or OS.
 ---
 
 ## 6. Watch status and validation in the console
+
+The card is fully live: an in-progress migration's **status pill, progress
+bar/%, ETA, transferred + speed, and RPO** update **every second** on their own,
+and the whole list refreshes every 5 seconds — no manual **Refresh** needed
+(the button remains as a force-refresh). This works on both entry paths: a page
+load with an existing session and a fresh sign-in through the login form (e.g.
+right after the appliance was updated/restarted).
 
 Each migration shows aggregate progress and a **per-disk table** (expand
 **Disks**), plus a checklist that requires **all disks**:
