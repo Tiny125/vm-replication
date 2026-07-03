@@ -169,7 +169,7 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 			if isSourceDisconnect(serr) {
 				if mm, merr := s.st.Migration(s.ctx, migID); merr == nil &&
 					(mm.State == api.MigMigrating || mm.State == api.MigAwaitingCutover) {
-					_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("disk %d (%s): the source went offline mid-pass during cutover — expected if you just powered it off; the frozen image is finalized with an fsck repair at convert", diskIdx, dev0))
+					_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("disk %d (%s): the source went offline mid-pass during cutover — expected if you just powered it off; the interrupted pass was discarded whole, so the frozen image is the last complete pass", diskIdx, dev0))
 					return
 				}
 			}
@@ -1166,10 +1166,10 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	drainStart := time.Now()
 	if s.drainReceivers(m, receiver.DrainGrace) {
 		if waited := time.Since(drainStart); waited > 2*time.Second {
-			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: waited %s for the in-flight replication pass to finish so the frozen image is one complete, consistent pass", waited.Round(time.Second)))
+			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: waited %s for the in-flight replication pass to end — delta passes apply atomically (an interrupted pass is discarded whole), so the frozen image is the last complete pass", waited.Round(time.Second)))
 		}
 	} else {
-		_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf("cutover: a replication pass was still running after %s and was severed — the frozen image may mix two points in time (repaired with fsck on convert)", receiver.DrainGrace))
+		_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf("cutover: a replication pass was still running after %s and was severed; its staged data was discarded whole — the frozen image remains the last completely applied pass", receiver.DrainGrace))
 	}
 	s.clearConsistency(m)
 

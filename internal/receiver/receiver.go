@@ -242,6 +242,29 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress,
 	start := time.Now()
 	var written int64
 
+	// Delta passes are applied ATOMICALLY: blocks are validated and STAGED to a
+	// sidecar file as they arrive, and only written to the device after the
+	// agent's Done confirms the pass is complete. An interrupted delta (source
+	// powered off mid-pass, network drop, freeze) is discarded WHOLE, so the
+	// target always holds the last complete pass. Without this, a partial delta
+	// tore the target badly: deltas stream in ascending disk order, so the ext4
+	// superblock and early group metadata advanced to the new pass while later
+	// blocks stayed old (backup-superblock recovery, mangled top-level dirs,
+	// unbootable images). Full syncs still apply directly — staging would double
+	// the I/O and disk footprint of an entire baseline, and an incomplete
+	// baseline is harmless (full_sync_done is only set on completion and the
+	// next pass re-sends it).
+	var stage *stageFile
+	if !hello.FullSync {
+		var serr error
+		if stage, serr = newStageFile(manifestPath); serr != nil {
+			_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, Message: "cannot stage the delta pass: " + serr.Error()})
+			_ = w.Flush()
+			return Stats{}, fmt.Errorf("create staging file: %w", serr)
+		}
+		defer stage.Discard() // no-op once applied; removes the file on any abort
+	}
+
 	// Live progress: a full sync sends every block, so totalBlocks is the
 	// expected count and lets the console compute percent + ETA.
 	const progressEvery = 16 // every 64 MiB at the 4 MiB default block size
@@ -260,10 +283,16 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress,
 		}
 		switch t {
 		case protocol.MsgBlock:
-			if err := applyBlock(dev, applied, payload); err != nil {
-				_ = protocol.WriteJSON(w, protocol.MsgDoneAck, protocol.DoneAck{OK: false, Error: err.Error()})
+			var berr error
+			if stage != nil {
+				berr = stageBlock(stage, applied, payload)
+			} else {
+				berr = applyBlock(dev, applied, payload)
+			}
+			if berr != nil {
+				_ = protocol.WriteJSON(w, protocol.MsgDoneAck, protocol.DoneAck{OK: false, Error: berr.Error()})
 				_ = w.Flush()
-				return Stats{}, err
+				return Stats{}, berr
 			}
 			written++
 			if onProgress != nil && written%progressEvery == 0 {
@@ -274,6 +303,14 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress,
 			var done protocol.Done
 			if err := json.Unmarshal(payload, &done); err != nil {
 				return Stats{}, fmt.Errorf("decode done: %w", err)
+			}
+			// The pass is complete: for a staged delta, NOW write it to the device.
+			if stage != nil {
+				if err := stage.Apply(dev); err != nil {
+					_ = protocol.WriteJSON(w, protocol.MsgDoneAck, protocol.DoneAck{OK: false, Error: err.Error()})
+					_ = w.Flush()
+					return Stats{}, fmt.Errorf("apply staged pass: %w", err)
+				}
 			}
 			if err := dev.Sync(); err != nil {
 				_ = protocol.WriteJSON(w, protocol.MsgDoneAck, protocol.DoneAck{OK: false, Error: err.Error()})
@@ -304,37 +341,61 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress,
 	}
 }
 
+// applyBlock validates one block frame and writes it straight to the device
+// (full-sync path; delta passes go through stageBlock instead).
 func applyBlock(dev *blockdiff.Device, applied *blockdiff.Manifest, payload []byte) error {
-	hdr, raw, err := protocol.DecodeBlock(payload)
+	hdr, raw, err := decodeCheckBlock(applied, payload)
 	if err != nil {
-		return err
-	}
-	// Bound the declared block before allocating/decompressing: RawLen can never
-	// legitimately exceed the negotiated block size, and the write must land
-	// inside the device.
-	if hdr.RawLen == 0 || int64(hdr.RawLen) > int64(applied.BlockSize) {
-		return fmt.Errorf("block at %d: raw length %d exceeds block size %d", hdr.Offset, hdr.RawLen, applied.BlockSize)
-	}
-	if hdr.Offset < 0 || hdr.Offset+int64(hdr.RawLen) > applied.DeviceSize {
-		return fmt.Errorf("block at %d (len %d) is out of device bounds %d", hdr.Offset, hdr.RawLen, applied.DeviceSize)
-	}
-	if hdr.Codec == protocol.CodecFlate {
-		raw, err = codec.Decompress(raw, int(hdr.RawLen))
-		if err != nil {
-			return fmt.Errorf("decompress block at %d: %w", hdr.Offset, err)
-		}
-	}
-	if err := hdr.Validate(raw); err != nil {
 		return err
 	}
 	if err := writeAt(dev, raw, hdr.Offset); err != nil {
 		return fmt.Errorf("write block at %d: %w", hdr.Offset, err)
 	}
+	return nil
+}
+
+// stageBlock validates one block frame and appends it to the staging file; it
+// is written to the device only when the whole pass has arrived (stage.Apply).
+func stageBlock(stage *stageFile, applied *blockdiff.Manifest, payload []byte) error {
+	hdr, raw, err := decodeCheckBlock(applied, payload)
+	if err != nil {
+		return err
+	}
+	return stage.add(hdr.Offset, raw)
+}
+
+// decodeCheckBlock decodes, bounds-checks, decompresses and hash-verifies one
+// block frame, and records its fingerprint in the applied manifest. It never
+// touches the device — the caller either writes the block directly (full sync)
+// or stages it (delta).
+func decodeCheckBlock(applied *blockdiff.Manifest, payload []byte) (protocol.BlockHeader, []byte, error) {
+	hdr, raw, err := protocol.DecodeBlock(payload)
+	if err != nil {
+		return hdr, nil, err
+	}
+	// Bound the declared block before allocating/decompressing: RawLen can never
+	// legitimately exceed the negotiated block size, and the write must land
+	// inside the device.
+	if hdr.RawLen == 0 || int64(hdr.RawLen) > int64(applied.BlockSize) {
+		return hdr, nil, fmt.Errorf("block at %d: raw length %d exceeds block size %d", hdr.Offset, hdr.RawLen, applied.BlockSize)
+	}
+	if hdr.Offset < 0 || hdr.Offset+int64(hdr.RawLen) > applied.DeviceSize {
+		return hdr, nil, fmt.Errorf("block at %d (len %d) is out of device bounds %d", hdr.Offset, hdr.RawLen, applied.DeviceSize)
+	}
+	if hdr.Codec == protocol.CodecFlate {
+		raw, err = codec.Decompress(raw, int(hdr.RawLen))
+		if err != nil {
+			return hdr, nil, fmt.Errorf("decompress block at %d: %w", hdr.Offset, err)
+		}
+	}
+	if err := hdr.Validate(raw); err != nil {
+		return hdr, nil, err
+	}
 	idx := hdr.Offset / int64(applied.BlockSize)
 	if idx >= 0 && idx < int64(len(applied.Hashes)) {
 		applied.Hashes[idx] = sha256.Sum256(raw)
 	}
-	return nil
+	return hdr, raw, nil
 }
 
 func writeAt(dev *blockdiff.Device, p []byte, off int64) error {

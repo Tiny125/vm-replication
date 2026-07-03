@@ -34,6 +34,23 @@ touch "$WORK/root3/sys/keep"
 ensure_dir_mount "$WORK/root3/sys"
 [ -d "$WORK/root3/sys" ] && [ -f "$WORK/root3/sys/keep" ] || fail "ensure_dir_mount clobbered an existing directory"
 
+# 3b) A DANGLING SYMLINK at the mount point (left by a heavy fsck repair; the
+#     exact "mkdir: cannot create directory '…/proc': File exists" crash from
+#     migration testest — `-e` follows symlinks so the old check missed it) is
+#     replaced with a real directory.
+mkdir -p "$WORK/root4"
+ln -s /nonexistent-target "$WORK/root4/proc"
+ensure_dir_mount "$WORK/root4/proc"
+[ -d "$WORK/root4/proc" ] && [ ! -L "$WORK/root4/proc" ] || fail "ensure_dir_mount did not replace a dangling symlink"
+
+# 3c) A symlink pointing AT a directory is also replaced — mounts must land on
+#     a real directory in the image, not wherever a symlink points.
+mkdir -p "$WORK/root5/elsewhere"
+ln -s elsewhere "$WORK/root5/sys"
+ensure_dir_mount "$WORK/root5/sys"
+[ -d "$WORK/root5/sys" ] && [ ! -L "$WORK/root5/sys" ] || fail "ensure_dir_mount did not replace a symlink-to-directory"
+[ -d "$WORK/root5/elsewhere" ] || fail "ensure_dir_mount must not delete the symlink's target"
+
 # 4) ensure_stage_dir: a heavy fsck repair (e.g. after an interrupted
 #    replication pass) can drop the image's /root — the convert must recreate
 #    it (0700) instead of crashing at "cat > $MNT/root/.convert-inner.sh".
