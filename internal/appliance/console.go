@@ -562,21 +562,27 @@ async function startMig(id,btn){
     '<div style="margin-top:4px"><b>Step 2:</b> power off the source server.</div>'+
     '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('launches a new Linode'+planNote+' from the frozen image.'):'clones every disk into launchable volumes.'))+'</div></div>';
   const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the frozen copy is current. The image is crash-consistent and repaired with fsck on convert — no LVM or read-only remount needed.</div>';
+  // Optional names for what the cutover creates: the instance (both methods)
+  // and, for volume boot, the cutover volume. Blank keeps <name>-cutover.
+  const defName=esc((meta.name||'')+'-cutover');
+  const fields=[{id:'inst_name',label:'New instance name (optional)',type:'text',placeholder:'default: '+defName}];
+  if(!disk)fields.push({id:'vol_name',label:'New volume name (optional)',type:'text',placeholder:'default: '+defName});
+  fields.push(
+    {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
+    {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
+  );
   const opts={
     title:'Cut over migration #'+id+' — step 1 of 3: stop replication & freeze',
     okText:'Stop replication & continue',
     html:how+access+prep,
-    fields:[
-      {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
-      {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
-    ]
+    fields:fields
   };
   const r=await confirmModal(opts);
   if(!r)return;
   busy(btn,true);
   // Always guided + skip the read-only snapshot: freeze the current crash-consistent
   // data, pause for the operator to power off the source, then launch. Always launch.
-  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:true,root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:true,guided_shutdown:true});await refreshMig(id)}
+  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:true,label:r.inst_name||'',volume_label:r.vol_name||'',root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:true,guided_shutdown:true});await refreshMig(id)}
   catch(e){alertModal({title:'Cannot start cutover',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function completeCutover(id,btn){

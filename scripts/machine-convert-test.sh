@@ -74,7 +74,32 @@ mkdir -p "$WORK/img3"
 ensure_stage_dir "$WORK/img3" >/dev/null
 [ -d "$WORK/img3/root" ] || fail "ensure_stage_dir did not replace a stray file at /root"
 
-# 7) The script must still be syntactically valid.
+# 8) disable_stale_swap: fstab swap entries pointing at devices that were NOT
+#    migrated (a separate swap disk — Linode's /dev/sdb, or a UUID that no
+#    longer resolves) must be commented out, or the migrated instance stalls
+#    ~90s at boot waiting for a ghost device. Root and comment lines untouched.
+FSTAB="$WORK/fstab"
+cat > "$FSTAB" <<'EOF'
+# /etc/fstab: static file system information.
+UUID=16829997-c4bf-8fc8-89a5-e49ca9f84956 / ext4 errors=remount-ro 0 1
+UUID=f1408ea6-59a0-11ed-bc9d-525400000001 none swap sw 0 0
+/dev/sdb none swap sw 0 0
+EOF
+disable_stale_swap "$FSTAB" >/dev/null
+grep -q '^UUID=16829997.* / ext4' "$FSTAB" || fail "disable_stale_swap must not touch the root entry"
+grep -q '^# /etc/fstab' "$FSTAB" || fail "disable_stale_swap must keep comments"
+grep -q '^# vmrepl: disabled.*UUID=f1408ea6' "$FSTAB" || fail "missing-UUID swap entry should be disabled"
+grep -q '^# vmrepl: disabled.*/dev/sdb' "$FSTAB" || fail "separate-disk swap entry should be disabled"
+if grep -qE '^[^#].*swap' "$FSTAB"; then fail "no active swap entries should remain"; fi
+
+# 8b) A file with no swap entries is left byte-identical.
+FSTAB2="$WORK/fstab2"
+printf 'UUID=abc / ext4 defaults 0 1\n' > "$FSTAB2"
+cp "$FSTAB2" "$FSTAB2.orig"
+disable_stale_swap "$FSTAB2" >/dev/null
+cmp -s "$FSTAB2" "$FSTAB2.orig" || fail "a swap-free fstab must be untouched"
+
+# 9) The script must still be syntactically valid.
 bash -n "$HERE/machine-convert.sh" || fail "machine-convert.sh has a syntax error"
 
 echo "ok  machine-convert.sh helpers (ensure_dir_mount, ensure_stage_dir)"

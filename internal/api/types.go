@@ -380,7 +380,13 @@ type FinalizeRequest struct {
 	LaunchInstance bool   `json:"launch_instance"` // also boot a new Linode from the image
 	Region         string `json:"region,omitempty"`
 	Type           string `json:"type,omitempty"`
-	Label          string `json:"label,omitempty"`
+	// Label is the operator's custom name for the launched cutover instance
+	// (sanitized; default "<migration>-cutover" when blank).
+	Label string `json:"label,omitempty"`
+	// VolumeLabel is the operator's custom name for the cutover volume(s)
+	// (volume-boot only; multi-disk migrations get a per-disk suffix; default
+	// "<migration>-cutover" when blank).
+	VolumeLabel string `json:"volume_label,omitempty"`
 
 	// SkipSnapshot cuts over from the current replicated data without asking the
 	// source agent for a crash-consistent point-in-time snapshot first. Safe (and

@@ -1335,7 +1335,7 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 			}
 			return
 		}
-		s.finalizeDisk(ctx, m, cl, kernel, rootDevice)
+		s.finalizeDisk(ctx, m, cl, kernel, rootDevice, cutoverInstanceLabel(req.Label, m.Name))
 		return
 	}
 
@@ -1356,7 +1356,7 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 	// 2) Clone every disk's volume into a launchable <name>-cutover artifact.
 	cloneIDs := make([]int64, len(m.Disks))
 	for i, d := range m.Disks {
-		label := cutoverVolumeLabel(m.Name, d.Index, len(m.Disks))
+		label := cutoverVolumeLabelFor(req.VolumeLabel, m.Name, d.Index, len(m.Disks))
 		log.Printf("appliance: migration %d: cloning disk %d volume %d -> %s", m.ID, d.Index, d.VolumeID, label)
 		clone, err := cl.CloneVolume(ctx, d.VolumeID, label)
 		if canceled() {
@@ -1394,7 +1394,7 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 		// Plan: the one chosen on the create form (stored on the migration), then
 		// an explicit finalize override, then a safe default.
 		typ := orDefault(m.LinodeType, orDefault(req.Type, "g6-standard-2"))
-		label := orDefault(req.Label, cutoverName(m.Name))
+		label := cutoverInstanceLabel(req.Label, m.Name)
 		inst, err := cl.CreateInstance(ctx, label, region, typ)
 		if canceled() {
 			return
@@ -1492,7 +1492,7 @@ func retryableLinodeErr(err error) bool {
 // volume, no reliance on the migrated OS booting from a volume (see
 // cutover_stream.go). Single-disk only (enforced at create time). The boot
 // conversion already ran in finalize().
-func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.Client, kernel, rootDevice string) {
+func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.Client, kernel, rootDevice, instLabel string) {
 	sctx := s.ctx
 	canceled := func() bool { return ctx.Err() != nil }
 	boot := m.Disks[0]
@@ -1508,7 +1508,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	if inst, err := cl.GetInstance(ctx, s.cfg.ApplianceLinodeID); err == nil && inst.Region != "" {
 		region = inst.Region
 	}
-	inst, err := cl.CreateInstance(ctx, cutoverName(m.Name), region, m.LinodeType)
+	inst, err := cl.CreateInstance(ctx, instLabel, region, m.LinodeType)
 	if canceled() {
 		return
 	}
@@ -1518,7 +1518,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	}
 	// Record the instance id now so a later failure or retry can clean it up.
 	_ = s.st.SetMigrationImage(sctx, m.ID, "", inst.ID)
-	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("created cutover Linode %q (id %d) on plan %s", cutoverName(m.Name), inst.ID, m.LinodeType))
+	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("created cutover Linode %q (id %d) on plan %s", instLabel, inst.ID, m.LinodeType))
 
 	// Disable Lassie (the Shutdown Watchdog) for the install phase. The in-guest
 	// one-shot signals "copy done" by powering the instance off; with Lassie enabled
@@ -1648,7 +1648,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		s.fail(m.ID, "instance did not boot into rescue mode: "+err.Error())
 		return
 	}
-	_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf("ACTION NEEDED — instance %q (id %d) is in RESCUE MODE. Open its Lish console (Cloud Manager → Linodes → %s → Launch LISH Console) and paste the copy command shown on this card. It streams %s onto the local disk with live progress, then powers the instance off; the appliance finishes automatically from there.", cutoverName(m.Name), inst.ID, cutoverName(m.Name), humanBytes(streamBytes)))
+	_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf("ACTION NEEDED — instance %q (id %d) is in RESCUE MODE. Open its Lish console (Cloud Manager → Linodes → %s → Launch LISH Console) and paste the copy command shown on this card. It streams %s onto the local disk with live progress, then powers the instance off; the appliance finishes automatically from there.", instLabel, inst.ID, instLabel, humanBytes(streamBytes)))
 
 	// The pasted command signals completion by powering the instance off. Wait in
 	// 15-minute slices up to the size-aware budget (which also absorbs the human
@@ -1719,7 +1719,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("disk:%d", rawDisk.ID), inst.ID)
 	_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
 	_ = s.st.SetMigrateFinished(sctx, m.ID)
-	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %q (id %d) is booting from its local disk on plan %s", cutoverName(m.Name), inst.ID, m.LinodeType))
+	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %q (id %d) is booting from its local disk on plan %s", instLabel, inst.ID, m.LinodeType))
 }
 
 // cleanupCutoverArtifacts deletes the Linode instance and cloned volumes created
@@ -1796,6 +1796,37 @@ func artifactVolumeID(artifact string) int64 {
 
 // cutoverName is the instance label for a cutover launch: "<name>-cutover".
 func cutoverName(name string) string { return sanitizeLabel(name) + "-cutover" }
+
+// cutoverInstanceLabel is the launched instance's label: the operator's custom
+// name from the cutover dialog — sanitized to Linode's charset, trimmed and
+// capped at 64 chars — or the "<migration>-cutover" default when blank or
+// unusable (fewer than 3 usable chars).
+func cutoverInstanceLabel(custom, migName string) string {
+	c := strings.Trim(sanitizeLabel(custom), "-_")
+	if len(c) > 64 {
+		c = strings.Trim(c[:64], "-_")
+	}
+	if len(c) < 3 {
+		return cutoverName(migName)
+	}
+	return c
+}
+
+// cutoverVolumeLabelFor is the cutover volume's label (volume-boot): the
+// operator's custom name — sanitized, capped at Linode's 32-char volume limit,
+// keeping the per-disk suffix for multi-disk migrations — or the existing
+// "<migration>-cutover" default when blank or unusable.
+func cutoverVolumeLabelFor(custom, migName string, idx, total int) string {
+	c := strings.Trim(sanitizeLabel(custom), "-_")
+	if c == "" {
+		return cutoverVolumeLabel(migName, idx, total)
+	}
+	suffix := ""
+	if total > 1 {
+		suffix = fmt.Sprintf("-%d", idx)
+	}
+	return fitLabel("", c, suffix)
+}
 
 // cutoverVolumeLabel is the cloned-volume label: "<name>-cutover" (with a disk
 // suffix for multi-disk), capped to Linode's 32-char limit. Deterministic so a

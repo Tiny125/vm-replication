@@ -67,6 +67,64 @@ ensure_stage_dir() {
   mkdir -p "$d"
   chmod 700 "$d"
 }
+# swap_spec_exists reports whether an fstab swap spec resolves to a device that
+# actually made it onto the MIGRATED disk. UUID=/LABEL=/PARTUUID= specs are
+# resolved with blkid (a migrated swap partition on $DEV is visible to it; a
+# separate swap disk that wasn't migrated is not). A raw /dev/... spec is only
+# trusted if the same-numbered partition of the migrated disk ($DEV) is
+# formatted as swap — the literal device name (e.g. Linode's separate-disk
+# /dev/sdb) may coincidentally exist on the APPLIANCE and must not count.
+swap_spec_exists() {
+  local spec="$1" dev="" pnum cand
+  case "$spec" in
+    UUID=*)   dev=$(blkid -U "${spec#UUID=}" 2>/dev/null || true) ;;
+    LABEL=*)  dev=$(blkid -L "${spec#LABEL=}" 2>/dev/null || true) ;;
+    PARTUUID=*|PARTLABEL=*) dev=$(blkid -t "$spec" -o device 2>/dev/null | head -1 || true) ;;
+    /dev/*)
+      pnum=$(printf '%s' "$spec" | grep -oE '[0-9]+$' || true)
+      if [ -n "$pnum" ] && [ -n "${DEV:-}" ]; then
+        for cand in "${DEV}${pnum}" "${DEV}p${pnum}"; do
+          if [ -b "$cand" ] && [ "$(blkid -s TYPE -o value "$cand" 2>/dev/null)" = "swap" ]; then
+            return 0
+          fi
+        done
+      fi
+      return 1 ;;
+    *) return 0 ;; # unknown spec form — leave it alone
+  esac
+  [ -n "$dev" ] && [ -b "$dev" ]
+}
+# disable_stale_swap comments out fstab swap entries whose device did NOT come
+# along with the migration (typically a SEPARATE swap disk — clouds attach one
+# next to the boot disk, and only the boot disk is migrated). Left active, such
+# an entry stalls every boot ~90s while systemd waits for a device that will
+# never appear, and the instance then runs with no swap anyway. The lines are
+# commented (not deleted) with a marker so the operator can see what happened;
+# a swapfile can be added later if swap is wanted.
+disable_stale_swap() {
+  local fstab="$1"
+  [ -f "$fstab" ] || return 0
+  local tmp="$fstab.vmrepl-tmp" line spec fstype disabled=0
+  : > "$tmp"
+  while IFS= read -r line; do
+    case "$line" in
+      \#*|"") printf '%s\n' "$line" >> "$tmp"; continue ;;
+    esac
+    spec=$(printf '%s' "$line" | awk '{print $1}')
+    fstype=$(printf '%s' "$line" | awk '{print $3}')
+    if [ "$fstype" = "swap" ] && ! swap_spec_exists "$spec"; then
+      printf '# vmrepl: disabled (swap device not migrated): %s\n' "$line" >> "$tmp"
+      disabled=1
+      log "WARNING: fstab swap entry '$spec' points at a device that was not migrated — disabled it so boot doesn't stall waiting for it (add a swapfile on the migrated system if you want swap)"
+    else
+      printf '%s\n' "$line" >> "$tmp"
+    fi
+  done < "$fstab"
+  if [ "$disabled" = 1 ]; then
+    cat "$tmp" > "$fstab"
+  fi
+  rm -f "$tmp"
+}
 cleanup() {
   for m in dev/pts dev proc sys run; do
     mountpoint -q "$MNT/$m" && umount -l "$MNT/$m" 2>/dev/null || true
@@ -314,6 +372,10 @@ mount --bind /run "$MNT/run" 2>/dev/null || true
 
 ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
 log "Root filesystem UUID: $ROOT_UUID"
+
+# Disable fstab swap entries whose device didn't come along with the migration
+# (e.g. a separate cloud swap disk) — left active they stall every boot ~90s.
+disable_stale_swap "$MNT/etc/fstab"
 
 # Stage the conversion steps inside the chroot. The image must have a /root to
 # stage into — a heavy fsck repair can have dropped it (see ensure_stage_dir).

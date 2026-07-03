@@ -72,6 +72,22 @@ func TestConsoleCutoverGuidance(t *testing.T) {
 	}
 }
 
+// The cutover dialog lets the operator NAME the launched instance (both boot
+// methods) and the cutover volume (volume-boot only), sent as label /
+// volume_label on the /start request; blank falls back to <name>-cutover.
+func TestConsoleCutoverNamingFields(t *testing.T) {
+	for _, want := range []string{
+		"inst_name",         // instance-name dialog field
+		"vol_name",          // volume-name dialog field (volume-boot)
+		"volume_label:",     // sent to the API
+		"label:r.inst_name", // instance name sent to the API
+	} {
+		if !strings.Contains(consoleHTML, want) {
+			t.Errorf("console should offer cutover naming (missing %q)", want)
+		}
+	}
+}
+
 // extractJSFunc returns the source of the embedded-JS function that begins with
 // header, up to the next top-level (column-0) "function"/"async function"
 // declaration — enough to assert what a given function contains.
