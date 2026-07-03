@@ -310,6 +310,10 @@ type MigrationView struct {
 	Assessed     bool              `json:"assessed"` // pre-migration assessment passed
 	EnrollCmd    string            `json:"enroll_cmd,omitempty"`
 	UninstallCmd string            `json:"uninstall_cmd,omitempty"`
+	// CutoverCopyCmd is set while a disk-boot cutover waits for the operator to
+	// run the image copy in the rescue'd destination's Lish console — the one
+	// line to paste there. Empty at all other times.
+	CutoverCopyCmd string `json:"cutover_copy_cmd,omitempty"`
 
 	// Gated replication start + pause/resume (computed for the console):
 	//   AgentConnected     — every disk's agent has handshaked recently (tick).

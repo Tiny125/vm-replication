@@ -256,6 +256,16 @@ func (c *Client) SetWatchdog(ctx context.Context, instanceID int64, enabled bool
 		map[string]any{"watchdog_enabled": enabled}, nil)
 }
 
+// RescueInstance reboots an instance into Rescue Mode (Finnix, run from RAM)
+// with the given devices attached — e.g. {"sda": {"disk_id": N}} exposes disk N
+// as /dev/sda inside the rescue environment. The disk-boot cutover uses this to
+// write the migrated image onto the local disk from a known-good environment,
+// without ever booting the migrated OS from a volume.
+func (c *Client) RescueInstance(ctx context.Context, id int64, devices map[string]any) error {
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("/linode/instances/%d/rescue", id),
+		map[string]any{"devices": devices}, nil)
+}
+
 // CreateConfigBootingVolume creates a config profile that boots from an attached
 // volume (GRUB 2) and returns the config id.
 func (c *Client) CreateConfigBootingVolume(ctx context.Context, linodeID, volumeID int64, label string) (int64, error) {

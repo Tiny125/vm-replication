@@ -191,6 +191,13 @@ echo "$V" | jq -e '.uninstall_cmd | contains("/install/uninstall.sh")' >/dev/nul
 curl -fsS --cacert "$CACERT" "$BASE/install/uninstall.sh" | grep -q 'rm -rf /etc/vm-repl' || { echo "FAIL: uninstall script incomplete"; exit 1; }
 echo "   OK"
 
+echo "== Disk-cutover copy endpoints are token-gated =="
+CODE=$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CACERT" "$BASE/cutover/image?token=bogus")
+[ "$CODE" = "403" ] || { echo "FAIL: /cutover/image with a bogus token returned $CODE, want 403"; exit 1; }
+CODE=$(curl -s -o /dev/null -w '%{http_code}' --cacert "$CACERT" "$BASE/cutover/copy.sh?token=bogus")
+[ "$CODE" = "403" ] || { echo "FAIL: /cutover/copy.sh with a bogus token returned $CODE, want 403"; exit 1; }
+echo "   OK: bogus cutover tokens rejected"
+
 echo "== Delete a migration removes BOTH disk files =="
 M2=$(api -X POST "$BASE/api/v1/migrations" -H 'Content-Type: application/json' \
   -d "{\"name\":\"throwaway\",\"source_hostname\":\"x\",\"devices\":[{\"device\":\"$WORK/sda.img\",\"size_bytes\":$SZA},{\"device\":\"$WORK/sdb.img\",\"size_bytes\":$SZB}]}")
