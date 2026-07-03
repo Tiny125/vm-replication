@@ -70,7 +70,11 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 		return fmt.Errorf("listen :%d: %w", d.ReceiverPort, err)
 	}
 	ctx, cancel := context.WithCancel(s.ctx)
-	s.receivers[d.ID] = cancel
+	// done closes when the serve loop has fully exited — including any session
+	// that was in flight at cancel time — so a freeze can DRAIN the receiver
+	// (wait for the pass to finish) instead of freezing mid-pass.
+	done := make(chan struct{})
+	s.receivers[d.ID] = &receiverHandle{cancel: cancel, done: done}
 
 	device := s.diskDevicePath(m, d)
 	manifest := s.diskManifestPath(m, d)
@@ -112,6 +116,7 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 	// single accept loop, so no locking is needed.
 	lastErrEvt := ""
 	go func() {
+		defer close(done)
 		err := receiver.Serve(ctx, ln, device, manifest, false, func(st receiver.Stats) {
 			// Quiesce-failure report (not a data session): the agent tried and could
 			// not capture a consistent image for cutover. Record it so quiesceForCutover
@@ -157,6 +162,16 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 			if isNonAgentHandshake(serr) {
 				log.Printf("appliance: migration %d disk %d: ignored non-agent connection on receiver port: %v", migID, diskID, serr)
 				return
+			}
+			// The source dropping mid-pass DURING CUTOVER is the expected result of
+			// "power off the source now" — log it softly instead of raising a red
+			// replication failure (and don't leave a scary LastError on the card).
+			if isSourceDisconnect(serr) {
+				if mm, merr := s.st.Migration(s.ctx, migID); merr == nil &&
+					(mm.State == api.MigMigrating || mm.State == api.MigAwaitingCutover) {
+					_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("disk %d (%s): the source went offline mid-pass during cutover — expected if you just powered it off; the frozen image is finalized with an fsck repair at convert", diskIdx, dev0))
+					return
+				}
 			}
 			_ = s.st.RecordDiskError(s.ctx, diskID, serr.Error())
 			if serr.Error() != lastErrEvt {
@@ -402,16 +417,55 @@ func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) bool {
 	}
 }
 
-// stopReceivers stops every disk receiver for a migration.
+// receiverHandle tracks one disk receiver: cancel stops it (closes the
+// listener; a session already in flight gets receiver.DrainGrace to finish
+// before being severed), done closes when its serve loop has fully exited.
+type receiverHandle struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// stopReceivers stops every disk receiver for a migration without waiting
+// (delete/cleanup paths, where an in-flight pass is irrelevant).
 func (s *Server) stopReceivers(m api.Migration) {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
 	for _, d := range m.Disks {
-		if cancel, ok := s.receivers[d.ID]; ok {
-			cancel()
+		if h, ok := s.receivers[d.ID]; ok {
+			h.cancel()
 			delete(s.receivers, d.ID)
 		}
 	}
+}
+
+// drainReceivers stops a migration's receivers like stopReceivers, but WAITS
+// (up to grace) for any replication pass already in flight to finish first —
+// a completed pass ends at one consistent instant, so a freeze that drains
+// always captures a clean image regardless of when the operator powers the
+// source off. Returns false when a session was still running at the deadline
+// (the receiver severs it shortly after — receiver.DrainGrace — but the frozen
+// image may then mix two points in time).
+func (s *Server) drainReceivers(m api.Migration, grace time.Duration) bool {
+	s.recMu.Lock()
+	var waits []chan struct{}
+	for _, d := range m.Disks {
+		if h, ok := s.receivers[d.ID]; ok {
+			h.cancel()
+			delete(s.receivers, d.ID)
+			waits = append(waits, h.done)
+		}
+	}
+	s.recMu.Unlock()
+	deadline := time.NewTimer(grace)
+	defer deadline.Stop()
+	for _, done := range waits {
+		select {
+		case <-done:
+		case <-deadline.C:
+			return false
+		}
+	}
+	return true
 }
 
 // ---- migration handlers ----
@@ -1104,7 +1158,19 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		return
 	}
 
-	s.stopReceivers(m)
+	// Freeze: stop NEW passes and wait for any pass already in flight to finish,
+	// so the frozen image is one complete, consistent pass. Without the drain, a
+	// pass could keep applying after the "freeze" and then be cut partway when
+	// the operator powers the source off (as instructed), leaving the image a
+	// mix of two points in time.
+	drainStart := time.Now()
+	if s.drainReceivers(m, receiver.DrainGrace) {
+		if waited := time.Since(drainStart); waited > 2*time.Second {
+			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: waited %s for the in-flight replication pass to finish so the frozen image is one complete, consistent pass", waited.Round(time.Second)))
+		}
+	} else {
+		_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf("cutover: a replication pass was still running after %s and was severed — the frozen image may mix two points in time (repaired with fsck on convert)", receiver.DrainGrace))
+	}
 	s.clearConsistency(m)
 
 	if req.GuidedShutdown {
@@ -2177,6 +2243,19 @@ func diskCopyTimeout(sizeBytes int64) time.Duration {
 		return 8 * time.Hour
 	}
 	return d
+}
+
+// isSourceDisconnect reports whether a session error means the SOURCE vanished
+// mid-pass (powered off / rebooted / network cut). During cutover that is the
+// expected consequence of "power off the source now", so the caller logs it as
+// info instead of a red replication failure.
+func isSourceDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "stream closed before done") ||
+		strings.Contains(msg, "connection reset by peer")
 }
 
 // checkAgentHello guards every receiver session for a disk: it verifies the

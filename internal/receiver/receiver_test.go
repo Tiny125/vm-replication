@@ -2,6 +2,7 @@ package receiver
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tiny125/vm-replication/internal/blockdiff"
 	"github.com/tiny125/vm-replication/internal/protocol"
@@ -142,6 +144,53 @@ func TestHelloCheckReject(t *testing.T) {
 	ack = exchangeHelloCheck(t, target, rogueQuiesce, nil, reject)
 	if ack.Accepted || !strings.Contains(ack.Message, "wrong source disk") {
 		t.Fatalf("quiesce report from a rejected agent must be refused, got accepted=%v msg=%q", ack.Accepted, ack.Message)
+	}
+}
+
+// After Serve's context is cancelled (a cutover freeze), an in-flight session
+// gets a bounded grace to finish and is then SEVERED — nothing may keep writing
+// to a frozen image indefinitely. This drives a real session that hangs after
+// its Hello and asserts Serve returns once the (shortened) grace expires.
+func TestServeSeversHungSessionAfterGrace(t *testing.T) {
+	oldGrace := DrainGrace
+	DrainGrace = 100 * time.Millisecond
+	defer func() { DrainGrace = oldGrace }()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target.img")
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() {
+		served <- Serve(ctx, ln, target, "", false, nil, nil, nil, nil, nil, nil)
+	}()
+
+	// "Agent": open a session, send a valid Hello, get accepted… then hang.
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	w := bufio.NewWriter(c)
+	if err := protocol.WriteJSON(w, protocol.MsgHello, protocol.Hello{
+		ProtocolVersion: 1, BlockSize: 4096, DeviceSize: 4096, DevicePath: "/dev/sda",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Flush()
+	r := bufio.NewReader(c)
+	if mt, _, err := protocol.ReadFrame(r); err != nil || mt != protocol.MsgHelloAck {
+		t.Fatalf("expected hello-ack, got type %d err %v", mt, err)
+	}
+
+	cancel() // freeze: stop accepting; the hung session must be severed after the grace
+	select {
+	case <-served:
+		// Serve returned — the hung session was severed and the loop exited.
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not sever the hung session after the drain grace")
 	}
 }
 

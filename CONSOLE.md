@@ -399,11 +399,14 @@ local-disk boot):
    the card), so the frozen copy is current.
 2. Click **Cutover instance**, optionally set a **root password / SSH key** (so
    you can log into the launched instance via the Lish console), then **Stop
-   replication & continue**. The appliance stops replication and **freezes the
-   current replicated copy** as the image to launch — crash-consistent (like a
-   power-loss) and repaired with `fsck` during the boot conversion. The migration
-   pauses in state `awaiting_cutover`. (No read-only remount of the source is
-   attempted, so it can't get stuck on a busy root.)
+   replication & continue**. The appliance stops new replication passes, **waits
+   for any pass already in flight to finish** (usually seconds — a completed
+   pass always ends at one consistent instant), and then **freezes the copy** as
+   the image to launch — crash-consistent (like a power-loss) and repaired with
+   `fsck` during the boot conversion. The migration pauses in state
+   `awaiting_cutover`. Because of the drain, the exact moment you power the
+   source off can no longer split a pass in half. (No read-only remount of the
+   source is attempted, so it can't get stuck on a busy root.)
 3. **Power off the source server**, then click **Launch instance**. The appliance:
    - runs the **machine conversion** on the boot disk so it boots on Linode
      (virtio initramfs, GRUB, fstab, Lish serial console, network reset),
