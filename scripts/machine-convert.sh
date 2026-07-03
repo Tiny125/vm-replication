@@ -50,6 +50,23 @@ ensure_dir_mount() {
   fi
   mkdir -p "$d"
 }
+# ensure_stage_dir guarantees the mounted image ($1) has a /root directory to
+# stage the inner conversion script in. A heavy fsck repair — e.g. after a
+# replication pass was interrupted mid-stream — can drop /root entirely, which
+# used to crash the conversion at "cat > $MNT/root/.convert-inner.sh: No such
+# file or directory" on an otherwise-recovered image. Recreate it (0700, like
+# a stock /root) and warn: a repair that lost /root may have relocated other
+# entries to /lost+found. An existing /root is left exactly as it is.
+ensure_stage_dir() {
+  local d="$1/root"
+  if [ -d "$d" ]; then
+    return 0
+  fi
+  log "WARNING: the image has no /root directory (heavy fsck repair?) — recreating it; check /lost+found on the migrated system for relocated files"
+  rm -f "$d" 2>/dev/null || true
+  mkdir -p "$d"
+  chmod 700 "$d"
+}
 cleanup() {
   for m in dev/pts dev proc sys run; do
     mountpoint -q "$MNT/$m" && umount -l "$MNT/$m" 2>/dev/null || true
@@ -298,7 +315,9 @@ mount --bind /run "$MNT/run" 2>/dev/null || true
 ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
 log "Root filesystem UUID: $ROOT_UUID"
 
-# Stage the conversion steps inside the chroot.
+# Stage the conversion steps inside the chroot. The image must have a /root to
+# stage into — a heavy fsck repair can have dropped it (see ensure_stage_dir).
+ensure_stage_dir "$MNT"
 cat > "$MNT/root/.convert-inner.sh" <<INNER
 #!/usr/bin/env bash
 set -euo pipefail

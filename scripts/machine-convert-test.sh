@@ -34,7 +34,30 @@ touch "$WORK/root3/sys/keep"
 ensure_dir_mount "$WORK/root3/sys"
 [ -d "$WORK/root3/sys" ] && [ -f "$WORK/root3/sys/keep" ] || fail "ensure_dir_mount clobbered an existing directory"
 
-# 4) The script must still be syntactically valid.
+# 4) ensure_stage_dir: a heavy fsck repair (e.g. after an interrupted
+#    replication pass) can drop the image's /root — the convert must recreate
+#    it (0700) instead of crashing at "cat > $MNT/root/.convert-inner.sh".
+mkdir -p "$WORK/img1"
+ensure_stage_dir "$WORK/img1" >/dev/null
+[ -d "$WORK/img1/root" ] || fail "ensure_stage_dir did not recreate a missing /root"
+perms=$(stat -c %a "$WORK/img1/root")
+[ "$perms" = "700" ] || fail "recreated /root should be 0700, got $perms"
+
+# 5) An existing /root (with contents) is left untouched.
+mkdir -p "$WORK/img2/root"
+touch "$WORK/img2/root/.bashrc"
+chmod 750 "$WORK/img2/root"
+ensure_stage_dir "$WORK/img2" >/dev/null
+[ -f "$WORK/img2/root/.bashrc" ] || fail "ensure_stage_dir clobbered an existing /root"
+[ "$(stat -c %a "$WORK/img2/root")" = "750" ] || fail "ensure_stage_dir changed an existing /root's permissions"
+
+# 6) A stray file where /root should be is replaced with a directory.
+mkdir -p "$WORK/img3"
+: > "$WORK/img3/root"
+ensure_stage_dir "$WORK/img3" >/dev/null
+[ -d "$WORK/img3/root" ] || fail "ensure_stage_dir did not replace a stray file at /root"
+
+# 7) The script must still be syntactically valid.
 bash -n "$HERE/machine-convert.sh" || fail "machine-convert.sh has a syntax error"
 
-echo "ok  machine-convert.sh helpers (ensure_dir_mount)"
+echo "ok  machine-convert.sh helpers (ensure_dir_mount, ensure_stage_dir)"
