@@ -99,7 +99,24 @@ cp "$FSTAB2" "$FSTAB2.orig"
 disable_stale_swap "$FSTAB2" >/dev/null
 cmp -s "$FSTAB2" "$FSTAB2.orig" || fail "a swap-free fstab must be untouched"
 
-# 9) The script must still be syntactically valid.
+# 10) filter_vgs_on_disk: only volume groups whose PVs live on the MIGRATED
+#     disk (kernel partitions or kpartx mappings) may be activated — the
+#     appliance's own LVM (if any) must never be touched.
+OUT=$(printf '  vg_root /dev/sdc2\n  vg_other /dev/sda3\n  vg_map /dev/mapper/sdc2\n  vg_root /dev/sdc3\n' | filter_vgs_on_disk /dev/sdc sdc)
+echo "$OUT" | grep -qx 'vg_root' || fail "VG on the migrated disk's partition should be selected"
+echo "$OUT" | grep -qx 'vg_map' || fail "VG on a kpartx mapping of the migrated disk should be selected"
+if echo "$OUT" | grep -qx 'vg_other'; then fail "VG on another disk (the appliance's own) must NOT be selected"; fi
+[ "$(echo "$OUT" | grep -cx 'vg_root')" = "1" ] || fail "VG names should be de-duplicated"
+
+# 11) The universal-source hardenings must be present in the conversion:
+#     LVM-root activation, cloud-agent disabling, and SELinux relabel.
+grep -q 'vgchange -ay' "$HERE/machine-convert.sh" || fail "convert should activate LVM volume groups when no plain-partition root is found"
+grep -q 'vgchange -an' "$HERE/machine-convert.sh" || fail "convert must deactivate the VGs it activated (cleanup)"
+grep -q 'cloud-init.disabled' "$HERE/machine-convert.sh" || fail "convert should disable cloud-init on the migrated image"
+grep -q 'google-guest-agent' "$HERE/machine-convert.sh" || fail "convert should disable the source cloud's agents"
+grep -q '/.autorelabel' "$HERE/machine-convert.sh" || fail "convert should schedule an SELinux relabel for enforcing sources"
+
+# 12) The script must still be syntactically valid.
 bash -n "$HERE/machine-convert.sh" || fail "machine-convert.sh has a syntax error"
 
 echo "ok  machine-convert.sh helpers (ensure_dir_mount, ensure_stage_dir)"

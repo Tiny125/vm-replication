@@ -55,11 +55,11 @@ partition — that warning is tolerated by design; the hard requirement
 |---|---|
 | Device naming | 🧪 Nitro instances expose EBS as `/dev/nvme0n1` (partitions `nvme0n1p1…`); older Xen types use `/dev/xvda`. Enter the **whole disk** (`/dev/nvme0n1`, not `p1`) on the create form — the "find source details" helper prints it. The agent reads NVMe devices like any block device. |
 | Boot firmware | ✅/🧪 Most x86 AMIs are BIOS; AL2023/Ubuntu UEFI-preferred AMIs are covered by the host-side GRUB 2 note above. |
-| Root filesystem | ✅ Ubuntu (ext4) and Amazon Linux / RHEL (xfs, plain partition) convert fine. ⚠️ **LVM roots are NOT supported** (see §3.1). |
-| Cloud agents | ⚠️ cloud-init (EC2 datasource), amazon-ssm-agent, hibinit-agent stay enabled (§3.2). |
+| Root filesystem | ✅ Ubuntu (ext4) and Amazon Linux / RHEL (xfs, plain partition) convert fine. ✅ LVM roots are activated and probed too (§3.1); 🧪 verify live once. |
+| Cloud agents | ✅ cloud-init / amazon-ssm-agent / hibinit-agent are disabled at conversion (§3.2). |
 | Instance-store (ephemeral) disks | ⚠️ Never add them as migration disks — they are not the OS disk and their data is disposable by design. Migrate **EBS** volumes only. |
 | Network egress | 🧪 Default SG egress is allow-all; the source needs outbound TCP 8080 + 5000–5100 to the appliance. Private subnets need a NAT route. |
-| ARM (Graviton) | ❌ **Cannot migrate** — Linode compute is x86_64; an aarch64 image will not boot. x86_64 instances only. |
+| ARM (Graviton) | ❌ Cannot migrate (x86_64 only) — the enrollment installer now refuses ARM sources with a clear message (§3.5). |
 
 ### 2.2 Azure Virtual Machines
 
@@ -68,8 +68,8 @@ partition — that warning is tolerated by design; the hard requirement
 | Device naming | 🧪 OS disk is `/dev/sda`. ⚠️ `/dev/sdb` is the **ephemeral resource disk** — never migrate it; migrate `/dev/sda` only. |
 | Boot firmware | ✅ Gen1 VMs are BIOS (cleanest case). 🧪 Gen2 VMs are UEFI-only — expected to boot via Linode's host-side GRUB 2 after the convert regenerates `grub.cfg`; verify live. |
 | Resource-disk fstab | ✅/🧪 Azure images mount the resource disk with `nofail` (no boot hang); waagent-managed swap on it disappears silently — the new stale-swap handling covers fstab-declared swap. |
-| Cloud agents | ⚠️ **waagent (walinuxagent)** and cloud-init's Azure datasource stay enabled — the Azure datasource **polls the IMDS/wireserver at boot and can add minutes of delay** before giving up on a non-Azure platform. Highest agent-related risk of the three clouds (§3.2). |
-| RHEL-family images | ⚠️ SELinux enforcing + our config writes → relabel needed (§3.3). |
+| Cloud agents | ✅ waagent and cloud-init (whose Azure datasource would otherwise poll the wireserver for minutes at boot) are disabled at conversion (§3.2). |
+| RHEL-family images | ✅ enforcing sources get an automatic first-boot relabel (§3.3). |
 | Network egress | 🧪 Default NSG allows outbound; same port requirements. |
 
 ### 2.3 GCP Compute Engine
@@ -78,24 +78,24 @@ partition — that warning is tolerated by design; the hard requirement
 |---|---|
 | Device naming | 🧪 Boot disk is `/dev/sda` (partitioned; newer images UEFI with GPT). |
 | Boot firmware | 🧪 Newer GCP images are UEFI-only — same host-side GRUB 2 expectation as Azure Gen2; verify live. |
-| Cloud agents | ⚠️ google-guest-agent + google-osconfig-agent stay enabled — they poll the GCP metadata server (absent on Linode), log errors, and normally manage **user accounts and SSH keys** from metadata (§3.2). |
+| Cloud agents | ✅ google-guest-agent / osconfig / startup-scripts are disabled at conversion (§3.2). |
 | OS Login | ⚠️ If the project used **OS Login**, sshd/PAM are wired to Google's `google_authorized_keys`/`pam_oslogin` — on Linode those return nothing, so **metadata-based SSH users stop working**. Mitigation already built in: seed a root password/SSH key at cutover (the dialog fields); local accounts keep working. |
 | Network egress | 🧪 Default VPC egress is allow; same port requirements. |
-| ARM (Tau T2A) | ❌ Not migratable (x86_64 only), same as EC2 Graviton. |
+| ARM (Tau T2A) | ❌ Not migratable (x86_64 only) — refused at enrollment (§3.5). |
 
 ---
 
 ## 3. Cross-cutting risks (the loopholes found)
 
-### 3.1 ⚠️ LVM root filesystems are not supported (affects RHEL-style layouts)
-`machine-convert.sh` locates the root by probing **partitions**; it never runs
-`vgchange -ay`, so a root inside an LVM logical volume is not found and the
-cutover aborts with "could not locate a root filesystem" (safely — nothing is
-launched). Ubuntu/Debian/Amazon Linux/GCP/Azure marketplace images don't use
-LVM by default, but custom RHEL/CentOS installs often do.
-**Status:** aborts safely; **fix available** (activate VGs and probe `/dev/mapper/*`).
+### 3.1 ✅ LVM root filesystems (RHEL-style layouts) — HANDLED
+When no plain partition carries the root, the convert now activates the volume
+groups **whose PVs live on the migrated disk only** (never the appliance's own
+LVM), probes their logical volumes for the root, and deactivates those VGs
+again when done so the volume is free for the clone/stream. LVM layouts keep
+their separate plain `/boot` partition, which is what Linode's host-side GRUB 2
+reads. 🧪 Verify live with one RHEL/LVM image.
 
-### 3.2 ⚠️ Cloud agents are left enabled on the migrated instance
+### 3.2 ✅ Cloud agents are disabled at conversion — HANDLED
 cloud-init (provider datasource), Azure **waagent**, GCP **google-guest-agent**
 / osconfig, AWS **amazon-ssm-agent** all survive the migration and start on
 Linode, where their platform APIs don't exist. Consequences range from log
@@ -103,33 +103,38 @@ noise (GCP/AWS) to **multi-minute first-boot delays** (Azure's datasource
 polling) and, for GCP OS Login, broken metadata-managed SSH users. The network
 config they'd normally manage is already neutralized by the convert's DHCP
 reset, so they can't break connectivity.
-**Status:** boot works but degraded UX; **fix available** (disable the
-provider agents + write `/etc/cloud/cloud-init.disabled` during conversion).
+**Status:** ✅ HANDLED — the convert now writes `/etc/cloud/cloud-init.disabled`
+and disables waagent, the Google guest/osconfig/startup agents, amazon-ssm-agent
+and related units (disabled, not uninstalled — re-enable anything you need).
+Networking, hostname, and root access are configured statically by the convert,
+so nothing depends on them.
 
-### 3.3 ⚠️ SELinux-enforcing sources (RHEL family) may need a relabel
+### 3.3 ✅ SELinux-enforcing sources (RHEL family) — HANDLED
 The convert writes files (network config, fstab, sshd edits) from outside the
 guest's SELinux policy, so they land unlabeled. On an enforcing system that
 can break `sshd`/`NetworkManager` on first boot.
-**Status:** **fix available** (touch `/.autorelabel` when
-`/etc/selinux/config` says enforcing — one extra reboot, correct labels).
+**Status:** ✅ HANDLED — the convert now touches `/.autorelabel` when
+`/etc/selinux/config` says `SELINUX=enforcing`; the first boot runs a one-time
+relabel (slower) and comes up with correct labels.
 
-### 3.4 ⚠️ Disk-boot fit check misses unshrinkable (partitioned) images
+### 3.4 ✅ Disk-boot fit check for unshrinkable (partitioned) images — HANDLED
 Disk-boot shrinks only **whole-disk ext4** images. Cloud images are
 **partitioned**, so no shrink happens — and the fit check only runs when a
 shrink reported a size. If the source disk is nominally the same size as the
 plan's disk (Linode's actual disk is a sliver smaller), the rescue copy `dd`
 fails at the very end and the cutover times out instead of failing fast.
-**Practical rule until fixed:** for disk boot, pick a plan whose disk is
-**comfortably larger** than the source disk (e.g. 30 GiB source → 80 GiB
-plan). **Fix available** (fail fast when `sourceBytes > actualDiskMB` and no
-shrink happened).
+**Status:** ✅ HANDLED — the fit check now also covers unshrinkable images:
+an oversized source **fails fast** with a clear message (pick a larger plan,
+or use volume boot) before the copy ever starts. Sizing headroom is still good
+practice.
 **Volume boot has no such constraint** — the volume is sized ≥ the source at
 create time.
 
-### 3.5 ❌ Architecture: x86_64 only
-ARM sources (EC2 Graviton, GCP T2A, Azure Ampere) cannot boot on Linode.
-Checked nowhere today — the failure would appear at first boot.
-**Fix available** (agent reports `uname -m`; refuse enrollment of non-x86_64).
+### 3.5 ✅ Architecture guard: x86_64 only — ENFORCED AT ENROLLMENT
+ARM sources (EC2 Graviton, GCP T2A, Azure Ampere) cannot boot on Linode. The
+enrollment installer now checks `uname -m` **before downloading anything** and
+refuses non-x86_64 sources with a clear message (previously: a cryptic "exec
+format error").
 
 ### 3.6 Method comparison for cloud sources
 

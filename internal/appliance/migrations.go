@@ -1606,13 +1606,15 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		if serr != nil {
 			log.Printf("appliance: migration %d: filesystem shrink command failed: %v\n%s", m.ID, serr, trimOut(out))
 		}
-		// Authoritative fit check against the ACTUAL disk: if the filesystem still
-		// will not fit, fail fast now instead of waiting on a copy that can never
-		// complete.
-		if shrunkMB > 0 && shrunkMB > actualMB {
-			s.fail(m.ID, fmt.Sprintf("image filesystem is %d MiB but the %s local disk is only %d MiB, so the copy cannot fit; recreate the migration on a larger plan", shrunkMB, m.LinodeType, actualMB))
-			return
-		}
+	}
+
+	// Authoritative fit check against the ACTUAL disk: fail fast now instead of
+	// waiting on a copy that can never complete. Covers both the shrunk case and
+	// unshrinkable (partitioned/non-ext — i.e. stock cloud) images, whose full
+	// source size must fit as-is.
+	if msg := diskFitError(boot.SizeBytes, shrunkMB, actualMB, m.LinodeType); msg != "" {
+		s.fail(m.ID, msg)
+		return
 	}
 
 	// 4) Authorize the image download and boot the instance into RESCUE MODE with
@@ -2341,6 +2343,29 @@ func checkAgentHello(expectJob string, declaredSize int64, diskIdx int, dev0 str
 			h.DevicePath, humanBytes(h.DeviceSize), diskIdx, dev0, humanBytes(declaredSize))
 	}
 	return nil
+}
+
+// diskFitError reports (as a ready-to-show message; "" = fits) whether the
+// image cannot fit the instance's ACTUAL local disk. When the whole-disk ext
+// shrink ran, its resulting size is authoritative; otherwise — partitioned or
+// non-ext images (every stock cloud image) CANNOT be shrunk — the full source
+// size must fit as-is. Without this, an oversized unshrinkable image failed at
+// the very end of the rescue copy (dd: no space) and the cutover timed out
+// instead of failing fast. An unknown disk size (0) never blocks.
+func diskFitError(sizeBytes int64, shrunkMB, actualMB int, linodeType string) string {
+	if actualMB <= 0 {
+		return ""
+	}
+	if shrunkMB > 0 {
+		if shrunkMB > actualMB {
+			return fmt.Sprintf("image filesystem is %d MiB but the %s local disk is only %d MiB, so the copy cannot fit; recreate the migration on a larger plan", shrunkMB, linodeType, actualMB)
+		}
+		return ""
+	}
+	if sizeBytes > int64(actualMB)<<20 {
+		return fmt.Sprintf("the source disk is %s but the %s local disk is only %d MiB, and this image cannot be shrunk (only whole-disk ext filesystems can — partitioned/cloud images cannot); pick a plan with a larger local disk, or use the volume-boot method which has no size squeeze", humanBytes(sizeBytes), linodeType, actualMB)
+	}
+	return ""
 }
 
 // deviceSizeMismatch reports whether the device size an agent declared in its
