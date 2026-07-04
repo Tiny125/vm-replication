@@ -34,6 +34,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 DEV="${1:-/dev/sda}"
 MNT="$(mktemp -d)"
 KPARTX_USED=0
+VGS_ACTIVATED="" # LVM volume groups we activated for an LVM-root image (see cleanup)
 log() { echo ">> $*"; }
 # ensure_dir_mount guarantees a chroot pseudo-filesystem mount point exists AS A
 # REAL DIRECTORY before we mount onto it. A crash-consistent copy, a heavy fsck
@@ -67,12 +68,85 @@ ensure_stage_dir() {
   mkdir -p "$d"
   chmod 700 "$d"
 }
+# swap_spec_exists reports whether an fstab swap spec resolves to a device that
+# actually made it onto the MIGRATED disk. UUID=/LABEL=/PARTUUID= specs are
+# resolved with blkid (a migrated swap partition on $DEV is visible to it; a
+# separate swap disk that wasn't migrated is not). A raw /dev/... spec is only
+# trusted if the same-numbered partition of the migrated disk ($DEV) is
+# formatted as swap — the literal device name (e.g. Linode's separate-disk
+# /dev/sdb) may coincidentally exist on the APPLIANCE and must not count.
+swap_spec_exists() {
+  local spec="$1" dev="" pnum cand
+  case "$spec" in
+    UUID=*)   dev=$(blkid -U "${spec#UUID=}" 2>/dev/null || true) ;;
+    LABEL=*)  dev=$(blkid -L "${spec#LABEL=}" 2>/dev/null || true) ;;
+    PARTUUID=*|PARTLABEL=*) dev=$(blkid -t "$spec" -o device 2>/dev/null | head -1 || true) ;;
+    /dev/*)
+      pnum=$(printf '%s' "$spec" | grep -oE '[0-9]+$' || true)
+      if [ -n "$pnum" ] && [ -n "${DEV:-}" ]; then
+        for cand in "${DEV}${pnum}" "${DEV}p${pnum}"; do
+          if [ -b "$cand" ] && [ "$(blkid -s TYPE -o value "$cand" 2>/dev/null)" = "swap" ]; then
+            return 0
+          fi
+        done
+      fi
+      return 1 ;;
+    *) return 0 ;; # unknown spec form — leave it alone
+  esac
+  [ -n "$dev" ] && [ -b "$dev" ]
+}
+# disable_stale_swap comments out fstab swap entries whose device did NOT come
+# along with the migration (typically a SEPARATE swap disk — clouds attach one
+# next to the boot disk, and only the boot disk is migrated). Left active, such
+# an entry stalls every boot ~90s while systemd waits for a device that will
+# never appear, and the instance then runs with no swap anyway. The lines are
+# commented (not deleted) with a marker so the operator can see what happened;
+# a swapfile can be added later if swap is wanted.
+disable_stale_swap() {
+  local fstab="$1"
+  [ -f "$fstab" ] || return 0
+  local tmp="$fstab.vmrepl-tmp" line spec fstype disabled=0
+  : > "$tmp"
+  while IFS= read -r line; do
+    case "$line" in
+      \#*|"") printf '%s\n' "$line" >> "$tmp"; continue ;;
+    esac
+    spec=$(printf '%s' "$line" | awk '{print $1}')
+    fstype=$(printf '%s' "$line" | awk '{print $3}')
+    if [ "$fstype" = "swap" ] && ! swap_spec_exists "$spec"; then
+      printf '# vmrepl: disabled (swap device not migrated): %s\n' "$line" >> "$tmp"
+      disabled=1
+      log "WARNING: fstab swap entry '$spec' points at a device that was not migrated — disabled it so boot doesn't stall waiting for it (add a swapfile on the migrated system if you want swap)"
+    else
+      printf '%s\n' "$line" >> "$tmp"
+    fi
+  done < "$fstab"
+  if [ "$disabled" = 1 ]; then
+    cat "$tmp" > "$fstab"
+  fi
+  rm -f "$tmp"
+}
+# filter_vgs_on_disk prints (deduplicated) the volume groups from "vg pv" pairs
+# on stdin whose PV lives on the MIGRATED disk — either a kernel partition of
+# $1 (/dev/sdc2) or a kpartx mapping of its basename $2 (/dev/mapper/sdc2).
+# VGs on any other disk (the appliance's own LVM, other volumes) are excluded:
+# the convert must never activate or deactivate volume groups it doesn't own.
+filter_vgs_on_disk() {
+  local dev="$1" base="$2"
+  awk -v d="$dev" -v m="/dev/mapper/$base" \
+    'index($2, d) == 1 || index($2, m) == 1 { print $1 }' | sort -u
+}
 cleanup() {
   for m in dev/pts dev proc sys run; do
     mountpoint -q "$MNT/$m" && umount -l "$MNT/$m" 2>/dev/null || true
   done
   mountpoint -q "$MNT" && umount -l "$MNT" 2>/dev/null || true
   rmdir "$MNT" 2>/dev/null || true
+  # Deactivate any volume groups WE activated (LVM-root images) so the volume
+  # is released for the clone/stream/detach that follows the conversion.
+  for vg in ${VGS_ACTIVATED:-}; do
+    vgchange -an "$vg" >/dev/null 2>&1 || true
+  done
   [ "$KPARTX_USED" = 1 ] && kpartx -d "$DEV" 2>/dev/null || true
 }
 # Test hook: sourcing with VMREPL_CONVERT_LIB=1 loads the helper functions above
@@ -250,15 +324,42 @@ fsck_clean() {
 # each candidate first so a dirty journal doesn't block the probe mount.
 ROOT_PART=""
 is_root() { [ -f "$1/etc/fstab" ] && { [ -d "$1/sbin" ] || [ -L "$1/sbin" ] || [ -d "$1/bin" ] || [ -L "$1/bin" ]; }; }
-for p in "${PARTS[@]}"; do
-  [ -b "$p" ] || continue
-  umount "$MNT" 2>/dev/null || true
-  fsck_clean "$p"
-  if mount -o ro "$p" "$MNT" 2>/dev/null; then
-    if is_root "$MNT"; then ROOT_PART="$p"; umount "$MNT" 2>/dev/null || true; break; fi
+probe_root() {
+  local p
+  for p in "$@"; do
+    [ -b "$p" ] || continue
     umount "$MNT" 2>/dev/null || true
+    fsck_clean "$p"
+    if mount -o ro "$p" "$MNT" 2>/dev/null; then
+      if is_root "$MNT"; then ROOT_PART="$p"; umount "$MNT" 2>/dev/null || true; return 0; fi
+      umount "$MNT" 2>/dev/null || true
+    fi
+  done
+  return 1
+}
+probe_root "${PARTS[@]}" || true
+# LVM root (common on RHEL-family installs): no plain partition carries the
+# root tree, so activate the volume groups whose PVs live on THIS disk — never
+# any other VG the appliance can see — and probe their logical volumes. The
+# activated VGs are recorded and deactivated again in cleanup so the volume is
+# free for the clone/stream that follows.
+if [ -z "$ROOT_PART" ] && command -v vgchange >/dev/null 2>&1 && command -v pvs >/dev/null 2>&1; then
+  VGS=$(pvs --noheadings -o vg_name,pv_name 2>/dev/null | filter_vgs_on_disk "$DEV" "$(basename "$DEV")")
+  if [ -n "$VGS" ]; then
+    log "No root on plain partitions; activating LVM volume group(s) on $DEV: $(echo $VGS | tr '\n' ' ')"
+    for vg in $VGS; do
+      if vgchange -ay "$vg" >/dev/null 2>&1; then
+        VGS_ACTIVATED="${VGS_ACTIVATED:-} $vg"
+      fi
+    done
+    command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=10 2>/dev/null || true
+    mapfile -t LVS < <(for vg in ${VGS_ACTIVATED:-}; do lvs --noheadings -o lv_path "$vg" 2>/dev/null; done | awk '{$1=$1; print}')
+    if [ "${#LVS[@]}" -gt 0 ]; then
+      log "Probing ${#LVS[@]} logical volume(s) for the root filesystem"
+      probe_root "${LVS[@]}" || true
+    fi
   fi
-done
+fi
 if [ -z "$ROOT_PART" ]; then
   echo "could not locate a root filesystem with /etc/fstab on $DEV (candidates: ${PARTS[*]:-none})"
   lsblk -po NAME,TYPE,FSTYPE,SIZE "$DEV" 2>/dev/null || true
@@ -314,6 +415,10 @@ mount --bind /run "$MNT/run" 2>/dev/null || true
 
 ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
 log "Root filesystem UUID: $ROOT_UUID"
+
+# Disable fstab swap entries whose device didn't come along with the migration
+# (e.g. a separate cloud swap disk) — left active they stall every boot ~90s.
+disable_stale_swap "$MNT/etc/fstab"
 
 # Stage the conversion steps inside the chroot. The image must have a /root to
 # stage into — a heavy fsck repair can have dropped it (see ensure_stage_dir).
@@ -503,6 +608,32 @@ if [ -n "\${VMREPL_SSH_AUTHORIZED_KEY:-}" ]; then
       echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config
     fi
   fi
+fi
+
+# 9) Disable the SOURCE cloud's agents. They poll their provider's metadata
+#    APIs, which don't exist on Linode: at best log noise, at worst multi-minute
+#    first-boot delays (Azure's cloud-init datasource / waagent) or account
+#    churn (GCP's guest agent manages users from metadata). Networking is
+#    already configured statically above, so nothing depends on them. They are
+#    DISABLED (not uninstalled) — re-enable any of them if you know you need it.
+log "Disabling source-cloud agents (cloud-init, waagent, GCP/AWS agents)"
+if [ -d /etc/cloud ]; then
+  touch /etc/cloud/cloud-init.disabled 2>/dev/null || true
+fi
+for svc in cloud-init cloud-init-local cloud-config cloud-final \
+           walinuxagent waagent \
+           google-guest-agent google-osconfig-agent google-startup-scripts google-shutdown-scripts \
+           amazon-ssm-agent hibinit-agent ec2-instance-connect; do
+  systemctl disable "\$svc" >/dev/null 2>&1 || true
+done
+
+# 10) SELinux (RHEL family): our config writes happened outside the guest's
+#     policy, so the files are unlabeled — on an ENFORCING system that can break
+#     sshd/networking on first boot. Schedule a full relabel (one-time, adds one
+#     slower first boot with correct labels).
+if [ -f /etc/selinux/config ] && grep -qE '^SELINUX=enforcing' /etc/selinux/config; then
+  log "SELinux is enforcing — scheduling a full relabel on first boot (/.autorelabel)"
+  touch /.autorelabel 2>/dev/null || true
 fi
 
 log "Inner conversion complete"

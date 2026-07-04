@@ -562,21 +562,27 @@ async function startMig(id,btn){
     '<div style="margin-top:4px"><b>Step 2:</b> power off the source server.</div>'+
     '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('launches a new Linode'+planNote+' from the frozen image.'):'clones every disk into launchable volumes.'))+'</div></div>';
   const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the frozen copy is current. The image is crash-consistent and repaired with fsck on convert — no LVM or read-only remount needed.</div>';
+  // Optional names for what the cutover creates: the instance (both methods)
+  // and, for volume boot, the cutover volume. Blank keeps <name>-cutover.
+  const defName=esc((meta.name||'')+'-cutover');
+  const fields=[{id:'inst_name',label:'New instance name (optional)',type:'text',placeholder:'default: '+defName}];
+  if(!disk)fields.push({id:'vol_name',label:'New volume name (optional)',type:'text',placeholder:'default: '+defName});
+  fields.push(
+    {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
+    {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
+  );
   const opts={
     title:'Cut over migration #'+id+' — step 1 of 3: stop replication & freeze',
     okText:'Stop replication & continue',
     html:how+access+prep,
-    fields:[
-      {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
-      {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
-    ]
+    fields:fields
   };
   const r=await confirmModal(opts);
   if(!r)return;
   busy(btn,true);
   // Always guided + skip the read-only snapshot: freeze the current crash-consistent
   // data, pause for the operator to power off the source, then launch. Always launch.
-  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:true,root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:true,guided_shutdown:true});await refreshMig(id)}
+  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:true,label:r.inst_name||'',volume_label:r.vol_name||'',root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:true,guided_shutdown:true});await refreshMig(id)}
   catch(e){alertModal({title:'Cannot start cutover',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function completeCutover(id,btn){
@@ -915,7 +921,7 @@ function migCard(v){
   // instance off; the appliance finishes automatically from there).
   if(m.state==='migrating' && v.cutover_copy_cmd){
     b+='<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05">'+
-      '<b>⚡ Action needed — copy the image onto the local disk.</b>'+
+      '<b>Action needed — copy the image onto the local disk.</b>'+
       '<div style="margin-top:6px">1. Make sure the <b>source server is powered off</b>.</div>'+
       '<div style="margin-top:4px">2. Open the cutover instance’s <b>Lish console</b>'+(m.launched_linode_id?(' — <a href="https://cloud.linode.com/linodes/'+m.launched_linode_id+'/lish/weblish" target="_blank" rel="noopener">open Weblish</a>'):'')+' (it is booted in Rescue Mode).</div>'+
       '<div style="margin-top:4px">3. Paste this one line there:</div>'+
@@ -959,14 +965,23 @@ function migCard(v){
        '<button onclick="copyText(document.getElementById(\'unin'+m.id+'\').textContent,this)">Copy</button></div></details>';
   }
 
-  // Guided-cutover step banner. Emitted BEFORE the actions row (which is a flex
+  // Guided-cutover banners. Emitted BEFORE the actions row (which is a flex
   // ROW) so the text gets its own full-width block and the buttons below stay on
   // their own aligned line — button positions must never be pushed around by text.
+  // Step 1 in progress (drain + freeze): the operator must NOT power off yet.
+  if(m.state==='migrating' && v.cutover_freezing){
+    b+='<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05">'+
+      '<b>Freezing the image — keep the source server running.</b>'+
+      '<div style="margin-top:6px">The appliance is waiting for the replication pass currently in flight to finish, so the frozen image carries your latest changes (this can take a few minutes on a large disk).</div>'+
+      '<div style="margin-top:4px">This card will tell you when to power off the source — nothing to do yet. (Powering off early is safe: an unfinished pass is discarded whole and the image stays at the last complete pass, just slightly older.)</div></div>';
+  }
+  // Step 1 done: NOW the operator powers the source off, then launches.
   if(m.state==='awaiting_cutover'){
-    b+='<div style="font-size:12.5px;margin-bottom:2px">'+
-      '<div>✓ <b>Step 1 done</b> — replication is stopped and the current copy is frozen as the image.</div>'+
-      '<div style="margin-top:5px"><b>Step 2 — now:</b> <b>power off the source server</b> (so the old and new machines aren’t both running at once).</div>'+
-      '<div style="margin-top:5px"><b>Step 3:</b> click <b>Launch instance</b> below to convert, clone and launch.</div></div>';
+    b+='<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05">'+
+      '<b>Action needed — power off the source server now.</b>'+
+      '<div style="margin-top:6px">✓ <b>Step 1 done</b> — replication is stopped and the copy is frozen as the image.</div>'+
+      '<div style="margin-top:4px"><b>Step 2 — now:</b> <b>power off the source server</b> (so the old and new machines aren’t both running at once).</div>'+
+      '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> below to convert and launch.</div></div>';
   }
   b+='<div class="actions">';
   const migDone=['image_ready','launched'].includes(m.state);
@@ -1026,9 +1041,11 @@ function migCard(v){
   // update (same state → smooth) from a state change (rebuild the whole card).
   card.dataset.live=['image_ready','launched','failed'].includes(m.state)?'':'1';
   card.dataset.state=m.state;
-  // Rebuild promptly when the disk-cutover copy command appears/disappears, so
-  // the "action needed" banner shows within a second (not on the next 5s pass).
+  // Rebuild promptly when the disk-cutover copy command or the freeze phase
+  // appears/disappears, so the guidance banners show within a second (not on
+  // the next 5s pass).
   card.dataset.cutcmd=v.cutover_copy_cmd?'1':'';
+  card.dataset.frz=v.cutover_freezing?'1':'';
   return card;
 }
 
@@ -1104,6 +1121,7 @@ function startTimers(){
         const m=v.migration;
         if(String(m.state)!==card.dataset.state){replaceCard(id,v);return;} // structure changed
         if((v.cutover_copy_cmd?'1':'')!==card.dataset.cutcmd){replaceCard(id,v);return;} // copy step appeared/finished
+        if((v.cutover_freezing?'1':'')!==card.dataset.frz){replaceCard(id,v);return;} // freeze phase started/ended
         const set=(sel,html)=>{const el=card.querySelector(sel);if(el)el.innerHTML=html;};
         set('#stat'+id,pillFor(v,m));
         set('#disks'+id,disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining'));

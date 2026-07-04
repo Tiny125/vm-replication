@@ -70,7 +70,17 @@ func (s *Server) handleAgentInstaller(w http.ResponseWriter, r *http.Request) {
 			d.SourceDevice, target, tok, manifest)
 	}
 
-	script := fmt.Sprintf(`#!/usr/bin/env bash
+	script := fmt.Sprintf(agentInstallerScript, m.Name, len(m.Disks), base, token, s.cfg.PublicHost, s.cfg.PublicKeyPin,
+		strings.TrimRight(checks.String(), "\n"), execs.String())
+
+	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+	_, _ = w.Write([]byte(script))
+}
+
+// agentInstallerScript is the fmt template for the one-line enrollment install
+// (args: migration name, disk count, base URL, token, server name, key pin,
+// per-disk device prechecks, per-disk ExecStart lines).
+const agentInstallerScript = `#!/usr/bin/env bash
 # vm-replication source enrollment for migration %q (%d disk(s))
 set -euo pipefail
 BASE=%q
@@ -82,6 +92,15 @@ ETC=/etc/vm-repl
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (use sudo)"; exit 1; }
 command -v curl >/dev/null || { echo "curl is required"; exit 1; }
+# The agent binary and the Linode target are x86_64-only: an ARM source (EC2
+# Graviton, GCP T2A, Azure Ampere, ...) can neither run the agent nor boot its
+# migrated image on Linode. Refuse loudly here instead of a cryptic
+# "exec format error" later.
+ARCH="$(uname -m)"
+if [ "$ARCH" != "x86_64" ]; then
+  echo "ERROR: this server's CPU architecture is $ARCH, but the migration agent and the Linode target are x86_64-only — this server cannot be migrated with this tool."
+  exit 1
+fi
 %s
 CURL="curl -fsSL"
 [ -n "$PIN" ] && CURL="$CURL -k --pinnedpubkey sha256//$PIN"
@@ -146,12 +165,7 @@ UNIT
 else
   echo "systemd not found; run the agent manually for each disk on a schedule."
 fi
-`, m.Name, len(m.Disks), base, token, s.cfg.PublicHost, s.cfg.PublicKeyPin,
-		strings.TrimRight(checks.String(), "\n"), execs.String())
-
-	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
-	_, _ = w.Write([]byte(script))
-}
+`
 
 // handleUninstallScript serves a script that removes everything enrollment
 // installed on a source server. Not token-gated by design: tokens die with

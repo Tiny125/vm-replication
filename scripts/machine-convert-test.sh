@@ -74,7 +74,49 @@ mkdir -p "$WORK/img3"
 ensure_stage_dir "$WORK/img3" >/dev/null
 [ -d "$WORK/img3/root" ] || fail "ensure_stage_dir did not replace a stray file at /root"
 
-# 7) The script must still be syntactically valid.
+# 8) disable_stale_swap: fstab swap entries pointing at devices that were NOT
+#    migrated (a separate swap disk — Linode's /dev/sdb, or a UUID that no
+#    longer resolves) must be commented out, or the migrated instance stalls
+#    ~90s at boot waiting for a ghost device. Root and comment lines untouched.
+FSTAB="$WORK/fstab"
+cat > "$FSTAB" <<'EOF'
+# /etc/fstab: static file system information.
+UUID=16829997-c4bf-8fc8-89a5-e49ca9f84956 / ext4 errors=remount-ro 0 1
+UUID=f1408ea6-59a0-11ed-bc9d-525400000001 none swap sw 0 0
+/dev/sdb none swap sw 0 0
+EOF
+disable_stale_swap "$FSTAB" >/dev/null
+grep -q '^UUID=16829997.* / ext4' "$FSTAB" || fail "disable_stale_swap must not touch the root entry"
+grep -q '^# /etc/fstab' "$FSTAB" || fail "disable_stale_swap must keep comments"
+grep -q '^# vmrepl: disabled.*UUID=f1408ea6' "$FSTAB" || fail "missing-UUID swap entry should be disabled"
+grep -q '^# vmrepl: disabled.*/dev/sdb' "$FSTAB" || fail "separate-disk swap entry should be disabled"
+if grep -qE '^[^#].*swap' "$FSTAB"; then fail "no active swap entries should remain"; fi
+
+# 8b) A file with no swap entries is left byte-identical.
+FSTAB2="$WORK/fstab2"
+printf 'UUID=abc / ext4 defaults 0 1\n' > "$FSTAB2"
+cp "$FSTAB2" "$FSTAB2.orig"
+disable_stale_swap "$FSTAB2" >/dev/null
+cmp -s "$FSTAB2" "$FSTAB2.orig" || fail "a swap-free fstab must be untouched"
+
+# 10) filter_vgs_on_disk: only volume groups whose PVs live on the MIGRATED
+#     disk (kernel partitions or kpartx mappings) may be activated — the
+#     appliance's own LVM (if any) must never be touched.
+OUT=$(printf '  vg_root /dev/sdc2\n  vg_other /dev/sda3\n  vg_map /dev/mapper/sdc2\n  vg_root /dev/sdc3\n' | filter_vgs_on_disk /dev/sdc sdc)
+echo "$OUT" | grep -qx 'vg_root' || fail "VG on the migrated disk's partition should be selected"
+echo "$OUT" | grep -qx 'vg_map' || fail "VG on a kpartx mapping of the migrated disk should be selected"
+if echo "$OUT" | grep -qx 'vg_other'; then fail "VG on another disk (the appliance's own) must NOT be selected"; fi
+[ "$(echo "$OUT" | grep -cx 'vg_root')" = "1" ] || fail "VG names should be de-duplicated"
+
+# 11) The universal-source hardenings must be present in the conversion:
+#     LVM-root activation, cloud-agent disabling, and SELinux relabel.
+grep -q 'vgchange -ay' "$HERE/machine-convert.sh" || fail "convert should activate LVM volume groups when no plain-partition root is found"
+grep -q 'vgchange -an' "$HERE/machine-convert.sh" || fail "convert must deactivate the VGs it activated (cleanup)"
+grep -q 'cloud-init.disabled' "$HERE/machine-convert.sh" || fail "convert should disable cloud-init on the migrated image"
+grep -q 'google-guest-agent' "$HERE/machine-convert.sh" || fail "convert should disable the source cloud's agents"
+grep -q '/.autorelabel' "$HERE/machine-convert.sh" || fail "convert should schedule an SELinux relabel for enforcing sources"
+
+# 12) The script must still be syntactically valid.
 bash -n "$HERE/machine-convert.sh" || fail "machine-convert.sh has a syntax error"
 
 echo "ok  machine-convert.sh helpers (ensure_dir_mount, ensure_stage_dir)"

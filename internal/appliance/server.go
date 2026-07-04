@@ -75,7 +75,11 @@ type Server struct {
 	// cutoverCmds:    migrationID -> the Lish copy command the console shows.
 	cutoverStreams sync.Map
 	cutoverCmds    sync.Map
-	ctx            context.Context
+	// cutoverFreezing marks migrations whose guided cutover step 1 (drain +
+	// freeze) is currently running, so the console can tell the operator to keep
+	// the source running until the card says to power it off.
+	cutoverFreezing sync.Map
+	ctx             context.Context
 
 	auditCh chan auditEntry // buffered audit entries -> DB (best-effort)
 }

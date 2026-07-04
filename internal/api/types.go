@@ -314,6 +314,10 @@ type MigrationView struct {
 	// run the image copy in the rescue'd destination's Lish console — the one
 	// line to paste there. Empty at all other times.
 	CutoverCopyCmd string `json:"cutover_copy_cmd,omitempty"`
+	// CutoverFreezing is true while a guided cutover's step 1 (drain the
+	// in-flight pass, freeze the image) is running — the console shows "keep the
+	// source running" until this clears and the state parks in awaiting_cutover.
+	CutoverFreezing bool `json:"cutover_freezing,omitempty"`
 
 	// Gated replication start + pause/resume (computed for the console):
 	//   AgentConnected     — every disk's agent has handshaked recently (tick).
@@ -376,7 +380,13 @@ type FinalizeRequest struct {
 	LaunchInstance bool   `json:"launch_instance"` // also boot a new Linode from the image
 	Region         string `json:"region,omitempty"`
 	Type           string `json:"type,omitempty"`
-	Label          string `json:"label,omitempty"`
+	// Label is the operator's custom name for the launched cutover instance
+	// (sanitized; default "<migration>-cutover" when blank).
+	Label string `json:"label,omitempty"`
+	// VolumeLabel is the operator's custom name for the cutover volume(s)
+	// (volume-boot only; multi-disk migrations get a per-disk suffix; default
+	// "<migration>-cutover" when blank).
+	VolumeLabel string `json:"volume_label,omitempty"`
 
 	// SkipSnapshot cuts over from the current replicated data without asking the
 	// source agent for a crash-consistent point-in-time snapshot first. Safe (and

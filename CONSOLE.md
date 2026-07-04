@@ -397,9 +397,13 @@ local-disk boot):
 
 1. Stop the source's apps/databases and let the **RPO lag drop to ~0** (shown on
    the card), so the frozen copy is current.
-2. Click **Cutover instance**, optionally set a **root password / SSH key** (so
-   you can log into the launched instance via the Lish console), then **Stop
-   replication & continue**. The appliance stops new replication passes, waits
+2. Click **Cutover instance**. In the dialog you can optionally set a **name
+   for the new instance** (both boot methods) and, for volume boot, a **name
+   for the cutover volume** — blank keeps the `<migration>-cutover` default
+   (names are sanitized to Linode's label rules; instances ≤64 chars, volumes
+   ≤32, multi-disk volumes get a `-N` suffix). You can also set a **root
+   password / SSH key** (so you can log into the launched instance via the
+   Lish console). Then click **Stop replication & continue**. The appliance stops new replication passes, waits
    briefly for any pass already in flight to end, and **freezes the copy** as
    the image to launch — crash-consistent (like a power-loss) and repaired with
    `fsck` during the boot conversion. **Delta passes are applied atomically**:
@@ -410,6 +414,12 @@ local-disk boot):
    power the source off cannot damage it. The migration pauses in state
    `awaiting_cutover`. (No read-only remount of the source is attempted, so it
    can't get stuck on a busy root.)
+
+   The card guides the timing: while step 1 runs it shows **"Freezing the
+   image — keep the source server running"** (so the in-flight pass can finish
+   and the image carries your latest changes); once frozen it switches to
+   **"Action needed — power off the source server now"**. Follow the card —
+   there is no need to guess when it is safe.
 3. **Power off the source server**, then click **Launch instance**. The appliance:
    - runs the **machine conversion** on the boot disk so it boots on Linode
      (virtio initramfs, GRUB, fstab, Lish serial console, network reset),
