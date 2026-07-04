@@ -220,6 +220,13 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress,
 		_ = w.Flush()
 		return Stats{}, errConsistentResync
 	}
+	// File-transfer session: write the source's files into the output root
+	// (devicePath is a directory here, not a block device). This is a wholly
+	// separate data path from the block loop below; block sessions never reach it.
+	if hello.Mode == protocol.ModeFile {
+		return handleFileSession(w, r, devicePath, manifestPath, hello, onProgress)
+	}
+
 	log.Printf("receiver: session job=%q source=%q device=%q size=%d block=%d full=%v consistent=%v",
 		hello.JobID, hello.SourceHostname, hello.DevicePath, hello.DeviceSize, hello.BlockSize, hello.FullSync, hello.Consistent)
 
