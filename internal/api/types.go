@@ -218,10 +218,12 @@ type Migration struct {
 	Disks []Disk `json:"disks"`
 
 	// Boot target chosen at create time (see CreateMigrationRequest). For disk
-	// mode PlanClass + LinodeType record the resolved Linode plan.
+	// and file modes PlanClass + LinodeType record the resolved Linode plan.
 	BootTarget string `json:"boot_target,omitempty"`
 	PlanClass  string `json:"plan_class,omitempty"`
 	LinodeType string `json:"linode_type,omitempty"`
+	// OSImage is the destination's Linode image id (file mode only).
+	OSImage string `json:"os_image,omitempty"`
 
 	// ReplicationEnabled is the gate the operator flips with "Start replication":
 	// while false the receiver acknowledges the agent connection but holds (no
@@ -262,20 +264,24 @@ type CreateMigrationRequest struct {
 	SourceDevice   string       `json:"source_device,omitempty"`
 	SourceDiskSize int64        `json:"source_disk_size,omitempty"`
 
-	// Boot target for the launched instance: BootTargetVolume (default) boots
-	// from a Block Storage volume; BootTargetDisk boots from the Linode's local
-	// disk on a plan sized to fit. PlanClass ("shared"|"dedicated") and the
-	// resolved LinodeType apply only to disk mode (LinodeType is computed by the
-	// appliance from PlanClass + total disk size; clients leave it empty).
+	// Boot target / migration method: BootTargetFile (default) copies the source's
+	// files onto a freshly launched destination Linode (only used storage moves);
+	// BootTargetVolume boots a block-for-block copy from a Block Storage volume;
+	// BootTargetDisk boots a block-for-block copy from the Linode's local disk.
+	// PlanClass ("shared"|"dedicated") and the resolved LinodeType size the plan.
 	BootTarget string `json:"boot_target,omitempty"`
 	PlanClass  string `json:"plan_class,omitempty"`
 	LinodeType string `json:"linode_type,omitempty"`
+	// OSImage is the Linode image id for the launched destination in file mode
+	// (e.g. "linode/ubuntu22.04"); ignored by the block methods.
+	OSImage string `json:"os_image,omitempty"`
 }
 
-// Boot targets for a migration's launched instance.
+// Boot targets / migration methods for a migration.
 const (
-	BootTargetVolume = "volume" // boot from a Block Storage volume (default)
-	BootTargetDisk   = "disk"   // boot from the Linode's local (plan) disk
+	BootTargetVolume = "volume" // block copy booting from a Block Storage volume
+	BootTargetDisk   = "disk"   // block copy booting from the Linode's local disk
+	BootTargetFile   = "file"   // file-level copy onto a launched destination (default)
 )
 
 // LinodePlan is one Linode type offered for local-disk boot sizing, surfaced to

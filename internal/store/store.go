@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS migrations (
   boot_target     TEXT NOT NULL DEFAULT 'volume',
   plan_class      TEXT NOT NULL DEFAULT '',
   linode_type     TEXT NOT NULL DEFAULT '',
+  os_image        TEXT NOT NULL DEFAULT '',
   replication_enabled INTEGER NOT NULL DEFAULT 0,
   enrolled_at     INTEGER NOT NULL DEFAULT 0,
   created_at      INTEGER NOT NULL
@@ -199,6 +200,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_migration ON audit_log(migration_id, id);
 		`ALTER TABLE migrations ADD COLUMN replication_enabled INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE migrations ADD COLUMN enrolled_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE migration_disks ADD COLUMN agent_connected_at INTEGER NOT NULL DEFAULT 0`,
+		// File-transfer method: the launched destination's OS image id.
+		`ALTER TABLE migrations ADD COLUMN os_image TEXT NOT NULL DEFAULT ''`,
 	} {
 		_, _ = s.db.Exec(stmt)
 	}

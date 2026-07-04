@@ -246,6 +246,63 @@ func (c *Client) CreateInstance(ctx context.Context, label, region, typ string) 
 	return inst, err
 }
 
+// Image is a deployable Linode OS image.
+type Image struct {
+	ID       string `json:"id"`     // e.g. "linode/ubuntu22.04"
+	Label    string `json:"label"`  // e.g. "Ubuntu 22.04 LTS"
+	Vendor   string `json:"vendor"` // e.g. "Ubuntu"
+	IsPublic bool   `json:"is_public"`
+	Size     int    `json:"size"` // MB
+}
+
+// ListImages returns the OS images available to this account (public
+// distributions plus any private images), paginated.
+func (c *Client) ListImages(ctx context.Context) ([]Image, error) {
+	var out []Image
+	page := 1
+	for {
+		var resp struct {
+			Data  []Image `json:"data"`
+			Page  int     `json:"page"`
+			Pages int     `json:"pages"`
+		}
+		if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/images?page=%d&page_size=100", page), nil, &resp); err != nil {
+			return nil, err
+		}
+		out = append(out, resp.Data...)
+		if resp.Page >= resp.Pages || len(resp.Data) == 0 {
+			break
+		}
+		page++
+	}
+	return out, nil
+}
+
+// CreateInstanceFromImage provisions and boots a Linode from an OS image, with
+// a root password and (optionally) a StackScript that runs on first boot. Used
+// by the file-transfer method to launch the destination the source's files are
+// copied onto. The instance boots immediately (booted:true) so its OS and the
+// first-boot script come up without a separate boot call.
+func (c *Client) CreateInstanceFromImage(ctx context.Context, label, region, typ, image, rootPass string, stackScriptID int64, stackData map[string]string) (Instance, error) {
+	body := map[string]any{
+		"label":     label,
+		"region":    region,
+		"type":      typ,
+		"image":     image,
+		"root_pass": rootPass,
+		"booted":    true,
+	}
+	if stackScriptID != 0 {
+		body["stackscript_id"] = stackScriptID
+		if stackData != nil {
+			body["stackscript_data"] = stackData
+		}
+	}
+	var inst Instance
+	err := c.do(ctx, http.MethodPost, "/linode/instances", body, &inst)
+	return inst, err
+}
+
 // SetWatchdog enables or disables Lassie, the Linode Shutdown Watchdog, which
 // automatically reboots an instance that powers itself off. The disk-boot cutover
 // MUST disable it around the install boot: the in-guest one-shot copies the image
