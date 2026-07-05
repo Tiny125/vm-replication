@@ -181,7 +181,7 @@ func (s *Store) LinodeAccount(ctx context.Context) (string, error) {
 // the migrations table remain for older databases but are no longer read.)
 const migCols = `id, name, state, source_hostname, source_ip, source_device, source_disk_size,
  image_id, launched_id, last_error, assessed_at, migrate_started, migrate_finished,
- boot_target, plan_class, linode_type, replication_enabled, enrolled_at, created_at`
+ boot_target, plan_class, linode_type, os_image, replication_enabled, enrolled_at, created_at`
 
 func scanMigration(row interface{ Scan(...any) error }) (api.Migration, error) {
 	var m api.Migration
@@ -190,7 +190,7 @@ func scanMigration(row interface{ Scan(...any) error }) (api.Migration, error) {
 	var replEnabled int
 	if err := row.Scan(&m.ID, &m.Name, &state, &m.SourceHostname, &m.SourceIP, &m.SourceDevice, &m.SourceDiskSize,
 		&m.ImageID, &m.LaunchedID, &m.LastError, &assessed, &migStart, &migFinish,
-		&m.BootTarget, &m.PlanClass, &m.LinodeType, &replEnabled, &enrolled, &created); err != nil {
+		&m.BootTarget, &m.PlanClass, &m.LinodeType, &m.OSImage, &replEnabled, &enrolled, &created); err != nil {
 		return api.Migration{}, err
 	}
 	m.State = api.MigrationState(state)
@@ -233,10 +233,10 @@ func (s *Store) CreateMigration(ctx context.Context, r api.CreateMigrationReques
 	now := time.Now()
 	res, err := s.db.ExecContext(ctx, `
 INSERT INTO migrations (name, state, source_hostname, source_ip, source_device, source_disk_size,
-  enroll_token, boot_target, plan_class, linode_type, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  enroll_token, boot_target, plan_class, linode_type, os_image, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.Name, string(api.MigCreated), r.SourceHostname, r.SourceIP, devices[0].Device, devices[0].SizeBytes,
-		token, bootTarget, r.PlanClass, r.LinodeType, unix(now))
+		token, bootTarget, r.PlanClass, r.LinodeType, r.OSImage, unix(now))
 	if err != nil {
 		return api.Migration{}, "", err
 	}

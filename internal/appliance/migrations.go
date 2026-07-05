@@ -550,6 +550,14 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 		total += d.SizeBytes
 	}
 	switch req.BootTarget {
+	case api.BootTargetFile:
+		// File-transfer: one source entry sized by USED bytes, a destination OS
+		// image, and a plan whose disk fits used+headroom. No block volume is
+		// provisioned (the data streams to a launched destination).
+		if err := s.validateFileCreate(ctx, &req, total); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	case "", api.BootTargetVolume:
 		req.BootTarget = api.BootTargetVolume
 		// Validate the picked plan exists, when we have a token to check against.
@@ -626,15 +634,21 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		if err := s.provisionDiskStorage(ctx, m, d); err != nil {
-			s.rollbackCreate(ctx, m.ID)
-			writeErr(w, http.StatusInternalServerError, "provision storage: "+err.Error())
-			return
+		// Block methods provision a replication volume per disk here; the file
+		// method streams to a launched destination and provisions none.
+		if provisionsBlockStorage(m.BootTarget) {
+			if err := s.provisionDiskStorage(ctx, m, d); err != nil {
+				s.rollbackCreate(ctx, m.ID)
+				writeErr(w, http.StatusInternalServerError, "provision storage: "+err.Error())
+				return
+			}
 		}
 	}
 
 	_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("migration created with %d disk(s); waiting for the source agent", len(m.Disks)))
-	if m.BootTarget == api.BootTargetDisk {
+	if isFileMethod(m.BootTarget) {
+		_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("method: file transfer — copies used files onto a new %s Linode running %s", m.LinodeType, m.OSImage))
+	} else if m.BootTarget == api.BootTargetDisk {
 		_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("boot target: Linode local disk (%s plan %s)", m.PlanClass, m.LinodeType))
 	} else if m.LinodeType != "" {
 		_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("boot target: separate Block Storage volume; launch plan %s", m.LinodeType))
