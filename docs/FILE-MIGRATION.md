@@ -71,19 +71,38 @@ block methods are untouched (proven by the full test suite staying green).
 
 ---
 
+## How the pieces fit (implementation)
+
+- **Enroll** bakes `-mode file -root /` into the agent's ExecStart.
+- **Start** opens the gate; the agent streams the file tree to the appliance's
+  per-migration file receiver, which stages it under
+  `<datadir>/filemig-<id>-root/` (`handleFileSession`). Delta passes update it.
+- **Cutover** (guided freeze → power off source → complete) runs `finalizeFile`:
+  launches the destination from `os_image` + plan (`CreateInstanceFromImage`),
+  waits for it to boot, then shows a **one-line Lish command** on the card. That
+  command pulls the staged tree as a **token-gated tar** (`/cutover/files.tar`),
+  extracts it over the live root (owners/perms preserved), pings
+  `/cutover/done`, and reboots. The appliance sees the ping and marks the
+  migration **launched**. Reuses the disk-boot token/pin pattern — no
+  per-destination certificates.
+- **Complete → remove agent → Close** is the shared cycle (Close has no volume
+  to delete in file mode).
+
 ## Status
 
-- ✅ **Built + tested (this PR):** additive model (`BootTargetFile`, `os_image`),
-  create-flow branch (no block volume), the full file data path (protocol +
-  agent walk + receiver sink), and the Linode `ListImages` /
-  `CreateInstanceFromImage` primitives. Non-regression proven by the existing
-  suite; the data path proven by `TestFileSessionRoundTrip` and friends.
-- 🔜 **Next slice:** launch-the-destination orchestration at Start (install the
-  file receiver on it, hand the agent its data target), the file **finalize**
-  (final pass + reboot), and the **console** create-card (method selector +
-  OS/used-space helper + OS dropdown) and cutover copy. These involve launching
-  real Linodes and so need live validation, mirroring how the disk-boot rescue
-  flow and cloud-compat work were landed.
+- ✅ **Built:** the full method end to end — additive model, create-flow branch,
+  data path (protocol + agent walk + receiver sink), console method selector
+  (default file) + OS/used-space helper + OS dropdown, appliance staging,
+  destination launch, and tar-delivery cutover.
+- ✅ **Tested (unit + regression):** `TestFileSessionRoundTrip`,
+  `TestFileDelivery` (tar + done ping + token gating), `TestConsoleMigration
+  MethodSelector`, `TestExcludedFromFileCopy`, `TestIsFileMethod`, plus the full
+  existing suite + end-to-end appliance smoke staying green (block methods
+  untouched).
+- 🧪 **Needs live validation:** launching a real destination Linode from an
+  image and the Lish tar-extract + reboot — these touch the Linode API and a
+  real instance, so confirm on a live run (same as how the disk-boot rescue flow
+  was validated). The data path and delivery mechanics are unit-proven.
 
 ---
 

@@ -79,7 +79,9 @@ type Server struct {
 	// freeze) is currently running, so the console can tell the operator to keep
 	// the source running until the card says to power it off.
 	cutoverFreezing sync.Map
-	ctx             context.Context
+	// File-transfer cutover delivery (token -> *fileDelivery); see file_delivery.go.
+	fileDeliveries sync.Map
+	ctx            context.Context
 
 	auditCh chan auditEntry // buffered audit entries -> DB (best-effort)
 }
@@ -136,6 +138,8 @@ func (s *Server) routes() {
 	// instance downloading these has no console session).
 	s.mux.HandleFunc("GET /cutover/copy.sh", s.handleCutoverScript)
 	s.mux.HandleFunc("GET /cutover/image", s.handleCutoverImage)
+	s.mux.HandleFunc("GET /cutover/files.tar", s.handleCutoverTar)
+	s.mux.HandleFunc("GET /cutover/done", s.handleCutoverDone)
 
 	// Console API (session-protected).
 	s.mux.Handle("GET /api/v1/session", s.auth(s.handleSession))

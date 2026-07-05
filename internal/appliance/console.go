@@ -601,6 +601,7 @@ function rpoText(v,m){
 async function startMig(id,btn){
   const meta=migMeta[id]||{};
   const disk=meta.boot_target==='disk';
+  const file=meta.boot_target==='file';
   const planNote=meta.linode_type?(' on plan <b>'+esc(meta.linode_type)+'</b>'):'';
   const access='<div class="muted" style="font-size:12px;margin-top:10px">Migrated disks keep the <b>source</b>’s logins, and cloud images usually leave root locked — so set a root password (and/or SSH key) below to reach the new instance via the Lish console without rescue mode.</div>';
   // Guided cutover, two steps with a power-off in between (same for volume- and
@@ -611,7 +612,7 @@ async function startMig(id,btn){
   const how='<div style="margin-bottom:8px"><b>Cutover has 3 steps:</b>'+
     '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> stop replication and freeze the current replicated copy as the image.</div>'+
     '<div style="margin-top:4px"><b>Step 2:</b> power off the source server.</div>'+
-    '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('launches a new Linode'+planNote+' from the frozen image.'):'clones every disk into launchable volumes.'))+'</div></div>';
+    '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(file?('launches a new Linode'+planNote+' running '+esc(meta.os_image||'the chosen OS')+' and shows a one-line command on this card; paste it in the destination’s Lish console to copy your files onto it and reboot. The appliance then marks it complete.'):disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('launches a new Linode'+planNote+' from the frozen image.'):'clones every disk into launchable volumes.'))+'</div></div>';
   const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the frozen copy is current. The image is crash-consistent and repaired with fsck on convert — no LVM or read-only remount needed.</div>';
   // Optional names for what the cutover creates: the instance (both methods)
   // and, for volume boot, the cutover volume. Blank keeps <name>-cutover.
@@ -920,7 +921,7 @@ function cleanupCard(id){
 function dismissCleanup(id){delete pendingCleanup[id];const c=$('mig'+id);if(c)c.remove();}
 function migCard(v){
   const m=v.migration;const err=anyDiskError(m);
-  migMeta[m.id]={uninstall:v.uninstall_cmd||'',source:m.source_hostname||'',name:m.name,boot_target:m.boot_target,plan_class:m.plan_class,linode_type:m.linode_type};
+  migMeta[m.id]={uninstall:v.uninstall_cmd||'',source:m.source_hostname||'',name:m.name,boot_target:m.boot_target,plan_class:m.plan_class,linode_type:m.linode_type,os_image:m.os_image};
   const collapsed=collapsedMigs.has(m.id);
   const firstSeen=!seenMigs.has(m.id);seenMigs.add(m.id);
 
@@ -973,14 +974,15 @@ function migCard(v){
   // console (the command streams the image onto the local disk and powers the
   // instance off; the appliance finishes automatically from there).
   if(m.state==='migrating' && v.cutover_copy_cmd){
+    const isFile=m.boot_target==='file';
     b+='<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05">'+
-      '<b>Action needed — copy the image onto the local disk.</b>'+
+      '<b>Action needed — '+(isFile?'copy your files onto the destination.':'copy the image onto the local disk.')+'</b>'+
       '<div style="margin-top:6px">1. Make sure the <b>source server is powered off</b>.</div>'+
-      '<div style="margin-top:4px">2. Open the cutover instance’s <b>Lish console</b>'+(m.launched_linode_id?(' — <a href="https://cloud.linode.com/linodes/'+m.launched_linode_id+'/lish/weblish" target="_blank" rel="noopener">open Weblish</a>'):'')+' (it is booted in Rescue Mode).</div>'+
+      '<div style="margin-top:4px">2. Open the '+(isFile?'destination':'cutover')+' instance’s <b>Lish console</b>'+(m.launched_linode_id?(' — <a href="https://cloud.linode.com/linodes/'+m.launched_linode_id+'/lish/weblish" target="_blank" rel="noopener">open Weblish</a>'):'')+(isFile?' (log in as root).':' (it is booted in Rescue Mode).')+'</div>'+
       '<div style="margin-top:4px">3. Paste this one line there:</div>'+
       '<div style="display:flex;gap:8px;align-items:flex-start;margin-top:6px"><pre id="cutcmd'+m.id+'" style="flex:1;margin:0">'+esc(v.cutover_copy_cmd)+'</pre>'+
       '<button onclick="copyText(document.getElementById(\'cutcmd'+m.id+'\').textContent,this)">Copy</button></div>'+
-      '<div style="font-size:12px;margin-top:6px">The copy shows live progress in the Lish session and powers the instance off when it finishes — the appliance then boots your server from its local disk automatically. Nothing else to click here.</div></div>';
+      '<div style="font-size:12px;margin-top:6px">'+(isFile?'It copies your files onto the destination and reboots it — the appliance then marks the migration complete automatically. Nothing else to click here.':'The copy shows live progress in the Lish session and powers the instance off when it finishes — the appliance then boots your server from its local disk automatically. Nothing else to click here.')+'</div></div>';
   }
 
   // Two groups: pre-migration (environment readiness while replicating) and

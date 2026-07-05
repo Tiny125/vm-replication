@@ -63,9 +63,16 @@ func (s *Server) handleAgentInstaller(w http.ResponseWriter, r *http.Request) {
 		// grub>). The token never repeats, so a new migration always full-syncs.
 		tok := enrollJobID(token)
 		manifest := fmt.Sprintf("/var/lib/vmrepl-source-%s-disk%d.cbt", tok, d.Index)
-		fmt.Fprintf(&checks, "[ -e %q ] || { echo \"source device %s not found — re-check the device in the console\"; exit 1; }\n", d.SourceDevice, d.SourceDevice)
 		// -job ties every session to THIS enrollment: the receiver refuses any
 		// other job id, so stale agents from old enrollments can't write here.
+		if isFileMethod(m.BootTarget) {
+			// File transfer: copy the source's filesystem from '/' (only used
+			// storage), no block device. One agent invocation for the whole tree.
+			fmt.Fprintf(&execs, "ExecStart=$BIN -mode file -root / -target %s -server-name $SERVER_NAME -job %s -manifest %s -cert $ETC/agent.crt -key $ETC/agent.key -ca $ETC/ca.crt\n",
+				target, tok, manifest)
+			continue
+		}
+		fmt.Fprintf(&checks, "[ -e %q ] || { echo \"source device %s not found — re-check the device in the console\"; exit 1; }\n", d.SourceDevice, d.SourceDevice)
 		fmt.Fprintf(&execs, "ExecStart=$BIN -device %s -target %s -server-name $SERVER_NAME -job %s -manifest %s -cert $ETC/agent.crt -key $ETC/agent.key -ca $ETC/ca.crt -cutover-quiesce=remountro\n",
 			d.SourceDevice, target, tok, manifest)
 	}

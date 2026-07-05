@@ -2,9 +2,12 @@ package appliance
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -29,10 +32,21 @@ import (
 // ---- per-disk paths ----
 
 func (s *Server) diskDevicePath(m api.Migration, d api.Disk) string {
+	// File transfer: the receiver writes the source's file TREE into a staging
+	// directory (handleFileSession), not a block device/image.
+	if isFileMethod(m.BootTarget) {
+		return s.fileStageRoot(m)
+	}
 	if d.VolumeDevice != "" {
 		return d.VolumeDevice
 	}
 	return filepath.Join(s.cfg.DataDir, fmt.Sprintf("migration-%d-disk%d.img", m.ID, d.Index))
+}
+
+// fileStageRoot is where a file-transfer migration's copied tree is staged on
+// the appliance before it is delivered to the launched destination at cutover.
+func (s *Server) fileStageRoot(m api.Migration) string {
+	return filepath.Join(s.cfg.DataDir, fmt.Sprintf("filemig-%d-root", m.ID))
 }
 
 func (s *Server) diskManifestPath(m api.Migration, d api.Disk) string {
@@ -1157,6 +1171,8 @@ func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration,
 			} else {
 				log.Printf("appliance: migration %d: replication volume %d detached and kept for reference", m.ID, d.VolumeID)
 			}
+		} else if isFileMethod(m.BootTarget) {
+			_ = os.RemoveAll(s.diskDevicePath(m, d)) // the file-staging tree
 		} else {
 			_ = os.Remove(s.diskDevicePath(m, d))
 		}
@@ -1266,6 +1282,14 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 	}()
 	canceled := func() bool { return ctx.Err() != nil }
 	sctx := s.ctx
+
+	// File transfer: no block conversion/clone — launch the destination from the
+	// chosen OS image and deliver the staged file tree onto it. Wholly separate
+	// from the block finalize below.
+	if isFileMethod(m.BootTarget) {
+		s.finalizeFile(ctx, m, req)
+		return
+	}
 
 	boot := m.Disks[0]
 	bootDevice := s.diskDevicePath(m, boot)
@@ -1760,6 +1784,117 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
 	_ = s.st.SetMigrateFinished(sctx, m.ID)
 	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %q (id %d) is booting from its local disk on plan %s", instLabel, inst.ID, m.LinodeType))
+}
+
+// finalizeFile cuts over a FILE-transfer migration: launch the destination from
+// the chosen OS image + plan, then have the operator paste one command in its
+// Lish console that pulls the staged file tree from the appliance, extracts it
+// over the live root, pings done, and reboots. No block conversion or volumes.
+func (s *Server) finalizeFile(ctx context.Context, m api.Migration, req api.FinalizeRequest) {
+	sctx := s.ctx
+	canceled := func() bool { return ctx.Err() != nil }
+	stageRoot := s.fileStageRoot(m)
+
+	cl, ok := s.linodeClient(sctx)
+	if !ok || s.cfg.ApplianceLinodeID == 0 {
+		_ = s.st.SetMigrationState(sctx, m.ID, api.MigImageReady,
+			"Linode automation not configured; the copied files are staged on the appliance at "+stageRoot)
+		_ = s.st.SetMigrateFinished(sctx, m.ID)
+		return
+	}
+	s.cleanupCutoverArtifacts(sctx, m) // retry-safe
+
+	label := cutoverInstanceLabel(req.Label, m.Name)
+	region := s.cfg.Region
+	if inst, err := cl.GetInstance(ctx, s.cfg.ApplianceLinodeID); err == nil && inst.Region != "" {
+		region = inst.Region
+	}
+	// Root access: use the operator's password if given, else generate a strong
+	// one (never logged). The image also seeds the operator's SSH key if provided.
+	rootPass := req.RootPassword
+	generated := false
+	if rootPass == "" {
+		rootPass = randPassword()
+		generated = true
+	}
+	inst, err := cl.CreateInstanceFromImage(ctx, label, region, m.LinodeType, m.OSImage, rootPass, 0, nil)
+	if canceled() {
+		return
+	}
+	if err != nil {
+		s.fail(m.ID, "launch destination: "+err.Error())
+		return
+	}
+	_ = s.st.SetMigrationImage(sctx, m.ID, "file:"+stageRoot, inst.ID)
+	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("launched destination %q (id %d) from image %s on plan %s", label, inst.ID, m.OSImage, m.LinodeType))
+	if generated {
+		_ = s.st.AddEvent(sctx, m.ID, "warn", "a temporary root password was set on the destination and NOT logged — reset it in Cloud Manager (or use your SSH key) to log in. Tip: set a root password / SSH key in the cutover dialog to control it.")
+	}
+	if req.SSHAuthorizedKey != "" {
+		_ = s.st.AddEvent(sctx, m.ID, "info", "note: seed the SSH key on the destination after boot (image launch does not install it automatically)")
+	}
+	if err := cl.WaitInstanceStatus(ctx, inst.ID, "running", 10*time.Minute); err != nil {
+		if canceled() {
+			return
+		}
+		s.fail(m.ID, "destination did not boot: "+err.Error())
+		return
+	}
+
+	// Authorize the tar download + done ping, and show the operator the one-line
+	// copy command on the card.
+	budget := diskCopyTimeout(dirSize(stageRoot))
+	tok, done := s.registerFileDelivery(m.ID, stageRoot, budget+time.Hour)
+	defer s.dropFileDelivery(m.ID)
+	defer s.setCutoverCopyCmd(m.ID, "")
+	s.setCutoverCopyCmd(m.ID, s.fileCopyCmd(tok))
+	_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf("ACTION NEEDED — destination %q (id %d) is up. Open its Lish console (Cloud Manager -> Linodes -> %s -> Launch LISH Console) and paste the copy command shown on this card. It copies your files onto it and reboots; the appliance finishes automatically.", label, inst.ID, label))
+
+	// Wait for the destination to report the extract finished (it pings /cutover/done).
+	waitStart := time.Now()
+	for {
+		select {
+		case <-done:
+			s.dropFileDelivery(m.ID)
+			s.setCutoverCopyCmd(m.ID, "")
+			_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
+			_ = s.st.SetMigrateFinished(sctx, m.ID)
+			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: files copied onto destination %q (id %d); it is rebooting into your migrated system", label, inst.ID))
+			return
+		case <-time.After(15 * time.Minute):
+			if canceled() {
+				return
+			}
+			if time.Since(waitStart) >= budget {
+				s.fail(m.ID, fmt.Sprintf("the file copy did not finish within %s (no completion from the destination). Open the destination's Lish console: if the copy command wasn't run, click Retry cutover and paste the fresh command; if it's still copying, let it finish and reboot, then Retry. Last known state: waiting for /cutover/done.", budget.Round(time.Minute)))
+				return
+			}
+			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: waiting for the file copy on the destination to finish (%s elapsed of up to %s) — paste the copy command from this card into its Lish console if you haven't", time.Since(waitStart).Round(time.Minute), budget.Round(time.Minute)))
+		}
+	}
+}
+
+// dirSize returns the total bytes of regular files under root (for the copy
+// budget); 0 if it can't be walked.
+func dirSize(root string) int64 {
+	var total int64
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			if info, e := d.Info(); e == nil {
+				total += info.Size()
+			}
+		}
+		return nil
+	})
+	return total
+}
+
+// randPassword returns a strong random password for a launched destination when
+// the operator didn't supply one. It is never logged.
+func randPassword() string {
+	b := make([]byte, 18)
+	_, _ = rand.Read(b)
+	return "Vmr-" + base64.RawURLEncoding.EncodeToString(b)
 }
 
 // cleanupCutoverArtifacts deletes the Linode instance and cloned volumes created
