@@ -697,6 +697,30 @@ func (s *Server) handleLinodePlans(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"plans": plans})
 }
 
+// handleLinodeImages returns the deployable public OS images (grouped by vendor
+// client-side), for the file-transfer method's destination OS dropdown.
+func (s *Server) handleLinodeImages(w http.ResponseWriter, r *http.Request) {
+	cl, ok := s.linodeClient(r.Context())
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "add a valid Linode API token in Settings to load OS images")
+		return
+	}
+	images, err := cl.ListImages(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "could not load Linode images: "+err.Error())
+		return
+	}
+	// Only public distribution images make sense as a fresh destination OS.
+	out := []map[string]any{}
+	for _, im := range images {
+		if !im.IsPublic {
+			continue
+		}
+		out = append(out, map[string]any{"id": im.ID, "label": im.Label, "vendor": im.Vendor})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"images": out})
+}
+
 // provisionDiskStorage creates and attaches a Linode volume for one disk when
 // automation is configured; otherwise it's a no-op (file fallback).
 func (s *Server) provisionDiskStorage(ctx context.Context, m api.Migration, d api.Disk) error {
