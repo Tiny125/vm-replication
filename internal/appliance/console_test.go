@@ -88,6 +88,42 @@ func TestConsoleCutoverNamingFields(t *testing.T) {
 	}
 }
 
+// The create card must offer all three methods from ONE selector, defaulting to
+// file transfer, and file mode must expose the OS-image dropdown + used-storage
+// field and post boot_target:'file' with os_image.
+func TestConsoleMigrationMethodSelector(t *testing.T) {
+	for _, want := range []string{
+		`id="m_method"`,         // single method selector
+		`value="file"`,          // file option
+		`value="volume"`,        // block volume option
+		`value="disk"`,          // block disk option
+		"m_osimage",             // destination OS image dropdown
+		"m_used",                // used-storage input (file mode)
+		"boot_target:mth",       // create posts the chosen method
+		"os_image:",             // create posts the OS image
+		"/api/v1/linode/images", // images are loaded for the dropdown
+		"loadImages",            // image loader
+	} {
+		if !strings.Contains(consoleHTML, want) {
+			t.Errorf("create card should support the method selector (missing %q)", want)
+		}
+	}
+	// File must be the default selected option (its <option> carries selected).
+	if !strings.Contains(consoleHTML, `value="file" selected`) {
+		t.Error("file transfer must be the default selected method")
+	}
+}
+
+// The source-details helper command must also report the OS and used storage so
+// the operator can size the plan by used data and match the destination OS.
+func TestConsoleSourceHelperReportsOSAndUsed(t *testing.T) {
+	for _, want := range []string{"os-release", "Used"} {
+		if !strings.Contains(consoleHTML, want) {
+			t.Errorf("source-details helper should report %q", want)
+		}
+	}
+}
+
 // extractJSFunc returns the source of the embedded-JS function that begins with
 // header, up to the next top-level (column-0) "function"/"async function"
 // declaration — enough to assert what a given function contains.

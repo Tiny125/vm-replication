@@ -212,12 +212,12 @@ const consoleHTML = `<!DOCTYPE html>
       <details>
         <summary>How do I find the source details?</summary>
         <div>
-          <div class="muted" style="font-size:13px;margin-bottom:8px">Run this on your <b>source server</b> — it prints the hostname, its reachable IP, and every whole disk (add a row per disk):</div>
+          <div class="muted" style="font-size:13px;margin-bottom:8px">Run this on your <b>source server</b> — it prints the hostname, reachable IP, <b>OS</b>, <b>used storage</b>, and every whole disk:</div>
           <div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:8px">
-            <pre id="srcCmd" style="flex:1;margin:0">echo "Hostname : $(hostname)"; echo "IP       : $(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')"; lsblk -b -d -n -o NAME,SIZE,TYPE | awk '$3=="disk"{printf "Device   : /dev/%s\nSize(GB) : %d\n", $1, ($2+1073741823)/1073741824}'</pre>
+            <pre id="srcCmd" style="flex:1;margin:0">echo "Hostname : $(hostname)"; echo "IP       : $(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')"; ( . /etc/os-release 2>/dev/null; echo "OS       : ${PRETTY_NAME:-unknown}" ); echo "Used(GB) : $(df -B1 --total -x tmpfs -x devtmpfs -x overlay 2>/dev/null | awk '/^total/{printf "%d", ($3+1073741823)/1073741824}')"; lsblk -b -d -n -o NAME,SIZE,TYPE | awk '$3=="disk"{printf "Device   : /dev/%s\nSize(GB) : %d\n", $1, ($2+1073741823)/1073741824}'</pre>
             <button onclick="copyText(document.getElementById('srcCmd').textContent,this)">Copy</button>
           </div>
-          <div class="muted" style="font-size:12px">Use the printed <b>IP</b> below (it must pass the connection test). Add <b>one row per whole disk</b> (e.g. <code style="display:inline;padding:1px 5px">/dev/sda</code>). The disk with the root filesystem <code style="display:inline;padding:1px 5px">/</code> is the <b>boot disk</b> — put it first. Round sizes up.</div>
+          <div class="muted" style="font-size:12px"><b>File transfer</b> (default): use the printed <b>OS</b> to pick the destination image and <b>Used(GB)</b> to size the plan. <b>Block methods</b>: add <b>one row per whole disk</b> (e.g. <code style="display:inline;padding:1px 5px">/dev/sda</code>); the disk with the root filesystem <code style="display:inline;padding:1px 5px">/</code> is the boot disk — put it first. Round sizes up.</div>
         </div>
       </details>
       <div class="row">
@@ -226,21 +226,34 @@ const consoleHTML = `<!DOCTYPE html>
       </div>
       <label style="margin-top:12px">Source IP address</label>
       <input id="m_ip" placeholder="e.g. 172.236.148.63">
-      <label style="margin-top:12px">Source disks (first = boot disk)</label>
-      <div id="disks"></div>
-      <div style="margin-top:8px"><button onclick="addDisk()">+ Add disk</button></div>
-
-      <label style="margin-top:14px">Boot target</label>
+      <label style="margin-top:14px">Migration method</label>
       <div class="row">
-        <div><select id="m_boot" onchange="bootTargetChanged()">
-          <option value="volume">Separate Block Storage volume (default)</option>
-          <option value="disk">Linode local disk (NVMe)</option>
+        <div><select id="m_method" onchange="methodChanged()">
+          <option value="file" selected>File transfer — copy used files to a new Linode (default)</option>
+          <option value="volume">Block: separate Block Storage volume</option>
+          <option value="disk">Block: Linode local disk (NVMe)</option>
         </select></div>
         <div><select id="m_planclass" onchange="reloadPlanOptions()">
           <option value="shared">Shared CPU</option>
           <option value="dedicated">Dedicated CPU</option>
         </select></div>
       </div>
+
+      <!-- File transfer: destination OS + used storage -->
+      <div id="fileFields">
+        <label style="margin-top:10px">Destination OS image</label>
+        <select id="m_osimage"></select>
+        <label style="margin-top:10px">Used storage on the source (GB)</label>
+        <input id="m_used" type="number" min="1" placeholder="from the command above — Used(GB)" oninput="reloadPlanOptions()">
+      </div>
+
+      <!-- Block methods: per-disk rows -->
+      <div id="diskFields">
+        <label style="margin-top:12px">Source disks (first = boot disk)</label>
+        <div id="disks"></div>
+        <div style="margin-top:8px"><button onclick="addDisk()">+ Add disk</button></div>
+      </div>
+
       <label style="margin-top:10px">Linode plan</label>
       <select id="m_plan" onchange="updatePlanInfo()"></select>
       <div id="m_plan_help" class="muted" style="font-size:12px;margin-top:6px"></div>
@@ -457,27 +470,38 @@ async function loadPlans(){
 function validHostname(h){return !!h&&h.length<=253&&/^[A-Za-z0-9.-]+$/.test(h)&&h[0]!=='-';}
 function totalDiskGB(){let g=0;document.querySelectorAll('#disks .d_size').forEach(i=>{const v=parseInt(i.value,10);if(v>0)g+=v;});return g;}
 function diskSizeChanged(){reloadPlanOptions();}
-function bootTargetChanged(){
-  const disk=$('m_boot').value==='disk';
-  $('m_boot_help').innerHTML=disk
-    ? 'Boots from the Linode’s <b>local NVMe disk</b> — faster, and no separate volume cost. Pick a plan whose disk fits your data; region follows the appliance.'
-    : 'Boots from a <b>Block Storage volume</b> sized to your data and attached to the chosen plan. The volume is billed separately (~$0.10/GB-month) on top of the plan.';
+// method returns the selected migration method ('file'|'volume'|'disk').
+function method(){return $('m_method')?$('m_method').value:'file';}
+// sizeGBForPlan returns the GB the plan must fit: used storage (file) or the
+// summed disk sizes (block).
+function sizeGBForPlan(){return method()==='file'?(parseInt($('m_used')&&$('m_used').value,10)||0):totalDiskGB();}
+// methodChanged toggles the per-method fields and reloads the plan list.
+function methodChanged(){
+  const m=method(), file=m==='file';
+  if($('fileFields'))$('fileFields').classList.toggle('hide',!file);
+  if($('diskFields'))$('diskFields').classList.toggle('hide',file);
+  $('m_boot_help').innerHTML=
+    file ? 'Copies the source’s <b>used files</b> onto a brand-new Linode running the OS image you pick — only used storage moves, so pick a small plan by <b>used</b> size. No block-layout concerns; the destination is a normal Linode.'
+    : m==='disk' ? 'Boots a block-for-block copy from the Linode’s <b>local NVMe disk</b> — faster, no separate volume cost. Pick a plan whose disk fits your data.'
+    : 'Boots a block-for-block copy from a <b>Block Storage volume</b> sized to your data. The volume is billed separately (~$0.10/GB-month) on top of the plan.';
+  if(file)loadImages();
   reloadPlanOptions();
 }
-// Populate the plan dropdown from the chosen class + boot target. In disk mode
-// only plans whose local disk fits the data are offered; the default selection
-// is the closest fit. The user's explicit choice is preserved across refreshes.
+// Populate the plan dropdown from the chosen class + method. File and disk modes
+// require a plan whose local disk fits the data (used or disk sizes); the default
+// selection is the closest fit. The user's explicit choice is preserved.
 async function reloadPlanOptions(){
   const sel=$('m_plan'); if(!sel)return;
-  const cls=$('m_planclass').value, disk=$('m_boot').value==='disk', gb=totalDiskGB();
+  const cls=$('m_planclass').value, m=method(), needFit=(m==='disk'||m==='file'), gb=sizeGBForPlan();
+  const fitGB=m==='file'?Math.ceil(gb*1.3):gb; // file mode leaves OS+growth headroom
   let plans;
   try{plans=await loadPlans();}
   catch(e){sel.innerHTML='<option value="">add a Linode token in Settings to load plans</option>';$('m_plan_help').innerHTML='';return;}
   let list=plans.filter(p=>p.class===cls);
-  if(disk)list=list.filter(p=>p.disk_gb>=gb);
+  if(needFit)list=list.filter(p=>p.disk_gb>=fitGB);
   list.sort((a,b)=>a.disk_gb-b.disk_gb||a.price_monthly-b.price_monthly);
-  if(!list.length){sel.innerHTML='<option value="">'+(disk?('no '+cls+' plan has a disk ≥ '+gb+' GB'):('no '+cls+' plans available'))+'</option>';updatePlanInfo();return;}
-  const def=(list.find(p=>p.disk_gb>=gb)||list[0]).id, prev=sel.value;
+  if(!list.length){sel.innerHTML='<option value="">'+(needFit?('no '+cls+' plan has a disk ≥ '+fitGB+' GB'):('no '+cls+' plans available'))+'</option>';updatePlanInfo();return;}
+  const def=(list.find(p=>p.disk_gb>=fitGB)||list[0]).id, prev=sel.value;
   sel.innerHTML=list.map(p=>'<option value="'+p.id+'">'+esc(p.label)+' — '+p.vcpus+' vCPU, '+(p.memory_mb/1024)+' GB, '+p.disk_gb+' GB disk ($'+p.price_monthly+'/mo)</option>').join('');
   sel.value=(prev&&list.some(p=>p.id===prev))?prev:def;
   updatePlanInfo();
@@ -487,11 +511,26 @@ function updatePlanInfo(){
   const p=(_plansCache||[]).find(x=>x.id===sel.value);
   if(!p){help.innerHTML='';return;}
   let h='Instance: <b>'+esc(p.label)+'</b> — '+p.vcpus+' vCPU, '+(p.memory_mb/1024)+' GB RAM (~$'+p.price_monthly+'/mo).';
-  if($('m_boot').value!=='disk'){
+  if(method()==='volume'){
     const gb=totalDiskGB(), vol=gb*0.10;
     h+=' Block Storage volume'+(gb>0?(' ('+gb+' GB)'):'')+': ~$'+vol.toFixed(2)+'/mo'+(gb>0?'':' — enter disk size(s)')+'. <b>Est. total ~$'+(p.price_monthly+vol).toFixed(2)+'/mo.</b>';
+  }else if(method()==='file'){
+    h+=' <b>File transfer</b>: no separate volume — the destination’s own disk holds your copied files.';
   }
   help.innerHTML=h;
+}
+// loadImages fills the destination OS dropdown, grouped by vendor, once.
+let _imagesLoaded=false;
+async function loadImages(){
+  const sel=$('m_osimage'); if(!sel||_imagesLoaded)return;
+  try{
+    const r=await api('GET','/api/v1/linode/images');
+    const imgs=(r&&r.images)||[];
+    if(!imgs.length){sel.innerHTML='<option value="">add a Linode token in Settings to load OS images</option>';return;}
+    imgs.sort((a,b)=>(a.vendor||'').localeCompare(b.vendor||'')||(a.label||'').localeCompare(b.label||''));
+    sel.innerHTML=imgs.map(i=>'<option value="'+esc(i.id)+'">'+esc(i.label||i.id)+'</option>').join('');
+    _imagesLoaded=true;
+  }catch(e){sel.innerHTML='<option value="">add a Linode token in Settings to load OS images</option>';}
 }
 // IP addresses that passed the in-form connection test; only these may be used
 // to create a migration.
@@ -511,22 +550,34 @@ async function createMig(btn){
   if(!validHostname(host)){$('createErr').textContent='“'+host+'” is not a valid hostname (letters, digits, dots and hyphens only — no spaces). Fix it and try again.';return}
   if(!ip){$('createErr').textContent='Enter the source IP address.';return}
   if(!validIP(ip)){$('createErr').textContent='“'+ip+'” is not a valid IP address (e.g. 172.236.148.63).';return}
-  const rows=document.querySelectorAll('#disks .row');const devices=[];
-  for(const r of rows){const dev=r.querySelector('.d_dev').value.trim();const gbRaw=r.querySelector('.d_size').value.trim();const gb=parseInt(gbRaw,10);
-    if(!dev||!gbRaw){$('createErr').textContent='Fill in every disk row (device path and size) or remove the empty one before creating.';return}
-    if(!gb||gb<=0){$('createErr').textContent='Each disk needs a positive size (GB): '+dev;return}
-    devices.push({device:dev,size_bytes:gb*1073741824});}
-  if(!devices.length){$('createErr').textContent='Add at least one disk';return}
-  const bootTarget=$('m_boot').value, planClass=$('m_planclass').value, planType=$('m_plan').value;
+  const mth=method(), planClass=$('m_planclass').value, planType=$('m_plan').value;
+  const devices=[];let osImage='';
+  if(mth==='file'){
+    // File transfer: one synthetic "whole filesystem" entry sized by USED bytes,
+    // plus the destination OS image.
+    const used=parseInt($('m_used').value,10);
+    if(!used||used<=0){$('createErr').textContent='Enter the source’s used storage in GB (from the command above — Used(GB)).';return}
+    osImage=$('m_osimage').value;
+    if(!osImage){$('createErr').textContent='Pick the destination OS image (match it to the source’s OS).';return}
+    devices.push({device:'/',size_bytes:used*1073741824});
+  }else{
+    const rows=document.querySelectorAll('#disks .row');
+    for(const r of rows){const dev=r.querySelector('.d_dev').value.trim();const gbRaw=r.querySelector('.d_size').value.trim();const gb=parseInt(gbRaw,10);
+      if(!dev||!gbRaw){$('createErr').textContent='Fill in every disk row (device path and size) or remove the empty one before creating.';return}
+      if(!gb||gb<=0){$('createErr').textContent='Each disk needs a positive size (GB): '+dev;return}
+      devices.push({device:dev,size_bytes:gb*1073741824});}
+    if(!devices.length){$('createErr').textContent='Add at least one disk';return}
+  }
   busy(btn,true);
   // Show a loading placeholder at the BOTTOM of the list while provisioning runs
   // (new migrations are appended, newest last).
-  $('migs').insertAdjacentHTML('beforeend','<div id="creating" class="mig"><div class="center"><div class="spinner"></div><div>Creating migration & provisioning volume(s)…</div></div></div>');
+  $('migs').insertAdjacentHTML('beforeend','<div id="creating" class="mig"><div class="center"><div class="spinner"></div><div>Creating migration…</div></div></div>');
   $('creating').scrollIntoView({behavior:'smooth',block:'center'});
   try{
-    await api('POST','/api/v1/migrations',{name:name,source_hostname:host,source_ip:ip,devices:devices,boot_target:bootTarget,plan_class:planClass,linode_type:planType});
+    await api('POST','/api/v1/migrations',{name:name,source_hostname:host,source_ip:ip,devices:devices,boot_target:mth,plan_class:planClass,linode_type:planType,os_image:osImage});
     $('m_name').value=$('m_host').value=$('m_ip').value='';
-    $('disks').innerHTML='';diskSeq=0;addDisk();$('m_boot').value='volume';bootTargetChanged();
+    if($('m_used'))$('m_used').value='';
+    $('disks').innerHTML='';diskSeq=0;addDisk();$('m_method').value='file';methodChanged();
     await refresh(true);
     const last=$('migs').lastElementChild;if(last)last.scrollIntoView({behavior:'smooth',block:'center'});
     toast('Migration "'+name+'" created — enroll the source agent to start replicating','ok');
@@ -550,6 +601,7 @@ function rpoText(v,m){
 async function startMig(id,btn){
   const meta=migMeta[id]||{};
   const disk=meta.boot_target==='disk';
+  const file=meta.boot_target==='file';
   const planNote=meta.linode_type?(' on plan <b>'+esc(meta.linode_type)+'</b>'):'';
   const access='<div class="muted" style="font-size:12px;margin-top:10px">Migrated disks keep the <b>source</b>’s logins, and cloud images usually leave root locked — so set a root password (and/or SSH key) below to reach the new instance via the Lish console without rescue mode.</div>';
   // Guided cutover, two steps with a power-off in between (same for volume- and
@@ -560,7 +612,7 @@ async function startMig(id,btn){
   const how='<div style="margin-bottom:8px"><b>Cutover has 3 steps:</b>'+
     '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> stop replication and freeze the current replicated copy as the image.</div>'+
     '<div style="margin-top:4px"><b>Step 2:</b> power off the source server.</div>'+
-    '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('launches a new Linode'+planNote+' from the frozen image.'):'clones every disk into launchable volumes.'))+'</div></div>';
+    '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(file?('launches a new Linode'+planNote+' running '+esc(meta.os_image||'the chosen OS')+' and shows a one-line command on this card; paste it in the destination’s Lish console to copy your files onto it and reboot. The appliance then marks it complete.'):disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('launches a new Linode'+planNote+' from the frozen image.'):'clones every disk into launchable volumes.'))+'</div></div>';
   const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the frozen copy is current. The image is crash-consistent and repaired with fsck on convert — no LVM or read-only remount needed.</div>';
   // Optional names for what the cutover creates: the instance (both methods)
   // and, for volume boot, the cutover volume. Blank keeps <name>-cutover.
@@ -869,7 +921,7 @@ function cleanupCard(id){
 function dismissCleanup(id){delete pendingCleanup[id];const c=$('mig'+id);if(c)c.remove();}
 function migCard(v){
   const m=v.migration;const err=anyDiskError(m);
-  migMeta[m.id]={uninstall:v.uninstall_cmd||'',source:m.source_hostname||'',name:m.name,boot_target:m.boot_target,plan_class:m.plan_class,linode_type:m.linode_type};
+  migMeta[m.id]={uninstall:v.uninstall_cmd||'',source:m.source_hostname||'',name:m.name,boot_target:m.boot_target,plan_class:m.plan_class,linode_type:m.linode_type,os_image:m.os_image};
   const collapsed=collapsedMigs.has(m.id);
   const firstSeen=!seenMigs.has(m.id);seenMigs.add(m.id);
 
@@ -885,9 +937,11 @@ function migCard(v){
     h+='<div class="banner" style="border-color:#bfe3cd;background:#eaf7ef;color:#0f5c30;margin:0 0 10px;font-size:14px;font-weight:600">✓ Migration complete<span style="font-weight:400"> — your server is migrated and running on Linode.</span></div>';
   }
 
-  // Boot-mode header banner: distinct colours so the mode is obvious at a glance
-  // (green = Linode local disk, blue = separate Block Storage volume).
-  h+=(m.boot_target==='disk')
+  // Method header banner: distinct colours so the method is obvious at a glance
+  // (amber = file transfer, green = local disk, blue = separate volume).
+  h+=(m.boot_target==='file')
+    ? '<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05;margin:0 0 10px"><b>File transfer</b>'+((m.linode_type)?(' — new '+esc(m.linode_type)+' Linode'+(m.os_image?(' running '+esc(m.os_image)):'')):'')+'</div>'
+    : (m.boot_target==='disk')
     ? '<div class="banner" style="border-color:#cde8d8;background:#f1faf4;color:#0f5c30;margin:0 0 10px"><b>Boot: Linode local disk</b>'+((m.linode_type)?(' — '+esc((m.plan_class||'')+' plan '+m.linode_type)):'')+'</div>'
     : '<div class="banner" style="border-color:#cdd6e8;background:#f3f6fc;color:#22408a;margin:0 0 10px"><b>Boot: separate Block Storage volume</b>'+((m.linode_type)?(' — plan '+esc(m.linode_type)):'')+'</div>';
 
@@ -920,14 +974,15 @@ function migCard(v){
   // console (the command streams the image onto the local disk and powers the
   // instance off; the appliance finishes automatically from there).
   if(m.state==='migrating' && v.cutover_copy_cmd){
+    const isFile=m.boot_target==='file';
     b+='<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05">'+
-      '<b>Action needed — copy the image onto the local disk.</b>'+
+      '<b>Action needed — '+(isFile?'copy your files onto the destination.':'copy the image onto the local disk.')+'</b>'+
       '<div style="margin-top:6px">1. Make sure the <b>source server is powered off</b>.</div>'+
-      '<div style="margin-top:4px">2. Open the cutover instance’s <b>Lish console</b>'+(m.launched_linode_id?(' — <a href="https://cloud.linode.com/linodes/'+m.launched_linode_id+'/lish/weblish" target="_blank" rel="noopener">open Weblish</a>'):'')+' (it is booted in Rescue Mode).</div>'+
+      '<div style="margin-top:4px">2. Open the '+(isFile?'destination':'cutover')+' instance’s <b>Lish console</b>'+(m.launched_linode_id?(' — <a href="https://cloud.linode.com/linodes/'+m.launched_linode_id+'/lish/weblish" target="_blank" rel="noopener">open Weblish</a>'):'')+(isFile?' (log in as root).':' (it is booted in Rescue Mode).')+'</div>'+
       '<div style="margin-top:4px">3. Paste this one line there:</div>'+
       '<div style="display:flex;gap:8px;align-items:flex-start;margin-top:6px"><pre id="cutcmd'+m.id+'" style="flex:1;margin:0">'+esc(v.cutover_copy_cmd)+'</pre>'+
       '<button onclick="copyText(document.getElementById(\'cutcmd'+m.id+'\').textContent,this)">Copy</button></div>'+
-      '<div style="font-size:12px;margin-top:6px">The copy shows live progress in the Lish session and powers the instance off when it finishes — the appliance then boots your server from its local disk automatically. Nothing else to click here.</div></div>';
+      '<div style="font-size:12px;margin-top:6px">'+(isFile?'It copies your files onto the destination and reboots it — the appliance then marks the migration complete automatically. Nothing else to click here.':'The copy shows live progress in the Lish session and powers the instance off when it finishes — the appliance then boots your server from its local disk automatically. Nothing else to click here.')+'</div></div>';
   }
 
   // Two groups: pre-migration (environment readiness while replicating) and
@@ -1131,7 +1186,7 @@ function startTimers(){
     });
   },1000);
 }
-async function start(){show('app');if(!document.querySelector('#disks .row'))addDisk();bootTargetChanged();refresh(false);startTimers();}
+async function start(){show('app');if(!document.querySelector('#disks .row'))addDisk();methodChanged();refresh(false);startTimers();}
 async function init(){
   try{await api('GET','/api/v1/session');start();}
   catch(e){show('login')}
