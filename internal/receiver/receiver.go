@@ -67,6 +67,16 @@ type ReplicationGate func(hello protocol.Hello) bool
 // only fails much later at cutover. A nil check accepts every valid Hello.
 type HelloCheck func(hello protocol.Hello) error
 
+// FileTarget decides, for a file-transfer session, where the agent should apply
+// its data. It is consulted after the replication gate opens. Returning
+// hold=true tells the agent to wait (e.g. the destination Linode is still
+// launching). Returning a non-empty target redirects the agent to stream
+// straight to that receiver (the destination), verifying it against serverName;
+// the receiver here writes nothing. Returning target=="" and hold=false means
+// "apply the files locally" (the appliance-staging fallback). A nil FileTarget
+// always applies locally.
+type FileTarget func(hello protocol.Hello) (target, serverName string, hold bool)
+
 // errConsistentResync is returned by Handle when it deliberately bounced a live
 // pass to request a crash-consistent resync. It is an expected control outcome,
 // not a failure, so Serve does not surface it via onError.
@@ -91,7 +101,7 @@ var DrainGrace = 3 * time.Minute
 // session. If once is true, Serve returns after the first successful session.
 // On cancellation Serve stops accepting immediately; a session already in
 // flight gets DrainGrace to finish and is then severed.
-func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress, onError func(error), requestConsistent ConsistencyFunc, replicationGate ReplicationGate, helloCheck HelloCheck) error {
+func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress, onError func(error), requestConsistent ConsistencyFunc, replicationGate ReplicationGate, helloCheck HelloCheck, fileTarget FileTarget) error {
 	var connMu sync.Mutex
 	var active net.Conn
 	go func() {
@@ -115,7 +125,7 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 		connMu.Lock()
 		active = conn
 		connMu.Unlock()
-		stats, herr := Handle(conn, devicePath, manifestPath, onProgress, requestConsistent, replicationGate, helloCheck)
+		stats, herr := Handle(conn, devicePath, manifestPath, onProgress, requestConsistent, replicationGate, helloCheck, fileTarget)
 		connMu.Lock()
 		active = nil
 		connMu.Unlock()
@@ -147,7 +157,7 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 // every block to devicePath, fsyncs, and writes the applied manifest.
 // onProgress (optional) is invoked at session start and every progressEvery
 // applied blocks.
-func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress, requestConsistent ConsistencyFunc, replicationGate ReplicationGate, helloCheck HelloCheck) (Stats, error) {
+func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress, requestConsistent ConsistencyFunc, replicationGate ReplicationGate, helloCheck HelloCheck, fileTarget FileTarget) (Stats, error) {
 	defer conn.Close()
 	r := bufio.NewReaderSize(conn, 1<<20)
 	w := bufio.NewWriterSize(conn, 1<<16)
@@ -225,6 +235,21 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress,
 	// (devicePath is a directory here, not a block device). This is a wholly
 	// separate data path from the block loop below; block sessions never reach it.
 	if hello.Mode == protocol.ModeFile {
+		if fileTarget != nil {
+			target, serverName, hold := fileTarget(hello)
+			if hold {
+				_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, Hold: true, Message: "destination not ready yet"})
+				_ = w.Flush()
+				return Stats{Hello: hello}, errReplicationHeld
+			}
+			if target != "" {
+				// Redirect the agent to stream straight to the destination; we apply
+				// nothing here.
+				_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, DataTarget: target, DataServerName: serverName})
+				_ = w.Flush()
+				return Stats{Hello: hello}, nil
+			}
+		}
 		return handleFileSession(w, r, devicePath, manifestPath, hello, onProgress)
 	}
 

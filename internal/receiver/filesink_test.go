@@ -54,6 +54,49 @@ func TestFileSessionRoundTrip(t *testing.T) {
 	}
 }
 
+// With a FileTarget that returns a redirect, a file session must be answered
+// with a HelloAck carrying DataTarget (the destination) and apply NOTHING
+// locally. With hold=true it must return a Hold ack. This is the direct-to-
+// destination path.
+func TestFileSessionRedirect(t *testing.T) {
+	root := t.TempDir()
+	// Redirect case.
+	ack := fileHelloAck(t, root, func(protocol.Hello) (string, string, bool) {
+		return "10.0.0.5:5999", "appliance.example", false
+	})
+	if ack.Accepted || ack.DataTarget != "10.0.0.5:5999" || ack.DataServerName != "appliance.example" {
+		t.Fatalf("redirect: got accepted=%v target=%q sni=%q", ack.Accepted, ack.DataTarget, ack.DataServerName)
+	}
+	if es, _ := os.ReadDir(root); len(es) != 0 {
+		t.Error("a redirected session must not write anything locally")
+	}
+	// Hold case.
+	ack = fileHelloAck(t, root, func(protocol.Hello) (string, string, bool) { return "", "", true })
+	if ack.Accepted || !ack.Hold {
+		t.Fatalf("hold: got accepted=%v hold=%v", ack.Accepted, ack.Hold)
+	}
+}
+
+// fileHelloAck sends one file-mode Hello through Handle (with the given
+// FileTarget) and returns the HelloAck.
+func fileHelloAck(t *testing.T, root string, ft FileTarget) protocol.HelloAck {
+	t.Helper()
+	cli, srv := net.Pipe()
+	go func() { _, _ = Handle(srv, root, "", nil, nil, nil, nil, ft) }()
+	defer cli.Close()
+	w := bufio.NewWriter(cli)
+	r := bufio.NewReader(cli)
+	_ = protocol.WriteJSON(w, protocol.MsgHello, protocol.Hello{ProtocolVersion: 1, Mode: protocol.ModeFile})
+	_ = w.Flush()
+	mt, payload, err := protocol.ReadFrame(r)
+	if err != nil || mt != protocol.MsgHelloAck {
+		t.Fatalf("expected hello-ack, got type %d err %v", mt, err)
+	}
+	var ack protocol.HelloAck
+	_ = json.Unmarshal(payload, &ack)
+	return ack
+}
+
 // A hostile agent must not escape the output root.
 func TestFileSessionRejectsUnsafePaths(t *testing.T) {
 	for _, bad := range []string{"/etc/passwd", "../escape", "a/../../b"} {
@@ -97,7 +140,7 @@ func runFileSession(t *testing.T, root string, msgs []fileMsg, complete bool) er
 	cli, srv := net.Pipe()
 	errc := make(chan error, 1)
 	go func() {
-		_, e := Handle(srv, root, filepath.Join(t.TempDir(), "f.manifest"), nil, nil, nil, nil)
+		_, e := Handle(srv, root, filepath.Join(t.TempDir(), "f.manifest"), nil, nil, nil, nil, nil)
 		errc <- e
 	}()
 	w := bufio.NewWriter(cli)

@@ -91,7 +91,7 @@ func runSession(t *testing.T, target, manifest string, fullSync bool, block []by
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = Handle(srv, target, manifest, nil, nil, nil, nil)
+		_, _ = Handle(srv, target, manifest, nil, nil, nil, nil, nil)
 	}()
 
 	w := bufio.NewWriter(cli)

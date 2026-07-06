@@ -81,6 +81,40 @@ func excludedFromFileCopy(rel string) bool {
 	return false
 }
 
+// dialFileSession opens an mTLS connection to target (verifying it against
+// serverName), sends a file-mode Hello, and returns the connection, buffered
+// reader/writer, and the receiver's HelloAck.
+func dialFileSession(c cfg, target, serverName string) (*tls.Conn, *bufio.Writer, *bufio.Reader, protocol.HelloAck, error) {
+	tlsCfg, err := transport.ClientConfig(c.tls, serverName)
+	if err != nil {
+		return nil, nil, nil, protocol.HelloAck{}, err
+	}
+	conn, err := tls.Dial("tcp", target, tlsCfg)
+	if err != nil {
+		return nil, nil, nil, protocol.HelloAck{}, fmt.Errorf("dial receiver: %w", err)
+	}
+	w := bufio.NewWriterSize(conn, 1<<20)
+	r := bufio.NewReaderSize(conn, 1<<16)
+	host, _ := os.Hostname()
+	if err := protocol.WriteJSON(w, protocol.MsgHello, protocol.Hello{
+		ProtocolVersion: 1, JobID: c.jobID, SourceHostname: host,
+		DevicePath: c.root, Mode: protocol.ModeFile,
+	}); err != nil {
+		conn.Close()
+		return nil, nil, nil, protocol.HelloAck{}, fmt.Errorf("send hello: %w", err)
+	}
+	if err := w.Flush(); err != nil {
+		conn.Close()
+		return nil, nil, nil, protocol.HelloAck{}, err
+	}
+	ack, err := expectAck(r)
+	if err != nil {
+		conn.Close()
+		return nil, nil, nil, protocol.HelloAck{}, err
+	}
+	return conn, w, r, ack, nil
+}
+
 // replicateFiles performs one file-transfer pass: connect, send a file-mode
 // Hello, walk the root (staying on the root filesystem, skipping excluded
 // paths), stream each file/dir/symlink, then commit the manifest. It reuses the
@@ -90,36 +124,40 @@ func replicateFiles(c cfg) (syncResult, error) {
 	prev := loadFileManifest(c.manifest)
 	next := fileManifest{}
 
-	tlsCfg, err := transport.ClientConfig(c.tls, c.serverName)
-	if err != nil {
-		return res, err
-	}
-	conn, err := tls.Dial("tcp", c.target, tlsCfg)
-	if err != nil {
-		return res, fmt.Errorf("dial receiver: %w", err)
-	}
-	defer conn.Close()
-	w := bufio.NewWriterSize(conn, 1<<20)
-	r := bufio.NewReaderSize(conn, 1<<16)
-
-	host, _ := os.Hostname()
-	if err := protocol.WriteJSON(w, protocol.MsgHello, protocol.Hello{
-		ProtocolVersion: 1, JobID: c.jobID, SourceHostname: host,
-		DevicePath: c.root, Mode: protocol.ModeFile,
-	}); err != nil {
-		return res, fmt.Errorf("send hello: %w", err)
-	}
-	if err := w.Flush(); err != nil {
-		return res, err
-	}
-	ack, err := expectAck(r)
+	// Connect to the CONTROL receiver (the appliance). It either holds (not
+	// started), accepts directly (appliance-staging fallback), or REDIRECTS us to
+	// the launched destination Linode to stream straight into it.
+	conn, w, r, ack, err := dialFileSession(c, c.target, c.serverName)
 	if err != nil {
 		return res, err
 	}
 	if ack.Hold {
-		log.Printf("agent: connection validated — replication not started yet; will retry")
+		conn.Close()
+		log.Printf("agent: connection validated — replication not started yet (or destination still launching); will retry")
 		return res, nil
 	}
+	if ack.DataTarget != "" {
+		// Direct-to-destination: re-dial the destination and stream there. The
+		// server name stays the appliance's cert SAN — the destination presents
+		// the appliance's receiver cert, so verification passes without a
+		// per-destination certificate.
+		conn.Close()
+		sni := ack.DataServerName
+		if sni == "" {
+			sni = c.serverName
+		}
+		log.Printf("agent: streaming files directly to the destination %s", ack.DataTarget)
+		conn, w, r, ack, err = dialFileSession(c, ack.DataTarget, sni)
+		if err != nil {
+			return res, fmt.Errorf("dial destination %s: %w", ack.DataTarget, err)
+		}
+		if ack.Hold {
+			conn.Close()
+			log.Printf("agent: destination not ready to receive yet; will retry")
+			return res, nil
+		}
+	}
+	defer conn.Close()
 	if !ack.Accepted {
 		return res, fmt.Errorf("receiver rejected file session: %s", ack.Message)
 	}

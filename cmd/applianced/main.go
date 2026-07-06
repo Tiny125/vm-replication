@@ -44,6 +44,7 @@ func main() {
 		agentCert     = flag.String("agent-cert", "", "agent certificate handed to sources")
 		agentKey      = flag.String("agent-key", "", "agent key handed to sources")
 		agentBinary   = flag.String("agent-binary", "", "path to the agent binary served to sources")
+		recvBinary    = flag.String("receiver-binary", "", "path to the receiver binary served to file-transfer destinations")
 		convertScript = flag.String("convert-script", "", "path to machine-convert.sh (enables disk conversion)")
 		rpoTarget     = flag.Int("rpo-target", 120, "max lag (seconds) for the 'ready to migrate' gate")
 		tlsCert       = flag.String("tls-cert", "", "console TLS certificate (self-signed auto-generated if empty)")
@@ -141,6 +142,7 @@ func main() {
 		AgentKey:          *agentKey,
 		CACert:            *caFile,
 		AgentBinary:       *agentBinary,
+		ReceiverBinary:    *recvBinary,
 		ApplianceLinodeID: applianceID,
 		ConvertScript:     *convertScript,
 		RPOTargetSec:      *rpoTarget,
