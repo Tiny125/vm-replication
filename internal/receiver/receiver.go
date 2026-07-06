@@ -30,6 +30,7 @@ type Stats struct {
 	Hello         protocol.Hello
 	BlocksWritten int64
 	ChangedBlocks int64
+	BytesOnWire   int64 // bytes applied this session (set by the file path)
 	Duration      time.Duration
 }
 
