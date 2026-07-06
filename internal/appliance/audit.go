@@ -240,7 +240,15 @@ func (s *Server) flushAudit(seen map[int64]int64) {
 			continue
 		}
 		if err := cl.PutObject(ctx, b, name, "text/plain; charset=utf-8", []byte(content)); err != nil {
-			continue // leave watermark unchanged so we retry next tick
+			// The bucket was deleted out from under us (e.g. removed in Cloud
+			// Manager, or a stale-state re-login). Self-heal: clear the local
+			// "ready" state so the console stops showing it as available (and the
+			// Delete button disappears) instead of retrying a 404 forever.
+			if linode.IsNotFound(err) {
+				s.setAuditErr("the audit bucket no longer exists (deleted in Cloud Manager or a previous session) — use \"Re-create audit bucket\" to make a new one")
+				return
+			}
+			continue // transient; leave watermark unchanged so we retry next tick
 		}
 		seen[id] = wm
 	}

@@ -446,7 +446,7 @@ async function deleteAuditBucket(btn){
   if(!r)return;
   if(!r.pw){alertModal({title:'Password required',html:'Enter your console password to delete the bucket.',danger:true});return}
   busy(btn,true);
-  try{await api('DELETE','/api/v1/settings/audit-bucket',{password:r.pw});toast('Audit bucket and its logs deleted','ok');loadSettings();}
+  try{const d=await api('DELETE','/api/v1/settings/audit-bucket',{password:r.pw});toast(d&&d.already_gone?'The audit bucket was already removed — cleared it here too':'Audit bucket and its logs deleted','ok');loadSettings();}
   catch(e){alertModal({title:'Could not delete audit bucket',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
 
 let diskSeq=0;

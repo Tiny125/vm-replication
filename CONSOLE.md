@@ -117,10 +117,12 @@ installs a systemd service (`applianced`), and prints:
 Options: `--public-host <ip>` (if auto-detect is wrong), `--region us-ord`,
 `--port 8080`.
 
-**Sessions & password recovery.** Signing out of the console only clears your
-browser session — it never stops a migration. Replication runs in the
-`applianced` service independent of console logins, so sign-out (or a closed
-browser) leaves every migration running. Forgot the console password? Retrieve
+**Sessions & password recovery.** A console session lasts **12 hours from
+sign-in** (a fixed lifetime — it is not extended by activity); after that you'll
+be asked to sign in again. Signing out of the console only clears your browser
+session — it never stops a migration. Replication runs in the `applianced`
+service independent of console logins, so sign-out, a timeout, or a closed
+browser leaves every migration running. Forgot the console password? Retrieve
 it on the replication server without disturbing anything:
 
 ```
@@ -235,7 +237,11 @@ Singapore appliance gets a Singapore bucket). Override with the
   against mistakes it is only allowed when **no migration is active** (none in a
   created/running state — finish, launch, or delete them first) and it requires
   you to **type the console password**. Re-create afterwards to start a fresh,
-  empty bucket.
+  empty bucket. This is **idempotent**: if the bucket was already removed (in
+  Cloud Manager, or an earlier session), clicking Delete simply clears the
+  console's view of it — it won't error. The console also self-heals within
+  ~20s if the bucket disappears out from under it (the button switches back to
+  "Re-create").
 - **Remove token** — deletes the stored Linode API token. Allowed once **no
   migration is active** — **completed** migrations (launched / image ready) don't
   block it, so you can remove the token after your servers are migrated. It's

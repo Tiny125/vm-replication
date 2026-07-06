@@ -435,11 +435,25 @@ func (s *Server) handleDeleteAuditBucket(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
+	// Idempotent: if the bucket is already gone (e.g. it was deleted in an earlier
+	// session but the console still shows the button because our local state was
+	// stale), a "not found" is a SUCCESS — the goal is already met. Clear the
+	// local state so the button disappears, instead of erroring forever.
 	if err := cl.EmptyBucket(ctx, b); err != nil {
+		if linode.IsNotFound(err) {
+			s.clearAuditBucket(ctx)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": false, "already_gone": true, "audit_bucket": b.Label})
+			return
+		}
 		writeErr(w, http.StatusBadGateway, "could not empty the audit bucket: "+err.Error())
 		return
 	}
 	if err := cl.DeleteBucket(ctx, b); err != nil {
+		if linode.IsNotFound(err) {
+			s.clearAuditBucket(ctx)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": false, "already_gone": true, "audit_bucket": b.Label})
+			return
+		}
 		writeErr(w, http.StatusBadGateway, "could not delete the audit bucket: "+err.Error())
 		return
 	}
