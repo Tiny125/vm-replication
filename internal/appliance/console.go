@@ -446,7 +446,7 @@ async function deleteAuditBucket(btn){
   if(!r)return;
   if(!r.pw){alertModal({title:'Password required',html:'Enter your console password to delete the bucket.',danger:true});return}
   busy(btn,true);
-  try{await api('DELETE','/api/v1/settings/audit-bucket',{password:r.pw});toast('Audit bucket and its logs deleted','ok');loadSettings();}
+  try{const d=await api('DELETE','/api/v1/settings/audit-bucket',{password:r.pw});toast(d&&d.already_gone?'The audit bucket was already removed — cleared it here too':'Audit bucket and its logs deleted','ok');loadSettings();}
   catch(e){alertModal({title:'Could not delete audit bucket',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
 
 let diskSeq=0;
@@ -809,11 +809,17 @@ function progressLine(v,m){
   else if(st==='migrating'){label='finalizing · running '+liveDur(m.migrate_started,v.elapsed_seconds);bar=progBar(0,true);}
   else if(st==='awaiting_cutover'){label='step 1 done — power off the source, then Launch instance';bar=progBar(100,false);}
   else{
+    const isFile=m.boot_target==='file';
     const allBase=disks(m).length>0&&disks(m).every(d=>d.full_sync_done);
-    if(allBase){label='initial sync completed · 100%';bar=progBar(100,false);}
+    if(allBase){label=isFile?'files copied · ready to cut over':'initial sync completed · 100%';bar=progBar(100,false);}
     else{
       const pct=syncPct(v,m);
-      if(pct<0){
+      if(isFile){
+        // File copy: bytes only land when a pass completes, so show motion + the
+        // item count rather than a fabricated percentage.
+        label=(st==='created'||st==='awaiting_agent'?'waiting for agent':'copying files (only used storage)…');
+        bar=progBar(0,true);
+      }else if(pct<0){
         // No live session reporting and not yet baselined — show motion, not a
         // fabricated percentage.
         label=(st==='created'||st==='awaiting_agent'?'waiting for agent':'initial sync in progress');

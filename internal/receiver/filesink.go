@@ -48,6 +48,11 @@ func handleFileSession(w *bufio.Writer, r *bufio.Reader, root, manifestPath stri
 	start := time.Now()
 	seen := make(map[string]bool) // relative paths written this pass (for delete-propagation)
 	var entries, bytesApplied int64
+	// Signal "data flowing" so the appliance marks the migration replicating (the
+	// block path does the same with an initial written=0 progress call).
+	if onProgress != nil {
+		onProgress(0, 0, false)
+	}
 
 	for {
 		t, payload, err := protocol.ReadFrame(r)
@@ -90,7 +95,7 @@ func handleFileSession(w *bufio.Writer, r *bufio.Reader, root, manifestPath stri
 			if onProgress != nil {
 				onProgress(entries, entries, false)
 			}
-			return Stats{Hello: hello, BlocksWritten: entries, ChangedBlocks: entries, Duration: time.Since(start)}, nil
+			return Stats{Hello: hello, BlocksWritten: entries, ChangedBlocks: entries, BytesOnWire: bytesApplied, Duration: time.Since(start)}, nil
 		default:
 			return Stats{Hello: hello}, fmt.Errorf("unexpected frame type %d in file session", t)
 		}

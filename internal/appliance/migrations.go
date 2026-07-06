@@ -143,6 +143,26 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 				return
 			}
 			lastErrEvt = "" // a pass landed; log the next failure even if it repeats
+			// File-transfer session: no block geometry (BlockSize/DeviceSize are 0,
+			// so NumBlocks would divide by zero). A completed file pass IS the
+			// baseline — record entries as the sync with the bytes it applied.
+			if st.Hello.Mode == protocol.ModeFile {
+				wasBaselined := false
+				if d0, derr := s.st.Migration(s.ctx, migID); derr == nil {
+					for _, dk := range d0.Disks {
+						if dk.ID == diskID {
+							wasBaselined = dk.FullSyncDone
+						}
+					}
+				}
+				if err := s.st.RecordDiskSync(s.ctx, migID, diskID, true, st.BlocksWritten, st.ChangedBlocks, st.BytesOnWire); err != nil {
+					log.Printf("appliance: record file sync (migration %d disk %d): %v", migID, diskID, err)
+				}
+				if !wasBaselined {
+					_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("file copy complete: %d items (%s) staged for %s — ready to cut over", st.BlocksWritten, humanBytes(st.BytesOnWire), dev0))
+				}
+				return
+			}
 			total := blockdiff.NumBlocks(st.Hello.DeviceSize, st.Hello.BlockSize)
 			bytes := st.BlocksWritten * int64(st.Hello.BlockSize)
 			wasBaselined := false
@@ -2197,13 +2217,31 @@ func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCh
 	lagOK := anySync && rpoSec <= float64(s.cfg.RPOTargetSec)
 
 	diskWord := func(k int) string { return fmt.Sprintf("%d/%d disks", k, n) }
+	// The first pre-check differs by method: block methods provision a replication
+	// volume ("Storage provisioned"); the file method provisions no block storage
+	// and instead needs a destination OS image + plan chosen ("Destination ready").
+	var first api.ValidationCheck
+	if isFileMethod(m.BootTarget) {
+		ready := m.OSImage != "" && m.LinodeType != ""
+		detail := "OS image + plan chosen"
+		if !ready {
+			detail = "choose a destination OS image and plan"
+		}
+		first = api.ValidationCheck{Name: "Destination ready", OK: ready, Detail: detail, Group: "pre"}
+	} else {
+		first = api.ValidationCheck{Name: "Storage provisioned", OK: allStorage, Detail: diskWord(storageOK) + " ready", Group: "pre"}
+	}
+	fullDetail := diskWord(fullDone) + " baselined"
+	if isFileMethod(m.BootTarget) {
+		fullDetail = map[bool]string{true: "files copied", false: "copying files"}[allFull]
+	}
 	return []api.ValidationCheck{
 		// Pre-migration: environment/connectivity readiness while replicating.
-		{Name: "Storage provisioned", OK: allStorage, Detail: diskWord(storageOK) + " ready", Group: "pre"},
+		first,
 		{Name: "Agent connected", OK: allAgents, Detail: diskWord(agentsSeen) + " checked in", Group: "pre"},
 		{Name: fmt.Sprintf("Replication lag within %ds", s.cfg.RPOTargetSec), OK: lagOK, Detail: lagDetail2(anySync, rpoSec), Group: "pre"},
 		// Migration: the gate that actually allows cutover.
-		{Name: "Initial full sync complete", OK: allFull, Detail: diskWord(fullDone) + " baselined", Group: "migration"},
+		{Name: "Initial full sync complete", OK: allFull, Detail: fullDetail, Group: "migration"},
 	}
 }
 
