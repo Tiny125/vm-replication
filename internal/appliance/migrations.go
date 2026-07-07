@@ -911,9 +911,14 @@ func (s *Server) handleStartReplication(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if resuming {
+	switch {
+	case resuming && isFileMethod(m.BootTarget):
+		_ = s.st.AddEvent(ctx, id, "info", "replication resumed by operator; the agent re-copies only the files that changed during the pause on its next pass (within ~60s)")
+	case resuming:
 		_ = s.st.AddEvent(ctx, id, "info", "replication resumed by operator; the agent ships only the blocks changed during the pause on its next pass (within ~60s)")
-	} else {
+	case isFileMethod(m.BootTarget):
+		_ = s.st.AddEvent(ctx, id, "info", "replication started by operator; launching the destination Linode, then the agent copies your used files straight into it (within ~60s)")
+	default:
 		_ = s.st.AddEvent(ctx, id, "info", "replication started by operator; the agent will stream the initial full sync on its next pass (within ~60s)")
 	}
 	// File transfer (direct): launch the destination now so the agent copies
@@ -2174,11 +2179,14 @@ func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCh
 	var first api.ValidationCheck
 	if isFileMethod(m.BootTarget) {
 		ready := m.OSImage != "" && m.LinodeType != ""
-		detail := "OS image + plan chosen"
+		// The destination Linode is not created yet — it launches when the operator
+		// clicks Start replication. Say so, so a green tick isn't read as "the
+		// instance already exists".
+		detail := "OS image + plan chosen — Linode launches on Start"
 		if !ready {
 			detail = "choose a destination OS image and plan"
 		}
-		first = api.ValidationCheck{Name: "Destination ready", OK: ready, Detail: detail, Group: "pre"}
+		first = api.ValidationCheck{Name: "Destination configured", OK: ready, Detail: detail, Group: "pre"}
 	} else {
 		first = api.ValidationCheck{Name: "Storage provisioned", OK: allStorage, Detail: diskWord(storageOK) + " ready", Group: "pre"}
 	}

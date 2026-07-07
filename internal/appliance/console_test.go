@@ -52,6 +52,29 @@ func TestConsoleRendersCutoverCopyCommand(t *testing.T) {
 	}
 }
 
+// The Start-replication confirmation must be method-aware. File transfer copies
+// FILES onto a launched destination — it must NOT tell the operator "the agent
+// streams every block" (that's the block-method wording and confused users into
+// thinking no destination existed). The file variant must mention launching the
+// destination and copying files.
+func TestConsoleStartDialogIsMethodAware(t *testing.T) {
+	js := extractJSFunc(t, "async function startReplication(")
+	// It must branch on the migration's method.
+	if !strings.Contains(js, "boot_target") {
+		t.Error("startReplication must pick its wording from the migration's boot_target")
+	}
+	// File-transfer wording present…
+	for _, want := range []string{"launches the destination", "used files"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("file-transfer Start dialog missing %q", want)
+		}
+	}
+	// …and the block wording still present for block methods.
+	if !strings.Contains(js, "streams every block") {
+		t.Error("block-method Start dialog should keep its 'streams every block' wording")
+	}
+}
+
 // The guided cutover must tell the operator, ON THE CARD, when it is safe to
 // power off the source: a "keep the source running" banner while step 1's
 // freeze/drain runs (cutover_freezing), then a "power off the source server

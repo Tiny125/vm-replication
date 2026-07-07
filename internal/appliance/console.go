@@ -647,9 +647,16 @@ async function stopMig(id,btn){
 }
 // startReplication starts (or, when resume=true, resumes) replication.
 async function startReplication(id,btn,resume){
+  // Method-aware wording: file transfer copies FILES onto a launched destination,
+  // block methods stream disk blocks. (boot_target comes from the migration meta.)
+  const file=((migMeta[id]||{}).boot_target==='file');
   const opts=resume
-    ?{title:'Resume replication for #'+id+'?',html:'Replication continues with an <b>incremental delta sync</b> — only the blocks that changed during the pause are sent, not a full re-copy.',okText:'Resume replication'}
-    :{title:'Start replication for #'+id+'?',html:'The agent connection is validated. This begins the <b>initial full sync</b> from the source; the agent streams every block, then keeps the copy current. You can cut over once the baseline completes.',okText:'Start replication'};
+    ?{title:'Resume replication for #'+id+'?',html: file
+        ?'Replication continues with an <b>incremental delta</b> — only the files that changed during the pause are re-copied, not a full re-copy.'
+        :'Replication continues with an <b>incremental delta sync</b> — only the blocks that changed during the pause are sent, not a full re-copy.',okText:'Resume replication'}
+    :{title:'Start replication for #'+id+'?',html: file
+        ?'The agent connection is validated. This <b>launches the destination Linode</b> and begins the <b>initial full copy</b> of the source’s <b>used files</b> straight into it. The copy then stays current; you can cut over once the baseline copy completes.'
+        :'The agent connection is validated. This begins the <b>initial full sync</b> from the source; the agent streams every block, then keeps the copy current. You can cut over once the baseline completes.',okText:'Start replication'};
   if(!await confirmModal(opts))return;
   busy(btn,true);
   try{await api('POST','/api/v1/migrations/'+id+'/replicate',{});await refreshMig(id)}
