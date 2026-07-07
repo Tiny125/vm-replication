@@ -10,6 +10,7 @@ package linode
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -303,6 +304,25 @@ func (c *Client) CreateInstanceFromImage(ctx context.Context, label, region, typ
 	return inst, err
 }
 
+// CreateInstanceFromImageUserData provisions and boots a Linode from an OS image
+// with cloud-init user-data (run on first boot via the Linode Metadata service).
+// Used by the direct file-transfer method to auto-install the receiver on the
+// destination. userData is the raw script; the API expects it base64-encoded.
+func (c *Client) CreateInstanceFromImageUserData(ctx context.Context, label, region, typ, image, rootPass, userData string) (Instance, error) {
+	body := map[string]any{
+		"label":     label,
+		"region":    region,
+		"type":      typ,
+		"image":     image,
+		"root_pass": rootPass,
+		"booted":    true,
+		"metadata":  map[string]any{"user_data": base64.StdEncoding.EncodeToString([]byte(userData))},
+	}
+	var inst Instance
+	err := c.do(ctx, http.MethodPost, "/linode/instances", body, &inst)
+	return inst, err
+}
+
 // SetWatchdog enables or disables Lassie, the Linode Shutdown Watchdog, which
 // automatically reboots an instance that powers itself off. The disk-boot cutover
 // MUST disable it around the install boot: the in-guest one-shot copies the image
@@ -388,6 +408,12 @@ func (c *Client) Boot(ctx context.Context, linodeID, configID int64) error {
 // local-disk boot in disk-mode cutover).
 func (c *Client) Shutdown(ctx context.Context, linodeID int64) error {
 	return c.do(ctx, http.MethodPost, fmt.Sprintf("/linode/instances/%d/shutdown", linodeID), nil, nil)
+}
+
+// RebootInstance reboots a Linode into its current/default config (used by the
+// direct file-transfer cutover to boot the destination into the migrated files).
+func (c *Client) RebootInstance(ctx context.Context, linodeID int64) error {
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("/linode/instances/%d/reboot", linodeID), nil, nil)
 }
 
 // Disk is a Linode local disk (lives on the instance's plan storage).

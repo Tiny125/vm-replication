@@ -31,8 +31,8 @@ block methods are untouched (proven by the full test suite staying green).
        │ control (gating / target handoff)
        ▼
  ┌────────────┐
- │ appliance  │  launches the destination, tells the agent where to stream
- └────────────┘
+ │ appliance  │  launches the destination + tells the agent where to stream
+ └────────────┘  (control only — the file data never passes through it)
 ```
 
 - **Data path (built + tested).** New protocol messages `MsgFileEntry` /
@@ -73,46 +73,76 @@ block methods are untouched (proven by the full test suite staying green).
 
 ## How the pieces fit (implementation)
 
-- **Enroll** bakes `-mode file -root /` into the agent's ExecStart.
-- **Start** opens the gate; the agent streams the file tree to the appliance's
-  per-migration file receiver, which stages it under
-  `<datadir>/filemig-<id>-root/` (`handleFileSession`). Delta passes update it.
-- **Cutover** (guided freeze → power off source → complete) runs `finalizeFile`:
-  launches the destination from `os_image` + plan (`CreateInstanceFromImage`),
-  waits for it to boot, then shows a **one-line Lish command** on the card. That
-  command pulls the staged tree as a **token-gated tar** (`/cutover/files.tar`),
-  extracts it over the live root (owners/perms preserved), pings
-  `/cutover/done`, and reboots. The appliance sees the ping and marks the
-  migration **launched**. Reuses the disk-boot token/pin pattern — no
-  per-destination certificates.
-- **Complete → remove agent → Close** is the shared cycle (Close has no volume
-  to delete in file mode).
+- **Enroll** bakes `-mode file -root /` into the agent's ExecStart (target = the
+  appliance, for control/gating).
+- **Start replication** launches the destination from `os_image` + plan with
+  **cloud-init user-data** that downloads the receiver binary + the appliance's
+  data-plane certs (both token-gated: `/dest/receiver`, `/dest/cert`) and runs
+  the receiver on the destination, applying files to `/` (`vmrepl-receiver`
+  systemd service, port 5999).
+- **The agent** dials the appliance (control). Once the destination's receiver
+  is reachable, the appliance answers with a **HelloAck redirect**
+  (`DataTarget` = the destination), and the agent re-dials the destination and
+  streams the files **straight into it** — nothing is staged on the appliance.
+  Until then the agent is told to Hold ("destination launching"). The
+  destination presents the **appliance's** receiver cert, so the agent keeps
+  `-server-name` pointed at the appliance and needs **no per-destination
+  certificate** (Go verifies the cert against `ServerName`, not the dialed IP).
+- **Cutover** (guided freeze → power off source → Launch) just **reboots the
+  destination** so it boots into the migrated files, then marks the migration
+  **launched**. No Lish paste, no tar.
+- **Complete → remove agent → Close** is the shared cycle (nothing to delete in
+  file mode).
+
+> Fallback: with **no Linode token** (evaluation/file-fallback mode), the agent
+> applies files to a staging tree on the appliance instead (`handleFileSession`).
 
 ## Status
 
 - ✅ **Built:** the full method end to end — additive model, create-flow branch,
   data path (protocol + agent walk + receiver sink), console method selector
-  (default file) + OS/used-space helper + OS dropdown, appliance staging,
-  destination launch, and tar-delivery cutover.
+  (default file) + OS/used-space helper + OS dropdown, **direct-to-destination**
+  streaming (destination launched at Start with a cloud-init receiver install,
+  HelloAck redirect, agent two-hop), and reboot-into-migrated-files cutover.
 - ✅ **Tested (unit + regression):** `TestFileSessionRoundTrip`,
-  `TestFileDelivery` (tar + done ping + token gating), `TestConsoleMigration
-  MethodSelector`, `TestExcludedFromFileCopy`, `TestIsFileMethod`, plus the full
-  existing suite + end-to-end appliance smoke staying green (block methods
-  untouched).
-- 🧪 **Needs live validation:** launching a real destination Linode from an
-  image and the Lish tar-extract + reboot — these touch the Linode API and a
-  real instance, so confirm on a live run (same as how the disk-boot rescue flow
-  was validated). The data path and delivery mechanics are unit-proven.
+  `TestFileSessionRedirect` (HelloAck redirect / Hold), `TestDestBootstrap`
+  (cloud-init + token-gated receiver/cert endpoints), `TestValidationsFileMethod`,
+  `TestConsoleMigrationMethodSelector`, `TestExcludedFromFileCopy`,
+  `TestIsFileMethod`, plus the full existing suite + end-to-end appliance smoke
+  staying green (block methods untouched).
+- 🧪 **Needs live validation:** launching a real destination Linode, its
+  cloud-init installing + starting the receiver, and the agent's two-hop stream
+  into it. These touch the Linode API + a real instance and cloud-init/metadata
+  support on the image (Ubuntu/Debian have it), so confirm on a live run — same
+  posture as the disk-boot rescue flow. The protocol/agent/receiver mechanics and
+  the bootstrap are unit-proven.
 
----
+### Live files (logs, journals) during a copy
+Files that the source keeps writing while the copy runs — `/var/log/*`,
+`systemd` journals, databases — inevitably change between the moment the agent
+hashes a file and the moment it streams it. The transfer is built to tolerate
+this rather than abort on it:
 
-## Limitations (documented)
+- The agent always streams **exactly the byte count it advertised** for a file
+  (truncating a file that grew, zero-padding one that shrank), so a moving file
+  can never desync the stream framing.
+- The agent records in its manifest the hash of the **bytes it actually
+  streamed**, so the next delta pass correctly re-sends anything that has since
+  moved.
+- The receiver treats a per-file content-hash mismatch as "this file changed
+  mid-copy" (not corruption — mTLS already guarantees transit integrity): it
+  keeps the freshest streamed bytes, logs a note, and **continues the pass**.
 
-- **x86_64 → x86_64** only (copied binaries run on the destination CPU) — the
-  same architecture guard as the block methods.
-- **Match the OS family/version** source→destination (auto-detected and
-  pre-selected at create) — the destination keeps its own kernel.
-- **Stop databases** before the final pass for a file-consistent copy (same as
-  any live file copy).
-- Copies the **root filesystem**; additional mounted data filesystems are
-  separate (a future enhancement can add extra roots).
+At **cutover** the source is frozen (guided freeze / power-off) before the final
+pass, so that pass has no such race and lands the exact, consistent content.
+Earlier a single racy log file failed the whole pass with `content hash mismatch`.
+
+### Requirements / caveats (direct mode)
+- The destination image must support **cloud-init + the Linode Metadata service**
+  (Ubuntu/Debian/RHEL-family cloud images do). Without it the receiver can't
+  auto-install; the card warns after 15 min and we can add a manual paste
+  fallback.
+- The **source must reach the destination's public IP** on TCP 5999.
+- A leftover `vmrepl-receiver` systemd service remains on the migrated instance
+  (harmless — it just listens); the completion note tells you to
+  `systemctl disable --now vmrepl-receiver` if you want it gone.

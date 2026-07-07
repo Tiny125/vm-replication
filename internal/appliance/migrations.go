@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -230,6 +229,13 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 			// disk. Everything else is rejected at the Hello, before any data
 			// lands and before the console shows "agent connected".
 			return checkAgentHello(expectJob, declaredSize, diskIdx, dev0, h)
+		}, func(h protocol.Hello) (string, string, bool) {
+			// File-transfer redirect: send the agent straight to the launched
+			// destination Linode (direct copy, no appliance staging). Returns
+			// hold=true while the destination is still launching/booting, the
+			// destination target once its receiver is up, or ("","",false) when
+			// there is no automation (appliance-staging fallback).
+			return s.fileDataTarget(migID)
 		})
 		if err != nil && ctx.Err() == nil {
 			log.Printf("appliance: receiver (migration %d disk %d) stopped: %v", migID, diskID, err)
@@ -910,6 +916,11 @@ func (s *Server) handleStartReplication(w http.ResponseWriter, r *http.Request) 
 	} else {
 		_ = s.st.AddEvent(ctx, id, "info", "replication started by operator; the agent will stream the initial full sync on its next pass (within ~60s)")
 	}
+	// File transfer (direct): launch the destination now so the agent copies
+	// straight into it. Idempotent; a no-op for block methods and file-fallback.
+	if isFileMethod(m.BootTarget) {
+		s.ensureFileDestination(m)
+	}
 	// Receivers are already listening from create time; they will now accept data.
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "replicating"})
 }
@@ -1153,6 +1164,7 @@ func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration,
 	}
 	s.recMu.Unlock()
 	s.stopReceivers(m)
+	s.dropFileDest(m.ID) // forget any direct file-transfer destination tracking
 
 	cl, haveLinode := s.linodeClient(ctx)
 	// Remove cutover artifacts (launched instance + clone volumes) unless the
@@ -1806,107 +1818,46 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %q (id %d) is booting from its local disk on plan %s", instLabel, inst.ID, m.LinodeType))
 }
 
-// finalizeFile cuts over a FILE-transfer migration: launch the destination from
-// the chosen OS image + plan, then have the operator paste one command in its
-// Lish console that pulls the staged file tree from the appliance, extracts it
-// over the live root, pings done, and reboots. No block conversion or volumes.
+// finalizeFile cuts over a FILE-transfer migration. The destination was already
+// launched at "Start replication" and the agent has been copying the source's
+// files STRAIGHT INTO it (direct, no appliance staging). Cutover just reboots
+// the destination so it comes up running the migrated files, then marks the
+// migration launched.
 func (s *Server) finalizeFile(ctx context.Context, m api.Migration, req api.FinalizeRequest) {
 	sctx := s.ctx
-	canceled := func() bool { return ctx.Err() != nil }
-	stageRoot := s.fileStageRoot(m)
-
 	cl, ok := s.linodeClient(sctx)
 	if !ok || s.cfg.ApplianceLinodeID == 0 {
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigImageReady,
-			"Linode automation not configured; the copied files are staged on the appliance at "+stageRoot)
+			"Linode automation not configured; the copied files are staged on the appliance")
 		_ = s.st.SetMigrateFinished(sctx, m.ID)
 		return
 	}
-	s.cleanupCutoverArtifacts(sctx, m) // retry-safe
-
-	label := cutoverInstanceLabel(req.Label, m.Name)
-	region := s.cfg.Region
-	if inst, err := cl.GetInstance(ctx, s.cfg.ApplianceLinodeID); err == nil && inst.Region != "" {
-		region = inst.Region
+	instID := m.LaunchedID
+	if v, ok := s.fileDests.Load(m.ID); ok {
+		if d := v.(*fileDest); d.instanceID != 0 {
+			instID = d.instanceID
+		}
 	}
-	// Root access: use the operator's password if given, else generate a strong
-	// one (never logged). The image also seeds the operator's SSH key if provided.
-	rootPass := req.RootPassword
-	generated := false
-	if rootPass == "" {
-		rootPass = randPassword()
-		generated = true
-	}
-	inst, err := cl.CreateInstanceFromImage(ctx, label, region, m.LinodeType, m.OSImage, rootPass, 0, nil)
-	if canceled() {
+	if instID == 0 {
+		s.fail(m.ID, "the destination was never launched — click Start replication first so the destination comes up and receives your files, then cut over")
 		return
 	}
-	if err != nil {
-		s.fail(m.ID, "launch destination: "+err.Error())
+	// Reboot the destination so it boots cleanly into the migrated files (the
+	// receiver copied them onto its live root while it idled).
+	if err := cl.RebootInstance(ctx, instID); err != nil {
+		s.fail(m.ID, fmt.Sprintf("could not reboot the destination (id %d): %v — reboot it in Cloud Manager and it will come up as your migrated server", instID, err))
 		return
 	}
-	_ = s.st.SetMigrationImage(sctx, m.ID, "file:"+stageRoot, inst.ID)
-	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("launched destination %q (id %d) from image %s on plan %s", label, inst.ID, m.OSImage, m.LinodeType))
-	if generated {
-		_ = s.st.AddEvent(sctx, m.ID, "warn", "a temporary root password was set on the destination and NOT logged — reset it in Cloud Manager (or use your SSH key) to log in. Tip: set a root password / SSH key in the cutover dialog to control it.")
-	}
-	if req.SSHAuthorizedKey != "" {
-		_ = s.st.AddEvent(sctx, m.ID, "info", "note: seed the SSH key on the destination after boot (image launch does not install it automatically)")
-	}
-	if err := cl.WaitInstanceStatus(ctx, inst.ID, "running", 10*time.Minute); err != nil {
-		if canceled() {
+	if err := cl.WaitInstanceStatus(ctx, instID, "running", 10*time.Minute); err != nil {
+		if ctx.Err() != nil {
 			return
 		}
-		s.fail(m.ID, "destination did not boot: "+err.Error())
-		return
+		_ = s.st.AddEvent(sctx, m.ID, "warn", "destination is slow to come back after reboot; check its Lish console")
 	}
-
-	// Authorize the tar download + done ping, and show the operator the one-line
-	// copy command on the card.
-	budget := diskCopyTimeout(dirSize(stageRoot))
-	tok, done := s.registerFileDelivery(m.ID, stageRoot, budget+time.Hour)
-	defer s.dropFileDelivery(m.ID)
-	defer s.setCutoverCopyCmd(m.ID, "")
-	s.setCutoverCopyCmd(m.ID, s.fileCopyCmd(tok))
-	_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf("ACTION NEEDED — destination %q (id %d) is up. Open its Lish console (Cloud Manager -> Linodes -> %s -> Launch LISH Console) and paste the copy command shown on this card. It copies your files onto it and reboots; the appliance finishes automatically.", label, inst.ID, label))
-
-	// Wait for the destination to report the extract finished (it pings /cutover/done).
-	waitStart := time.Now()
-	for {
-		select {
-		case <-done:
-			s.dropFileDelivery(m.ID)
-			s.setCutoverCopyCmd(m.ID, "")
-			_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
-			_ = s.st.SetMigrateFinished(sctx, m.ID)
-			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: files copied onto destination %q (id %d); it is rebooting into your migrated system", label, inst.ID))
-			return
-		case <-time.After(15 * time.Minute):
-			if canceled() {
-				return
-			}
-			if time.Since(waitStart) >= budget {
-				s.fail(m.ID, fmt.Sprintf("the file copy did not finish within %s (no completion from the destination). Open the destination's Lish console: if the copy command wasn't run, click Retry cutover and paste the fresh command; if it's still copying, let it finish and reboot, then Retry. Last known state: waiting for /cutover/done.", budget.Round(time.Minute)))
-				return
-			}
-			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: waiting for the file copy on the destination to finish (%s elapsed of up to %s) — paste the copy command from this card into its Lish console if you haven't", time.Since(waitStart).Round(time.Minute), budget.Round(time.Minute)))
-		}
-	}
-}
-
-// dirSize returns the total bytes of regular files under root (for the copy
-// budget); 0 if it can't be walked.
-func dirSize(root string) int64 {
-	var total int64
-	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err == nil && d.Type().IsRegular() {
-			if info, e := d.Info(); e == nil {
-				total += info.Size()
-			}
-		}
-		return nil
-	})
-	return total
+	s.dropFileDest(m.ID)
+	_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
+	_ = s.st.SetMigrateFinished(sctx, m.ID)
+	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: destination (id %d) rebooted into your migrated system. Power off the source now if you haven't. (You can remove the leftover vmrepl-receiver service on the destination: systemctl disable --now vmrepl-receiver.)", instID))
 }
 
 // randPassword returns a strong random password for a launched destination when

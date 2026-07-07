@@ -40,6 +40,7 @@ type Config struct {
 	AgentKey          string          // agent.key handed to sources
 	CACert            string          // ca.crt handed to sources
 	AgentBinary       string          // path to the linux/amd64 agent binary to serve
+	ReceiverBinary    string          // path to the linux/amd64 receiver binary (for the file-transfer destination)
 	ApplianceLinodeID int64           // this server's Linode id (0 = file fallback)
 	RPOTargetSec      int             // lag threshold for the "ready to migrate" gate
 	ConvertScript     string          // path to machine-convert.sh (empty = skip convert)
@@ -81,6 +82,12 @@ type Server struct {
 	cutoverFreezing sync.Map
 	// File-transfer cutover delivery (token -> *fileDelivery); see file_delivery.go.
 	fileDeliveries sync.Map
+	// Direct file transfer: migrationID -> *fileDest (the launched destination the
+	// agent streams straight into); see file_direct.go.
+	fileDests sync.Map
+	// Token-gated bootstrap for the destination's receiver install (token ->
+	// *destBootstrap); see file_direct.go.
+	destBootstraps sync.Map
 	ctx            context.Context
 
 	auditCh chan auditEntry // buffered audit entries -> DB (best-effort)
@@ -140,6 +147,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /cutover/image", s.handleCutoverImage)
 	s.mux.HandleFunc("GET /cutover/files.tar", s.handleCutoverTar)
 	s.mux.HandleFunc("GET /cutover/done", s.handleCutoverDone)
+	// Direct file transfer: the launched destination bootstraps its receiver from
+	// these (token-gated) during first boot.
+	s.mux.HandleFunc("GET /dest/receiver", s.handleDestReceiver)
+	s.mux.HandleFunc("GET /dest/cert", s.handleDestCert)
 
 	// Console API (session-protected).
 	s.mux.Handle("GET /api/v1/session", s.auth(s.handleSession))

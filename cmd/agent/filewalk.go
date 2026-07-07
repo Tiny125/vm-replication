@@ -81,6 +81,40 @@ func excludedFromFileCopy(rel string) bool {
 	return false
 }
 
+// dialFileSession opens an mTLS connection to target (verifying it against
+// serverName), sends a file-mode Hello, and returns the connection, buffered
+// reader/writer, and the receiver's HelloAck.
+func dialFileSession(c cfg, target, serverName string) (*tls.Conn, *bufio.Writer, *bufio.Reader, protocol.HelloAck, error) {
+	tlsCfg, err := transport.ClientConfig(c.tls, serverName)
+	if err != nil {
+		return nil, nil, nil, protocol.HelloAck{}, err
+	}
+	conn, err := tls.Dial("tcp", target, tlsCfg)
+	if err != nil {
+		return nil, nil, nil, protocol.HelloAck{}, fmt.Errorf("dial receiver: %w", err)
+	}
+	w := bufio.NewWriterSize(conn, 1<<20)
+	r := bufio.NewReaderSize(conn, 1<<16)
+	host, _ := os.Hostname()
+	if err := protocol.WriteJSON(w, protocol.MsgHello, protocol.Hello{
+		ProtocolVersion: 1, JobID: c.jobID, SourceHostname: host,
+		DevicePath: c.root, Mode: protocol.ModeFile,
+	}); err != nil {
+		conn.Close()
+		return nil, nil, nil, protocol.HelloAck{}, fmt.Errorf("send hello: %w", err)
+	}
+	if err := w.Flush(); err != nil {
+		conn.Close()
+		return nil, nil, nil, protocol.HelloAck{}, err
+	}
+	ack, err := expectAck(r)
+	if err != nil {
+		conn.Close()
+		return nil, nil, nil, protocol.HelloAck{}, err
+	}
+	return conn, w, r, ack, nil
+}
+
 // replicateFiles performs one file-transfer pass: connect, send a file-mode
 // Hello, walk the root (staying on the root filesystem, skipping excluded
 // paths), stream each file/dir/symlink, then commit the manifest. It reuses the
@@ -90,36 +124,40 @@ func replicateFiles(c cfg) (syncResult, error) {
 	prev := loadFileManifest(c.manifest)
 	next := fileManifest{}
 
-	tlsCfg, err := transport.ClientConfig(c.tls, c.serverName)
-	if err != nil {
-		return res, err
-	}
-	conn, err := tls.Dial("tcp", c.target, tlsCfg)
-	if err != nil {
-		return res, fmt.Errorf("dial receiver: %w", err)
-	}
-	defer conn.Close()
-	w := bufio.NewWriterSize(conn, 1<<20)
-	r := bufio.NewReaderSize(conn, 1<<16)
-
-	host, _ := os.Hostname()
-	if err := protocol.WriteJSON(w, protocol.MsgHello, protocol.Hello{
-		ProtocolVersion: 1, JobID: c.jobID, SourceHostname: host,
-		DevicePath: c.root, Mode: protocol.ModeFile,
-	}); err != nil {
-		return res, fmt.Errorf("send hello: %w", err)
-	}
-	if err := w.Flush(); err != nil {
-		return res, err
-	}
-	ack, err := expectAck(r)
+	// Connect to the CONTROL receiver (the appliance). It either holds (not
+	// started), accepts directly (appliance-staging fallback), or REDIRECTS us to
+	// the launched destination Linode to stream straight into it.
+	conn, w, r, ack, err := dialFileSession(c, c.target, c.serverName)
 	if err != nil {
 		return res, err
 	}
 	if ack.Hold {
-		log.Printf("agent: connection validated — replication not started yet; will retry")
+		conn.Close()
+		log.Printf("agent: connection validated — replication not started yet (or destination still launching); will retry")
 		return res, nil
 	}
+	if ack.DataTarget != "" {
+		// Direct-to-destination: re-dial the destination and stream there. The
+		// server name stays the appliance's cert SAN — the destination presents
+		// the appliance's receiver cert, so verification passes without a
+		// per-destination certificate.
+		conn.Close()
+		sni := ack.DataServerName
+		if sni == "" {
+			sni = c.serverName
+		}
+		log.Printf("agent: streaming files directly to the destination %s", ack.DataTarget)
+		conn, w, r, ack, err = dialFileSession(c, ack.DataTarget, sni)
+		if err != nil {
+			return res, fmt.Errorf("dial destination %s: %w", ack.DataTarget, err)
+		}
+		if ack.Hold {
+			conn.Close()
+			log.Printf("agent: destination not ready to receive yet; will retry")
+			return res, nil
+		}
+	}
+	defer conn.Close()
 	if !ack.Accepted {
 		return res, fmt.Errorf("receiver rejected file session: %s", ack.Message)
 	}
@@ -173,10 +211,15 @@ func replicateFiles(c cfg) (syncResult, error) {
 		}
 		entries++
 		if sendData {
-			n, derr := streamFileData(w, p, e.Size)
+			n, streamedHash, derr := streamFileData(w, p, e.Size)
 			if derr != nil {
 				return derr
 			}
+			// Record what the receiver actually stored (the hash of the exact bytes
+			// we streamed), not the pre-read hash — a live file may have changed
+			// between the two, and the manifest must reflect the delivered content
+			// so the next pass's unchanged-skip is correct.
+			next[rel] = streamedHash
 			bytesWire += n
 		}
 		return nil
@@ -241,12 +284,12 @@ func entryFor(abs, rel string, info os.FileInfo, prev, next fileManifest) (proto
 		return e, false, nil
 	case info.Mode().IsRegular():
 		e.Type, e.Size = "file", info.Size()
-		sum, err := hashFile(abs)
+		sum, err := hashFilePrefix(abs, e.Size)
 		if err != nil {
 			return e, false, err
 		}
 		e.Hash = sum
-		next[rel] = sum
+		next[rel] = sum // provisional; overwritten with the streamed hash if we send data
 		if prev[rel] == sum {
 			e.Unchanged = true
 			return e, false, nil // content unchanged; metadata only
@@ -258,43 +301,79 @@ func entryFor(abs, rel string, info os.FileInfo, prev, next fileManifest) (proto
 	}
 }
 
-func hashFile(path string) (string, error) {
+// hashFilePrefix hashes exactly the first size bytes of a file (the same window
+// streamFileData sends). Hashing to EOF instead would read a different amount
+// than we stream for a file being appended to, guaranteeing a spurious mismatch;
+// bounding it to the stat'd size keeps the delta decision consistent with the
+// wire. A file that shrank below size yields EOF early — we hash what's there.
+func hashFilePrefix(path string, size int64) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.CopyN(h, f, size); err != nil && err != io.EOF {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // streamFileData sends a regular file's content as MsgFileData chunks totalling
-// exactly size bytes.
-func streamFileData(w *bufio.Writer, path string, size int64) (int64, error) {
+// EXACTLY size bytes — the length the receiver was told to expect in the
+// FileEntry — and returns the SHA-256 of exactly those streamed bytes.
+//
+// Sending exactly size bytes is what keeps a live file from derailing the pass:
+// the receiver frames the file purely by byte count, so if a log grew after we
+// stat'd it we send only the first size bytes, and if it was truncated we
+// zero-pad up to size. Either way the stream stays aligned. The returned hash
+// lets the caller record in its manifest what the receiver actually stored,
+// rather than a stale pre-read hash of a since-changed file.
+func streamFileData(w *bufio.Writer, path string, size int64) (int64, string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	defer f.Close()
+	h := sha256.New()
 	buf := make([]byte, fileChunk)
 	var sent int64
 	for sent < size {
-		n, rerr := f.Read(buf)
+		want := size - sent
+		if want > int64(len(buf)) {
+			want = int64(len(buf))
+		}
+		n, rerr := f.Read(buf[:want])
 		if n > 0 {
-			if err := protocol.WriteFrame(w, protocol.MsgFileData, buf[:n]); err != nil {
-				return sent, err
+			chunk := buf[:n]
+			if err := protocol.WriteFrame(w, protocol.MsgFileData, chunk); err != nil {
+				return sent, "", err
 			}
+			h.Write(chunk)
 			sent += int64(n)
 		}
 		if rerr == io.EOF {
 			break
 		}
 		if rerr != nil {
-			return sent, rerr
+			return sent, "", rerr
 		}
 	}
-	return sent, nil
+	// The file shrank below its stat'd size mid-copy: pad with zeros so the
+	// receiver still gets exactly size bytes and the stream stays framed.
+	if sent < size {
+		zeros := make([]byte, fileChunk)
+		for sent < size {
+			want := size - sent
+			if want > int64(len(zeros)) {
+				want = int64(len(zeros))
+			}
+			if err := protocol.WriteFrame(w, protocol.MsgFileData, zeros[:want]); err != nil {
+				return sent, "", err
+			}
+			h.Write(zeros[:want])
+			sent += want
+		}
+	}
+	return sent, hex.EncodeToString(h.Sum(nil)), nil
 }

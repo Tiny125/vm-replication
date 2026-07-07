@@ -164,7 +164,7 @@ func TestServeSeversHungSessionAfterGrace(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() {
-		served <- Serve(ctx, ln, target, "", false, nil, nil, nil, nil, nil, nil)
+		served <- Serve(ctx, ln, target, "", false, nil, nil, nil, nil, nil, nil, nil)
 	}()
 
 	// "Agent": open a session, send a valid Hello, get accepted… then hang.
@@ -204,7 +204,7 @@ func exchangeHelloCheck(t *testing.T, target string, h protocol.Hello, want Cons
 	t.Helper()
 	c, srv := net.Pipe()
 	go func() {
-		_, _ = Handle(srv, target, "", nil, want, nil, check)
+		_, _ = Handle(srv, target, "", nil, want, nil, check, nil)
 	}()
 	defer c.Close()
 

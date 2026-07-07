@@ -166,6 +166,15 @@ type HelloAck struct {
 	// until the operator clicks "Start replication" in the console. Old agents
 	// that don't understand it see Accepted=false and simply retry next tick.
 	Hold bool `json:"hold,omitempty"`
+	// DataTarget redirects a file-transfer agent to stream to a DIFFERENT
+	// receiver (the launched destination Linode), instead of applying data here.
+	// The appliance's control receiver returns it (with Accepted=false) once the
+	// destination is up: the agent re-dials DataTarget, verifying the server
+	// against DataServerName (which stays the appliance's cert SAN — the
+	// destination presents the appliance's receiver cert, so no per-destination
+	// certificate is needed). Empty means "no redirect".
+	DataTarget     string `json:"data_target,omitempty"`
+	DataServerName string `json:"data_server_name,omitempty"`
 }
 
 // Done closes the stream and reports what the agent sent.
