@@ -97,6 +97,28 @@ func fileHelloAck(t *testing.T, root string, ft FileTarget) protocol.HelloAck {
 	return ack
 }
 
+// A per-file content-hash mismatch must NOT fail the whole pass. Live files
+// (logs, journals) can change between the agent's hash and its streaming read,
+// so the streamed bytes won't match the entry's advertised hash. The receiver
+// must keep the freshest streamed bytes (they are exactly Size, mTLS-intact),
+// warn, and carry on — the pass still completes and the file lands. Before this
+// fix, one racy log file aborted the entire migration ("content hash mismatch").
+func TestFileSessionToleratesHashRace(t *testing.T) {
+	root := t.TempDir()
+	err := runFileSession(t, root, []fileMsg{
+		{entry: protocol.FileEntry{Path: "var", Type: "dir", Mode: 0o755}},
+		{entry: protocol.FileEntry{Path: "var/log", Type: "dir", Mode: 0o755}},
+		// Wrong advertised hash, but a well-formed, correctly-sized data stream.
+		{entry: protocol.FileEntry{Path: "var/log/access.log", Type: "file", Mode: 0o644, Hash: "0000deadbeef"}, data: []byte("racy log line\n")},
+	}, true)
+	if err != nil {
+		t.Fatalf("a hash race must not fail the pass, got: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "var", "log", "access.log")); string(b) != "racy log line\n" {
+		t.Errorf("streamed bytes must still land on a hash race, got %q", b)
+	}
+}
+
 // A hostile agent must not escape the output root.
 func TestFileSessionRejectsUnsafePaths(t *testing.T) {
 	for _, bad := range []string{"/etc/passwd", "../escape", "a/../../b"} {
@@ -164,8 +186,12 @@ func runFileSession(t *testing.T, root string, msgs []fileMsg, complete bool) er
 		e := m.entry
 		if e.Type == "file" && !e.Unchanged {
 			e.Size = int64(len(m.data))
-			sum := sha256.Sum256(m.data)
-			e.Hash = hex.EncodeToString(sum[:])
+			// Respect an explicitly-set (possibly wrong) hash so tests can
+			// exercise the mismatch path; otherwise compute the correct one.
+			if e.Hash == "" {
+				sum := sha256.Sum256(m.data)
+				e.Hash = hex.EncodeToString(sum[:])
+			}
 		}
 		if err := protocol.WriteJSON(w, protocol.MsgFileEntry, e); err != nil {
 			return err

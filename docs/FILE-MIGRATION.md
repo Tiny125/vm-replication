@@ -117,6 +117,26 @@ block methods are untouched (proven by the full test suite staying green).
   posture as the disk-boot rescue flow. The protocol/agent/receiver mechanics and
   the bootstrap are unit-proven.
 
+### Live files (logs, journals) during a copy
+Files that the source keeps writing while the copy runs — `/var/log/*`,
+`systemd` journals, databases — inevitably change between the moment the agent
+hashes a file and the moment it streams it. The transfer is built to tolerate
+this rather than abort on it:
+
+- The agent always streams **exactly the byte count it advertised** for a file
+  (truncating a file that grew, zero-padding one that shrank), so a moving file
+  can never desync the stream framing.
+- The agent records in its manifest the hash of the **bytes it actually
+  streamed**, so the next delta pass correctly re-sends anything that has since
+  moved.
+- The receiver treats a per-file content-hash mismatch as "this file changed
+  mid-copy" (not corruption — mTLS already guarantees transit integrity): it
+  keeps the freshest streamed bytes, logs a note, and **continues the pass**.
+
+At **cutover** the source is frozen (guided freeze / power-off) before the final
+pass, so that pass has no such race and lands the exact, consistent content.
+Earlier a single racy log file failed the whole pass with `content hash mismatch`.
+
 ### Requirements / caveats (direct mode)
 - The destination image must support **cloud-init + the Linode Metadata service**
   (Ubuntu/Debian/RHEL-family cloud images do). Without it the receiver can't
