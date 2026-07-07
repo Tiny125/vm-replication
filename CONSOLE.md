@@ -275,8 +275,13 @@ with its size rounded up:
 
 ```bash
 echo "Hostname : $(hostname)"; lsblk -b -d -n -o NAME,SIZE,TYPE | \
-  awk '$3=="disk"{printf "Device   : /dev/%s\nSize(GB) : %d\n", $1, ($2+1073741823)/1073741824}'
+  awk '$3=="disk" && $2>0 && $1!~/^(nbd|loop|ram|zram|sr|fd)/{printf "Device   : /dev/%s\nSize(GB) : %d\n", $1, ($2+1073741823)/1073741824}'
 ```
+
+The `awk` filter skips pseudo/empty block devices — `nbd*` (network block
+devices, e.g. the 16 empty `/dev/nbd0..15` a loaded `nbd` module creates),
+`loop`, `ram`/`zram`, `sr` (optical), `fd` (floppy) — so only real, non-zero
+data disks are listed.
 
 Use the **whole disks** (e.g. `/dev/sda`, `/dev/sdb`), not partitions. For LVM,
 if a volume group spans multiple disks, add **all** of its member disks.

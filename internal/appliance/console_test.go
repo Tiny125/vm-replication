@@ -124,6 +124,30 @@ func TestConsoleSourceHelperReportsOSAndUsed(t *testing.T) {
 	}
 }
 
+// The source-details helper lists whole disks via lsblk. It must skip pseudo
+// block devices (nbd/loop/ram/zram/sr/fd) and zero-size nodes so a destination
+// (or any host) with the nbd kernel module loaded doesn't print 16 empty
+// "/dev/nbdN — Size 0" lines that look like extra disks.
+func TestConsoleSourceHelperSkipsPseudoDisks(t *testing.T) {
+	i := strings.Index(consoleHTML, `id="srcCmd"`)
+	if i < 0 {
+		t.Fatal("source-details helper (srcCmd) not found")
+	}
+	cmd := consoleHTML[i:]
+	if end := strings.Index(cmd, "</pre>"); end >= 0 {
+		cmd = cmd[:end]
+	}
+	// The lsblk|awk pipeline must filter by size and by device-name prefix.
+	if !strings.Contains(cmd, "$2>0") {
+		t.Error("helper must skip zero-size block devices ($2>0)")
+	}
+	for _, pseudo := range []string{"nbd", "loop", "ram", "zram", "sr", "fd"} {
+		if !strings.Contains(cmd, pseudo) {
+			t.Errorf("helper must exclude pseudo device %q from the disk list", pseudo)
+		}
+	}
+}
+
 // extractJSFunc returns the source of the embedded-JS function that begins with
 // header, up to the next top-level (column-0) "function"/"async function"
 // declaration — enough to assert what a given function contains.
