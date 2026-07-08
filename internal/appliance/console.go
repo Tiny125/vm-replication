@@ -604,16 +604,17 @@ async function startMig(id,btn){
   const file=meta.boot_target==='file';
   const planNote=meta.linode_type?(' on plan <b>'+esc(meta.linode_type)+'</b>'):'';
   const access='<div class="muted" style="font-size:12px;margin-top:10px">Your migrated system keeps the <b>source</b>’s logins, and cloud images usually leave root locked — so set a root password (and/or SSH key) below to reach the new instance via the Lish console without rescue mode.</div>';
-  // Guided cutover, two steps with a power-off in between (same for volume- and
-  // disk-boot, for consistency). Step 1 STOPS replication and freezes the current
-  // replicated copy as the image — crash-consistent (like a power-loss), repaired
-  // with fsck on convert; it never attempts a read-only remount, so it can't get
-  // stuck on a busy root. Step 2 (after you power off the source) launches.
+  // Guided cutover, 3 steps with a power-off in between (same for volume- and
+  // disk-boot). Step 1 STOPS replication and, for the BLOCK methods, takes ONE
+  // consistent final pass with the source root remounted read-only (so the
+  // cloned/converted image is a clean point-in-time, not a live smear that fails
+  // fsck on convert). If the operator confirms the source is already powered off
+  // or idle, they can tick the box to skip that quiesce. Step 3 launches.
   const how='<div style="margin-bottom:8px"><b>Cutover has 3 steps:</b>'+
-    '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> '+(file?'stop replication and hold the copied files for launch.':'stop replication and freeze the current replicated copy as the image.')+'</div>'+
+    '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> '+(file?'stop replication and hold the copied files for launch.':'stop replication and take a consistent final pass (the source root is briefly remounted read-only), then hold it as the image.')+'</div>'+
     '<div style="margin-top:4px"><b>Step 2:</b> power off the source server.</div>'+
     '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(file?('reboots the destination Linode'+planNote+' (already launched at Start, with your files copied straight into it) so it boots into your migrated system — the migration is then complete. No Lish paste needed.'):disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('launches a new Linode'+planNote+' from the frozen image.'):'clones every disk into launchable volumes.'))+'</div></div>';
-  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the '+(file?'copied files are current.':'frozen copy is current. The image is crash-consistent and repaired with fsck on convert — no LVM or read-only remount needed.')+'</div>';
+  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the '+(file?'copied files are current.':'final pass is current. The final pass remounts the source root <b>read-only</b> for a clean, fsck-passing image — if writers are still holding the root open, the cutover fails fast and asks you to stop them (or tick the box below if the source is already powered off).')+'</div>';
   // Optional names for what the cutover creates: the instance (both methods)
   // and, for volume boot, the cutover volume. Blank keeps <name>-cutover.
   const defName=esc((meta.name||'')+'-cutover');
@@ -624,17 +625,24 @@ async function startMig(id,btn){
     {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
   );
   const opts={
-    title:'Cut over migration #'+id+' — step 1 of 3: stop replication'+(file?'':' & freeze'),
+    title:'Cut over migration #'+id+' — step 1 of 3: stop replication'+(file?'':' & take a consistent pass'),
     okText:'Stop replication & continue',
     html:how+access+prep,
     fields:fields
   };
+  // Block methods: default to the read-only quiesce, with an opt-out for an
+  // already-powered-off/idle source. File transfer doesn't convert a block image,
+  // so it keeps its existing behaviour (no quiesce checkbox).
+  if(!file)opts.checkboxes=[{id:'skip_snap',label:'The source is already powered off or idle — skip the read-only snapshot',checked:false}];
   const r=await confirmModal(opts);
   if(!r)return;
   busy(btn,true);
-  // Always guided + skip the read-only snapshot: freeze the current crash-consistent
-  // data, pause for the operator to power off the source, then launch. Always launch.
-  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:true,label:r.inst_name||'',volume_label:r.vol_name||'',root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:true,guided_shutdown:true});await refreshMig(id)}
+  // File keeps skip_snapshot:true (no block image to make consistent). Block
+  // methods quiesce by default (skip_snapshot:false) so finalize() captures a
+  // crash-consistent final pass via the existing agent remount-ro / LVM path,
+  // unless the operator opted out for an already-off source.
+  const skipSnap=file?true:!!r.skip_snap;
+  try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:true,label:r.inst_name||'',volume_label:r.vol_name||'',root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:skipSnap,guided_shutdown:true});await refreshMig(id)}
   catch(e){alertModal({title:'Cannot start cutover',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function completeCutover(id,btn){
