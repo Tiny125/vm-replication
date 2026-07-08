@@ -94,6 +94,31 @@ func TestConsoleFileFlowMessagesAreMethodAware(t *testing.T) {
 	}
 }
 
+// The file-transfer flow must render the explicit "Create destination instance"
+// step: a destPanel that keys off dest_state, a createDest() that collects a name
+// + root password and POSTs to /destination, and a Start button whose disabled
+// title points the operator at the destination step.
+func TestConsoleDestinationStep(t *testing.T) {
+	for _, want := range []string{
+		"function destPanel(",         // the destination status panel
+		"v.dest_state",                // it keys off the destination state
+		"Create destination instance", // the button label
+		"async function createDest(",  // the create action
+		"/destination",                // POSTs to the new endpoint
+		"root_password:r.d_pw",        // sends the operator's root password
+		"dest_manual_cmd",             // renders the manual-install fallback
+		"the destination is ready",    // Start tooltip mentions destination readiness
+	} {
+		if !strings.Contains(consoleHTML, want) {
+			t.Errorf("destination step missing %q", want)
+		}
+	}
+	// The card poller must rebuild when the destination status changes.
+	if !strings.Contains(consoleHTML, "card.dataset.dest") {
+		t.Error("card must track dest_state so the panel + Start gate update live")
+	}
+}
+
 // The guided cutover must tell the operator, ON THE CARD, when it is safe to
 // power off the source: a "keep the source running" banner while step 1's
 // freeze/drain runs (cutover_freezing), then a "power off the source server

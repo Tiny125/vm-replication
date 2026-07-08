@@ -3,6 +3,7 @@ package appliance
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -36,7 +37,11 @@ const destFilePort = 5999
 type fileDest struct {
 	instanceID int64
 	ip         string
-	ready      bool // the destination's receiver is reachable on destFilePort
+	ready      bool   // the destination's receiver is reachable on destFilePort
+	label      string // the operator-chosen instance name
+	token      string // the bootstrap token (also used by the manual-install command)
+	failed     bool   // the launch failed; the operator can retry Create destination
+	errMsg     string // failure reason (never contains the root password)
 }
 
 // destBootstrap authorizes a destination's one-time download of the receiver
@@ -64,38 +69,63 @@ func (s *Server) fileDataTarget(migID int64) (target, serverName string, hold bo
 	return net.JoinHostPort(d.ip, fmt.Sprintf("%d", destFilePort)), s.cfg.PublicHost, false
 }
 
-// ensureFileDestination launches the destination for a file migration (once)
-// and, in the background, waits for its receiver to come up so fileDataTarget
-// starts redirecting the agent to it. Idempotent per migration.
-func (s *Server) ensureFileDestination(m api.Migration) {
+// fileAutomation reports whether the appliance can launch a destination Linode
+// (a Linode token is configured and the appliance knows its own instance id).
+// Without it, the file method falls back to staging on the appliance.
+func (s *Server) fileAutomation() bool {
+	if s.st == nil {
+		return false
+	}
+	if _, ok := s.linodeClient(s.ctx); !ok {
+		return false
+	}
+	return s.cfg.ApplianceLinodeID != 0
+}
+
+// createFileDestination launches the destination for a file migration with an
+// operator-chosen label + root password, once. It replaces the old auto-launch:
+// the operator creates the destination explicitly (so they can log into it), and
+// Start replication stays gated until the destination's receiver is ready.
+// Returns an error if it cannot begin (wrong method, no automation, already up).
+func (s *Server) createFileDestination(m api.Migration, label, rootPass string) error {
 	if !isFileMethod(m.BootTarget) {
-		return
+		return fmt.Errorf("not a file-transfer migration")
 	}
-	if _, ok := s.linodeClient(s.ctx); !ok || s.cfg.ApplianceLinodeID == 0 {
-		return // no automation: the appliance-staging fallback handles it
+	if !s.fileAutomation() {
+		return fmt.Errorf("no Linode automation: add a Linode API token in Settings to launch a destination")
 	}
-	if _, loaded := s.fileDests.LoadOrStore(m.ID, &fileDest{}); loaded {
-		return // already launching/launched
+	if v, ok := s.fileDests.Load(m.ID); ok {
+		if d := v.(*fileDest); !d.failed {
+			return fmt.Errorf("a destination instance already exists for this migration")
+		}
 	}
-	go s.launchFileDestination(m)
+	if label == "" {
+		label = cutoverInstanceLabel("", m.Name)
+	}
+	if rootPass == "" {
+		// Fall back to a strong generated password if the operator left it blank.
+		rootPass = randPassword()
+	}
+	// Mark launching so the console reflects it immediately and a second click is a
+	// no-op. rootPass is passed to the launch goroutine only — never stored here.
+	s.fileDests.Store(m.ID, &fileDest{label: label})
+	go s.launchFileDestination(m, label, rootPass)
+	return nil
 }
 
 // launchFileDestination creates the destination from the OS image with cloud-init
 // that installs + runs the receiver, then polls until its receiver port answers.
-func (s *Server) launchFileDestination(m api.Migration) {
+// rootPass is used only for the create call and is never logged or persisted.
+func (s *Server) launchFileDestination(m api.Migration, label, rootPass string) {
 	ctx := s.ctx
 	cl, ok := s.linodeClient(ctx)
 	if !ok {
 		return
 	}
-	label := cutoverInstanceLabel("", m.Name)
 	region := s.cfg.Region
 	if inst, err := cl.GetInstance(ctx, s.cfg.ApplianceLinodeID); err == nil && inst.Region != "" {
 		region = inst.Region
 	}
-	// A strong root password so the operator can log in (reset in Cloud Manager);
-	// never logged.
-	rootPass := randPassword()
 
 	// Token-gated bootstrap so the destination can pull the receiver binary + certs.
 	tok := s.registerDestBootstrap(m.ID, 6*time.Hour)
@@ -103,13 +133,15 @@ func (s *Server) launchFileDestination(m api.Migration) {
 
 	inst, err := cl.CreateInstanceFromImageUserData(ctx, label, region, m.LinodeType, m.OSImage, rootPass, userData)
 	if err != nil {
-		s.fileDests.Delete(m.ID)
-		s.fail(m.ID, "launch destination: "+err.Error())
+		// Mark the destination failed (don't fail the whole migration) so the
+		// operator can fix the cause and retry "Create destination instance".
+		s.fileDests.Store(m.ID, &fileDest{label: label, token: tok, failed: true, errMsg: err.Error()})
+		_ = s.st.AddEvent(ctx, m.ID, "error", "could not launch the destination instance: "+err.Error())
 		return
 	}
-	s.fileDests.Store(m.ID, &fileDest{instanceID: inst.ID})
+	s.fileDests.Store(m.ID, &fileDest{instanceID: inst.ID, label: label, token: tok})
 	_ = s.st.SetMigrationImage(ctx, m.ID, "file:direct", inst.ID)
-	_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("launched destination %q (id %d) from image %s on plan %s — installing the file receiver, then the agent will copy straight into it", label, inst.ID, m.OSImage, m.LinodeType))
+	_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("launched destination %q (id %d) from image %s on plan %s — installing the file receiver", label, inst.ID, m.OSImage, m.LinodeType))
 
 	// Wait for the instance to run, learn its public IP, then poll its receiver
 	// port until it answers.
@@ -131,10 +163,11 @@ func (s *Server) launchFileDestination(m api.Migration) {
 		}
 	}
 	if ip == "" {
-		_ = s.st.AddEvent(ctx, m.ID, "warn", "could not determine the destination's public IP yet; will keep the agent holding")
+		s.fileDests.Store(m.ID, &fileDest{instanceID: inst.ID, label: label, token: tok, failed: true, errMsg: "could not determine the destination's public IP"})
+		_ = s.st.AddEvent(ctx, m.ID, "warn", "could not determine the destination's public IP yet")
 		return
 	}
-	s.fileDests.Store(m.ID, &fileDest{instanceID: inst.ID, ip: ip})
+	s.fileDests.Store(m.ID, &fileDest{instanceID: inst.ID, ip: ip, label: label, token: tok})
 
 	// Poll the receiver port: cloud-init needs a few minutes to install + start it.
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", destFilePort))
@@ -146,13 +179,64 @@ func (s *Server) launchFileDestination(m api.Migration) {
 		c, err := net.DialTimeout("tcp", addr, 5*time.Second)
 		if err == nil {
 			_ = c.Close()
-			s.fileDests.Store(m.ID, &fileDest{instanceID: inst.ID, ip: ip, ready: true})
-			_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("destination %s is ready to receive — the agent will now copy your files straight into it", addr))
+			s.fileDests.Store(m.ID, &fileDest{instanceID: inst.ID, ip: ip, label: label, token: tok, ready: true})
+			_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("destination %s is ready to receive — you can now Start replication", addr))
 			return
 		}
 		time.Sleep(10 * time.Second)
 	}
-	_ = s.st.AddEvent(ctx, m.ID, "warn", fmt.Sprintf("the destination's file receiver did not come up on %s within 15m. Check its Lish console (cloud-init log: /var/log/vmrepl-dest.log). If the image lacks cloud-init/metadata support, the receiver can't auto-install — tell us and we'll add a manual paste fallback.", addr))
+	// Keep the record (not failed) with its token so the console can show the
+	// manual-install command; the receiver may still come up, and the operator can
+	// run the paste command to bring it up now.
+	_ = s.st.AddEvent(ctx, m.ID, "warn", fmt.Sprintf("the destination's file receiver has not come up on %s automatically (the image/region may lack cloud-init/Metadata). Run the manual install command shown on the card in the instance's Lish console.", addr))
+}
+
+// destStatusFor computes the console-facing destination status for a migration.
+func (s *Server) destStatusFor(m api.Migration) (state string, linodeID int64, ip, errMsg, manualCmd string) {
+	if !isFileMethod(m.BootTarget) {
+		return "", 0, "", "", ""
+	}
+	if !s.fileAutomation() {
+		return "fallback", 0, "", "", ""
+	}
+	v, ok := s.fileDests.Load(m.ID)
+	if !ok {
+		return "none", 0, "", "", ""
+	}
+	d := v.(*fileDest)
+	if d.token != "" {
+		manualCmd = s.destManualInstallCmd(d.token)
+	}
+	switch {
+	case d.failed:
+		return "failed", d.instanceID, d.ip, d.errMsg, manualCmd
+	case d.ready:
+		return "ready", d.instanceID, d.ip, "", manualCmd
+	case d.ip != "":
+		return "installing", d.instanceID, d.ip, "", manualCmd
+	default:
+		return "launching", d.instanceID, d.ip, "", manualCmd
+	}
+}
+
+// destReady reports whether the migration's destination receiver is reachable
+// (so Start replication may proceed). True for the no-automation fallback.
+func (s *Server) destReady(m api.Migration) bool {
+	if !isFileMethod(m.BootTarget) || !s.fileAutomation() {
+		return true
+	}
+	if v, ok := s.fileDests.Load(m.ID); ok {
+		return v.(*fileDest).ready
+	}
+	return false
+}
+
+// destManualInstallCmd builds the copy-paste command the operator runs in the
+// destination's Lish console (as root) to install + start the file receiver when
+// the automatic cloud-init install stalls.
+func (s *Server) destManualInstallCmd(token string) string {
+	base := fmt.Sprintf("%s://%s:%d", s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort)
+	return fmt.Sprintf("curl -fsSL %s'%s/dest/install.sh?token=%s' | sudo bash", s.curlPinFlag(), base, token)
 }
 
 // registerDestBootstrap mints a token letting the destination download the
@@ -214,6 +298,43 @@ systemctl enable --now vmrepl-receiver.service
 echo "vmrepl-dest: receiver started on :%d"
 `, pin, base, token, pin, base, token, destFilePort, destFilePort)
 	return script
+}
+
+// handleCreateDestination launches a file-transfer migration's destination
+// instance with an operator-chosen label + root password (POST
+// /api/v1/migrations/{id}/destination). The root password is used only to create
+// the instance and is never logged or persisted.
+func (s *Server) handleCreateDestination(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	m, err := s.st.Migration(r.Context(), id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
+	var req api.CreateDestinationRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := s.createFileDestination(m, sanitizeLabel(req.Label), req.RootPassword); err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	_ = s.st.AddEvent(r.Context(), id, "info", "creating the destination instance (operator) — installing the file receiver, then Start replication unlocks once it is ready")
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "launching"})
+}
+
+// handleDestInstall serves the receiver-install script (GET /dest/install.sh,
+// token-gated) so the operator can run it manually in the destination's Lish
+// console when cloud-init doesn't auto-install the receiver.
+func (s *Server) handleDestInstall(w http.ResponseWriter, r *http.Request) {
+	tok := r.URL.Query().Get("token")
+	if _, ok := s.lookupDestBootstrap(tok); !ok {
+		writeErr(w, http.StatusForbidden, "invalid or expired bootstrap token")
+		return
+	}
+	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+	_, _ = w.Write([]byte(s.destCloudInit(tok)))
 }
 
 // handleDestReceiver serves the receiver binary to a booting destination (GET

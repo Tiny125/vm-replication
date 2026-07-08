@@ -646,6 +646,57 @@ async function stopMig(id,btn){
   if(!await confirmModal({title:'Stop cutover #'+id+'?',html:'The finalize run is cancelled and replication resumes.',okText:'Stop cutover',okDanger:true}))return;
   busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/stop');await refreshMig(id)}catch(e){alertModal({title:'Cannot stop',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
+// destPanel renders the file-transfer destination step: a "Create destination
+// instance" button (name + root password), then live launch/install status, a
+// manual receiver-install command fallback, and a ready/failed result — gating
+// Start replication until the destination's receiver answers. Empty for block
+// methods, the appliance-staging fallback, and post-replication states.
+function destPanel(v,m){
+  const st=v.dest_state;
+  if(!st||st==='fallback')return '';
+  if(['migrating','awaiting_cutover','image_ready','launched'].includes(m.state))return '';
+  const amber='border-color:#f2ddba;background:#fdf6ea;color:#7a4d05';
+  const idl=v.dest_linode_id||m.launched_linode_id;
+  const lish=idl?(' — <a href="https://cloud.linode.com/linodes/'+idl+'/lish/weblish" target="_blank" rel="noopener">open Lish</a>'):'';
+  const manual=v.dest_manual_cmd?('<div style="margin-top:8px;font-size:12px"><b>Taking too long?</b> Open the instance’s Lish console (log in as root)'+lish+' and paste this to install the receiver now:</div>'+
+    '<div style="display:flex;gap:8px;align-items:flex-start;margin-top:6px"><pre id="dinstall'+m.id+'" style="flex:1;margin:0">'+esc(v.dest_manual_cmd)+'</pre>'+
+    '<button onclick="copyText(document.getElementById(\'dinstall'+m.id+'\').textContent,this)">Copy</button></div>'):'';
+  if(st==='none')
+    return '<div class="banner" style="'+amber+'"><b>Step 1 — create the destination instance.</b>'+
+      '<div style="margin-top:6px">Launches a <b>'+esc(m.linode_type||'plan')+'</b> Linode running <b>'+esc(m.os_image||'your OS image')+'</b> and installs the file receiver on it. <b>Start replication</b> unlocks once it’s ready to receive.</div>'+
+      '<div style="margin-top:8px"><button class="primary" onclick="createDest('+m.id+',this)">Create destination instance</button></div></div>';
+  if(st==='failed')
+    return '<div class="banner" style="border-color:#e6c0c0;background:#fdeeee;color:#7a1f1f"><b>Destination launch failed.</b>'+
+      '<div style="margin-top:6px">'+esc(v.dest_error||'see the activity log')+'</div>'+
+      '<div style="margin-top:8px"><button class="primary" onclick="createDest('+m.id+',this)">Retry — create destination instance</button></div></div>';
+  if(st==='ready')
+    return '<div class="resultbox ok" style="margin-top:10px"><b>✔ Destination ready</b> — Linode '+esc(idl||'')+(v.dest_ip?(' ('+esc(v.dest_ip)+')'):'')+' is ready to receive. Use <b>Start replication</b> to begin copying your files into it.</div>';
+  // launching / installing
+  const label=(st==='launching')?'Launching the destination Linode…':'Installing the file receiver on the destination…';
+  return '<div class="banner" style="'+amber+'"><b>'+label+'</b>'+
+    '<div style="margin-top:6px">This can take a few minutes.'+(v.dest_ip?(' Destination IP: <b>'+esc(v.dest_ip)+'</b>.'):'')+' <b>Start replication</b> unlocks automatically once its receiver answers.</div>'+manual+'</div>';
+}
+// createDest launches the file-transfer destination instance with an operator
+// name + root password. The password is sent once to create the instance and is
+// never stored by the appliance.
+async function createDest(id,btn){
+  const meta=migMeta[id]||{};
+  const defName=esc((meta.name||'')+'-dest');
+  const r=await confirmModal({
+    title:'Create destination instance for #'+id,
+    html:'Launches a <b>'+esc(meta.linode_type||'plan')+'</b> Linode running <b>'+esc(meta.os_image||'your OS image')+'</b> and installs the file receiver on it. Set a <b>root password</b> so you can log into it (Lish/SSH) — e.g. to run the manual install if cloud-init is unavailable.',
+    okText:'Create destination',
+    fields:[
+      {id:'d_name',label:'Destination instance name (optional)',type:'text',placeholder:'default: '+defName},
+      {id:'d_pw',label:'Root password for the destination',type:'password',placeholder:'used to log in (Lish/SSH) — leave blank to auto-generate'}
+    ]
+  });
+  if(!r)return;
+  if(r.d_pw && r.d_pw.length<6){alertModal({title:'Password too short',html:'Enter at least 6 characters, or leave it blank to auto-generate a strong one.',danger:true});return;}
+  busy(btn,true);
+  try{await api('POST','/api/v1/migrations/'+id+'/destination',{label:r.d_name||'',root_password:r.d_pw||''});await refreshMig(id);}
+  catch(e){alertModal({title:'Cannot create destination',html:esc(e.message),danger:true});}finally{busy(btn,false);}
+}
 // startReplication starts (or, when resume=true, resumes) replication.
 async function startReplication(id,btn,resume){
   // Method-aware wording: file transfer copies FILES onto a launched destination,
@@ -976,6 +1027,10 @@ function migCard(v){
   if(m.last_error)b+='<div class="resultbox bad">'+esc(m.last_error)+'</div>';
   else if(err)b+='<div class="resultbox bad">Last replication attempt failed: '+esc(err)+'</div>';
 
+  // File transfer: the explicit "Create destination instance" step + its status,
+  // shown before replication starts and gating the Start button.
+  b+=destPanel(v,m);
+
   if(['image_ready','launched'].includes(m.state) && m.boot_target==='file'){
     b+='<div class="banner">✔ <b>Migration completed.</b> '+
        (m.launched_linode_id?('Your files were copied onto Linode '+esc(m.launched_linode_id)+' ('+esc(m.linode_type||'plan')+'), which rebooted into your migrated system — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a> and connect via Lish. No separate volume is used.')
@@ -1088,8 +1143,9 @@ function migCard(v){
     // but only during the replication phase.
     const ctrl=['created','awaiting_agent','replicating','ready'].includes(m.state);
     if(ctrl && !v.replication_started){
-      b+='<button class="primary"'+(v.can_replicate?'':' disabled title="Waiting for the agent connection to be validated"')+' onclick="startReplication('+m.id+',this,false)">Start replication</button>'+
-        infoIcon('Replication does not start automatically. Once the agent connection shows a green tick, this begins the initial '+(file?'file copy.':'full sync.'));
+      const startTitle=file&&v.dest_state&&v.dest_state!=='fallback'&&v.dest_state!=='ready'?'Create the destination instance and wait for it to be ready first':'Waiting for the agent connection to be validated';
+      b+='<button class="primary"'+(v.can_replicate?'':' disabled title="'+startTitle+'"')+' onclick="startReplication('+m.id+',this,false)">Start replication</button>'+
+        infoIcon('Replication does not start automatically. Once the agent connection shows a green tick'+(file?' and the destination is ready':'')+', this begins the initial '+(file?'file copy.':'full sync.'));
     }else if(ctrl && v.replication_active){
       b+='<button class="danger" onclick="pauseReplication('+m.id+',this)">Pause replication</button>'+
         infoIcon('Stops sending data after any in-flight pass finishes. Already-copied data is kept; resume continues with an incremental delta — no full re-copy.');
@@ -1124,6 +1180,9 @@ function migCard(v){
   // the next 5s pass).
   card.dataset.cutcmd=v.cutover_copy_cmd?'1':'';
   card.dataset.frz=v.cutover_freezing?'1':'';
+  // Rebuild when the file-transfer destination's status changes (none → launching
+  // → installing → ready/failed) so its panel + the Start gate update promptly.
+  card.dataset.dest=v.dest_state||'';
   return card;
 }
 
@@ -1198,6 +1257,7 @@ function startTimers(){
       api('GET','/api/v1/migrations/'+id).then(v=>{
         const m=v.migration;
         if(String(m.state)!==card.dataset.state){replaceCard(id,v);return;} // structure changed
+        if((v.dest_state||'')!==card.dataset.dest){replaceCard(id,v);return;} // destination status changed
         if((v.cutover_copy_cmd?'1':'')!==card.dataset.cutcmd){replaceCard(id,v);return;} // copy step appeared/finished
         if((v.cutover_freezing?'1':'')!==card.dataset.frz){replaceCard(id,v);return;} // freeze phase started/ended
         const set=(sel,html)=>{const el=card.querySelector(sel);if(el)el.innerHTML=html;};

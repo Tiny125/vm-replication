@@ -27,16 +27,16 @@ func TestValidationsFileMethod(t *testing.T) {
 	if !hasPrefix(names, "Destination") {
 		t.Errorf("file migrations should show a destination-readiness check; got %v", names)
 	}
-	// The destination Linode is launched at Start, not at Create — the check
-	// detail must say so, so a green tick isn't mistaken for "instance exists".
+	// With no Linode automation (a bare Server), the file method stages on the
+	// appliance, so the destination check reports the fallback (no instance step).
 	destDetail := ""
 	for _, c := range checks {
 		if strings.HasPrefix(c.Name, "Destination") {
 			destDetail = c.Detail
 		}
 	}
-	if !strings.Contains(strings.ToLower(destDetail), "start") {
-		t.Errorf("destination check detail should note the Linode launches on Start; got %q", destDetail)
+	if !strings.Contains(strings.ToLower(destDetail), "fallback") {
+		t.Errorf("without automation the destination check should note the appliance-staging fallback; got %q", destDetail)
 	}
 	// The cutover-gate check must use file wording, not "Initial full sync complete".
 	if names["Initial full sync complete"] {

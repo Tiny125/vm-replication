@@ -342,6 +342,27 @@ type MigrationView struct {
 	ReplicationPaused  bool `json:"replication_paused"`
 	CanReplicate       bool `json:"can_replicate"`
 
+	// File-transfer destination (direct method): the console offers an explicit
+	// "Create destination instance" step and gates Start replication until the
+	// destination's receiver is confirmed ready. DestState is one of:
+	//   ""           — not a file-transfer migration (no destination step)
+	//   "fallback"   — file mode with no Linode automation (data staged on the
+	//                  appliance; no destination instance is launched)
+	//   "none"       — automation available, no destination created yet → the
+	//                  operator uses "Create destination instance"
+	//   "launching"  — the destination Linode is being created / booting
+	//   "installing" — the instance is up; waiting for its file receiver to start
+	//   "ready"      — the receiver is reachable; Start replication is unlocked
+	//   "failed"     — the launch failed (DestError says why); the operator retries
+	DestState    string `json:"dest_state,omitempty"`
+	DestLinodeID int64  `json:"dest_linode_id,omitempty"`
+	DestIP       string `json:"dest_ip,omitempty"`
+	DestError    string `json:"dest_error,omitempty"`
+	// DestManualCmd is a copy-paste command (run in the destination's Lish console
+	// / over SSH as root) that installs and starts the file receiver, for when the
+	// automatic cloud-init install stalls (e.g. the image/region lacks Metadata).
+	DestManualCmd string `json:"dest_manual_cmd,omitempty"`
+
 	// Live progress for the console: Phase is a human label ("initial sync",
 	// "finalizing", …); PercentDone/ETASeconds are -1 when unknown.
 	Phase          string  `json:"phase"`
@@ -379,6 +400,15 @@ type LoginRequest struct {
 // SetLinodeTokenRequest stores the Linode API token on the appliance.
 type SetLinodeTokenRequest struct {
 	Token string `json:"token"`
+}
+
+// CreateDestinationRequest launches a file-transfer migration's destination
+// Linode with an operator-chosen label and root password (so the operator can
+// log into it via Lish/SSH — e.g. to run the manual receiver-install fallback).
+// The root password is never logged or persisted in cleartext by the appliance.
+type CreateDestinationRequest struct {
+	Label        string `json:"label"`
+	RootPassword string `json:"root_password"`
 }
 
 // FinalizeRequest controls what happens when a migration is cut over.
