@@ -958,7 +958,11 @@ func (s *Server) handlePauseReplication(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	_ = s.st.AddEvent(ctx, id, "info", "replication paused by operator; a pass already in flight finishes, then the agent holds. Resume to continue with an incremental delta sync (no full re-copy).")
+	if isFileMethod(m.BootTarget) {
+		_ = s.st.AddEvent(ctx, id, "info", "replication paused by operator; a pass already in flight finishes, then the agent holds. Resume to continue re-copying only the files that changed (no full re-copy).")
+	} else {
+		_ = s.st.AddEvent(ctx, id, "info", "replication paused by operator; a pass already in flight finishes, then the agent holds. Resume to continue with an incremental delta sync (no full re-copy).")
+	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "paused"})
 }
 
@@ -982,11 +986,19 @@ func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 	// full sync is complete. No manual assessment, and the live agent/lag don't
 	// gate it (so a previously-failed cutover can be retried).
 	if !cutoverReady(m) {
-		writeErr(w, http.StatusConflict, "the initial full sync must finish on all disks before cutover")
+		if isFileMethod(m.BootTarget) {
+			writeErr(w, http.StatusConflict, "the initial file copy must finish before cutover")
+		} else {
+			writeErr(w, http.StatusConflict, "the initial full sync must finish on all disks before cutover")
+		}
 		return
 	}
 	if m.State == api.MigFailed {
-		_ = s.st.AddEvent(ctx, id, "info", "retrying cutover on the already-replicated data")
+		if isFileMethod(m.BootTarget) {
+			_ = s.st.AddEvent(ctx, id, "info", "retrying cutover — rebooting the destination into the copied files")
+		} else {
+			_ = s.st.AddEvent(ctx, id, "info", "retrying cutover on the already-replicated data")
+		}
 	}
 	if err := s.st.SetMigrationState(ctx, id, api.MigMigrating, ""); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -1033,7 +1045,11 @@ func (s *Server) handleCompleteCutover(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	_ = s.st.AddEvent(ctx, id, "info", "cutover: operator confirmed — completing (convert, clone, launch)")
+	if isFileMethod(m.BootTarget) {
+		_ = s.st.AddEvent(ctx, id, "info", "cutover: operator confirmed — rebooting the destination into your copied files")
+	} else {
+		_ = s.st.AddEvent(ctx, id, "info", "cutover: operator confirmed — completing (convert, clone, launch)")
+	}
 	finCtx, cancel := context.WithCancel(s.ctx)
 	s.recMu.Lock()
 	s.finalizes[id] = cancel
@@ -1229,6 +1245,17 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	canceled := func() bool { return ctx.Err() != nil }
 	sctx := s.ctx // store writes survive a Stop (which owns its own transition)
 
+	// msg picks method-appropriate wording: the file method copies files onto an
+	// already-launched destination (no image/volume/convert), so its cutover
+	// events must not use block-method vocabulary.
+	fileMode := isFileMethod(m.BootTarget)
+	msg := func(fileMsg, blockMsg string) string {
+		if fileMode {
+			return fileMsg
+		}
+		return blockMsg
+	}
+
 	// Guided step 1 is now running (drain + freeze): light the console's "keep
 	// the source running" banner until the migration parks in awaiting_cutover
 	// (the state the deferred clear races benignly with) or this run ends.
@@ -1250,7 +1277,9 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	//    sources, quiesce the source first and use skip — see docs/CUTOVER.md.
 	consistent := false
 	if req.SkipSnapshot {
-		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: replication stopped; freezing the current replicated copy as the image (crash-consistent, repaired with fsck on convert). Power off the source before launching so the captured state is final.")
+		_ = s.st.AddEvent(sctx, m.ID, "info", msg(
+			"cutover: replication stopped; holding the copied files for launch. Power off the source before launching so the copy is final.",
+			"cutover: replication stopped; freezing the current replicated copy as the image (crash-consistent, repaired with fsck on convert). Power off the source before launching so the captured state is final."))
 		consistent = true // operator's assertion
 	} else if !s.sourceAgentActive(m) {
 		// No agent checked in — the source appears powered off, so the current
@@ -1283,10 +1312,14 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	drainStart := time.Now()
 	if s.drainReceivers(m, receiver.DrainGrace) {
 		if waited := time.Since(drainStart); waited > 2*time.Second {
-			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: waited %s for the in-flight replication pass to end — delta passes apply atomically (an interrupted pass is discarded whole), so the frozen image is the last complete pass", waited.Round(time.Second)))
+			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf(msg(
+				"cutover: waited %s for the in-flight file-copy pass to end — passes apply atomically (an interrupted pass is discarded whole), so the copied files are the last complete pass",
+				"cutover: waited %s for the in-flight replication pass to end — delta passes apply atomically (an interrupted pass is discarded whole), so the frozen image is the last complete pass"), waited.Round(time.Second)))
 		}
 	} else {
-		_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf("cutover: a replication pass was still running after %s and was severed; its staged data was discarded whole — the frozen image remains the last completely applied pass", receiver.DrainGrace))
+		_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf(msg(
+			"cutover: a file-copy pass was still running after %s and was severed; its partial data was discarded whole — the copied files remain the last completely applied pass",
+			"cutover: a replication pass was still running after %s and was severed; its staged data was discarded whole — the frozen image remains the last completely applied pass"), receiver.DrainGrace))
 	}
 	s.clearConsistency(m)
 
@@ -1299,7 +1332,9 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		s.pendingCutover[m.ID] = req
 		s.recMu.Unlock()
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigAwaitingCutover, "")
-		_ = s.st.AddEvent(sctx, m.ID, "info", "cutover step 1 done: replication stopped and the current copy frozen as the image. Now POWER OFF the source server, then click \"Launch instance\" to convert, clone and launch.")
+		_ = s.st.AddEvent(sctx, m.ID, "info", msg(
+			"cutover step 1 done: replication stopped and the copied files held for launch. Now POWER OFF the source server, then click \"Launch instance\" to reboot the destination into your migrated files.",
+			"cutover step 1 done: replication stopped and the current copy frozen as the image. Now POWER OFF the source server, then click \"Launch instance\" to convert, clone and launch."))
 		return
 	}
 	s.finalizeComplete(ctx, m, req)
@@ -2191,8 +2226,10 @@ func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCh
 		first = api.ValidationCheck{Name: "Storage provisioned", OK: allStorage, Detail: diskWord(storageOK) + " ready", Group: "pre"}
 	}
 	fullDetail := diskWord(fullDone) + " baselined"
+	fullName := "Initial full sync complete"
 	if isFileMethod(m.BootTarget) {
 		fullDetail = map[bool]string{true: "files copied", false: "copying files"}[allFull]
+		fullName = "Initial file copy complete"
 	}
 	return []api.ValidationCheck{
 		// Pre-migration: environment/connectivity readiness while replicating.
@@ -2200,7 +2237,7 @@ func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCh
 		{Name: "Agent connected", OK: allAgents, Detail: diskWord(agentsSeen) + " checked in", Group: "pre"},
 		{Name: fmt.Sprintf("Replication lag within %ds", s.cfg.RPOTargetSec), OK: lagOK, Detail: lagDetail2(anySync, rpoSec), Group: "pre"},
 		// Migration: the gate that actually allows cutover.
-		{Name: "Initial full sync complete", OK: allFull, Detail: fullDetail, Group: "migration"},
+		{Name: fullName, OK: allFull, Detail: fullDetail, Group: "migration"},
 	}
 }
 

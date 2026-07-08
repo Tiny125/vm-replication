@@ -75,6 +75,25 @@ func TestConsoleStartDialogIsMethodAware(t *testing.T) {
 	}
 }
 
+// The file-transfer flow must render file-appropriate wording (not block-method
+// vocabulary) across the card: the completion banner, the guided-cutover freeze
+// and awaiting-cutover banners, and the action-button tooltips all carry a
+// file-specific branch. This guards the message sweep so block wording can't
+// silently creep back into the file path.
+func TestConsoleFileFlowMessagesAreMethodAware(t *testing.T) {
+	for _, want := range []string{
+		"Your files were copied onto Linode",       // file completion banner branch
+		"Finishing the last file-copy pass",        // file freeze banner
+		"the copied files are held for launch",     // file awaiting-cutover banner
+		"reboots the already-launched destination", // file cutover button tooltip
+		"initial file copy complete",               // file validation-check explainer
+	} {
+		if !strings.Contains(consoleHTML, want) {
+			t.Errorf("file-transfer flow missing method-aware wording %q", want)
+		}
+	}
+}
+
 // The guided cutover must tell the operator, ON THE CARD, when it is safe to
 // power off the source: a "keep the source running" banner while step 1's
 // freeze/drain runs (cutover_freezing), then a "power off the source server

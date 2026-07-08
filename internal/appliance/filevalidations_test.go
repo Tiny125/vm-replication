@@ -38,6 +38,13 @@ func TestValidationsFileMethod(t *testing.T) {
 	if !strings.Contains(strings.ToLower(destDetail), "start") {
 		t.Errorf("destination check detail should note the Linode launches on Start; got %q", destDetail)
 	}
+	// The cutover-gate check must use file wording, not "Initial full sync complete".
+	if names["Initial full sync complete"] {
+		t.Error("file migrations must not show the block 'Initial full sync complete' check name")
+	}
+	if !names["Initial file copy complete"] {
+		t.Errorf("file migrations should show 'Initial file copy complete'; got %v", names)
+	}
 
 	block := api.Migration{BootTarget: api.BootTargetVolume, Disks: []api.Disk{{ID: 1, VolumeDevice: "/dev/x"}}}
 	if !checkNames(s.validations(block, 0))["Storage provisioned"] {
