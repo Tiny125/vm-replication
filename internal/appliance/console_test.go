@@ -139,6 +139,31 @@ func TestConsoleCutoverGuidance(t *testing.T) {
 	}
 }
 
+// The guided cutover of a BLOCK migration must take a consistent final pass by
+// default (skip_snapshot=false → the appliance's existing remount-ro/LVM quiesce
+// runs), with an opt-out checkbox for an already-powered-off source. File
+// transfer must be untouched: it keeps skip_snapshot=true and has no checkbox.
+// This is the fix for the "converted disk has no root filesystem" fsck failure
+// caused by cloning a live, inconsistent block image.
+func TestConsoleBlockCutoverQuiesces(t *testing.T) {
+	js := extractJSFunc(t, "async function startMig(")
+	// Block methods get the opt-out checkbox (guarded by !file) …
+	if !strings.Contains(js, "if(!file)opts.checkboxes") || !strings.Contains(js, "skip_snap") {
+		t.Error("block cutover must offer a skip-the-snapshot opt-out checkbox")
+	}
+	// … and send skip_snapshot method-aware: true for file, the checkbox for block.
+	if !strings.Contains(js, "file?true:!!r.skip_snap") {
+		t.Error("skip_snapshot must be true for file and the checkbox value for block methods")
+	}
+	if !strings.Contains(js, "skip_snapshot:skipSnap") {
+		t.Error("cutover must post the computed skip_snapshot value")
+	}
+	// The dialog must mention the read-only quiesce so the block flow is honest.
+	if !strings.Contains(js, "read-only") {
+		t.Error("cutover dialog should describe the read-only quiesce for block methods")
+	}
+}
+
 // The cutover dialog lets the operator NAME the launched instance (both boot
 // methods) and the cutover volume (volume-boot only), sent as label /
 // volume_label on the /start request; blank falls back to <name>-cutover.

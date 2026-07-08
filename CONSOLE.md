@@ -425,17 +425,18 @@ local-disk boot):
    (names are sanitized to Linode's label rules; instances ≤64 chars, volumes
    ≤32, multi-disk volumes get a `-N` suffix). You can also set a **root
    password / SSH key** (so you can log into the launched instance via the
-   Lish console). Then click **Stop replication & continue**. The appliance stops new replication passes, waits
-   briefly for any pass already in flight to end, and **freezes the copy** as
-   the image to launch — crash-consistent (like a power-loss) and repaired with
-   `fsck` during the boot conversion. **Delta passes are applied atomically**:
-   the receiver stages each pass and writes it to the volume only once the
-   whole pass has arrived, so an interrupted pass (source powered off
-   mid-stream, network drop, the freeze itself) is **discarded whole** and the
-   frozen image is always exactly the **last complete pass** — the moment you
-   power the source off cannot damage it. The migration pauses in state
-   `awaiting_cutover`. (No read-only remount of the source is attempted, so it
-   can't get stuck on a busy root.)
+   Lish console). Then click **Stop replication & continue**. The appliance stops new replication passes and takes
+   **one consistent final pass** with the source root briefly **remounted
+   read-only**, so the cloned/converted image is a clean point-in-time — not a
+   live "smear" that fails `fsck` and boots to a `grub>` prompt. If the root
+   can't be remounted read-only because apps are still writing to it, the
+   cutover **fails fast** and asks you to stop those writers and retry (rather
+   than silently producing a corrupt image). If the source is **already powered
+   off or idle**, tick **"skip the read-only snapshot"** in the dialog to skip
+   that step. **Delta passes are applied atomically**: the receiver stages each
+   pass and writes it to the volume only once the whole pass has arrived, so an
+   interrupted pass is **discarded whole** and the image is always exactly the
+   **last complete pass**. The migration pauses in state `awaiting_cutover`.
 
    The card guides the timing: while step 1 runs it shows **"Freezing the
    image — keep the source server running"** (so the in-flight pass can finish
