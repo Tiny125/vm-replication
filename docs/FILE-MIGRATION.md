@@ -63,11 +63,23 @@ block methods are untouched (proven by the full test suite staying green).
    by *used* data and pre-select a matching **destination OS image**. No block
    volume is provisioned.
 2. **Enroll** — same one-line agent install (with `-mode file`).
-3. **Start** — launches the destination from your OS image + plan, then the
-   copy begins (source → destination). Live progress and delta passes as usual.
-4. **Cutover** — final pass, then reboot the destination so every copied service
+3. **Create destination instance** — an explicit step on the card: name the
+   destination and set a **root password** (so you can log into it), then the
+   appliance launches the Linode from your OS image + plan and installs the file
+   receiver on it. The card shows its status (launching → installing → **ready**);
+   **Start replication stays disabled until the receiver is confirmed ready**, so
+   the migration can never hang "waiting for a destination that never came up".
+   If the automatic (cloud-init) install stalls, the card shows a one-line
+   **manual install command** to paste in the destination's Lish console.
+4. **Start** — the agent copies straight into the ready destination. Live
+   progress and delta passes as usual.
+5. **Cutover** — final pass, then reboot the destination so every copied service
    starts from the migrated files.
-5. **Remove the agent** — same as the block methods.
+6. **Remove the agent** — same as the block methods.
+
+> With **no Linode token** (evaluation/fallback mode) there is no destination
+> instance to create — the agent stages files on the appliance and Start is not
+> gated on a destination.
 
 ---
 
@@ -75,11 +87,21 @@ block methods are untouched (proven by the full test suite staying green).
 
 - **Enroll** bakes `-mode file -root /` into the agent's ExecStart (target = the
   appliance, for control/gating).
-- **Start replication** launches the destination from `os_image` + plan with
-  **cloud-init user-data** that downloads the receiver binary + the appliance's
-  data-plane certs (both token-gated: `/dest/receiver`, `/dest/cert`) and runs
-  the receiver on the destination, applying files to `/` (`vmrepl-receiver`
-  systemd service, port 5999).
+- **Create destination instance** (`POST /api/v1/migrations/{id}/destination`,
+  operator-supplied label + root password) launches the destination from
+  `os_image` + plan with **cloud-init user-data** that downloads the receiver
+  binary + the appliance's data-plane certs (both token-gated: `/dest/receiver`,
+  `/dest/cert`) and runs the receiver on the destination, applying files to `/`
+  (`vmrepl-receiver` systemd service, port 5999). The appliance then polls the
+  receiver port and exposes the destination status (`launching`/`installing`/
+  `ready`/`failed`) in the migration view; **`Start replication` is gated on
+  `ready`**. The root password is used only to create the instance and is never
+  logged or persisted in cleartext.
+- **Manual install fallback.** If cloud-init can't auto-install (the image/region
+  lacks the Metadata service), the card shows a token-gated one-liner
+  (`GET /dest/install.sh?token=…` piped to `sudo bash`) to run in the
+  destination's Lish console — bringing the receiver up by hand so the migration
+  proceeds instead of hanging.
 - **The agent** dials the appliance (control). Once the destination's receiver
   is reachable, the appliance answers with a **HelloAck redirect**
   (`DataTarget` = the destination), and the agent re-dials the destination and
@@ -138,10 +160,13 @@ pass, so that pass has no such race and lands the exact, consistent content.
 Earlier a single racy log file failed the whole pass with `content hash mismatch`.
 
 ### Requirements / caveats (direct mode)
-- The destination image must support **cloud-init + the Linode Metadata service**
-  (Ubuntu/Debian/RHEL-family cloud images do). Without it the receiver can't
-  auto-install; the card warns after 15 min and we can add a manual paste
-  fallback.
+- The destination image ideally supports **cloud-init + the Linode Metadata
+  service** (Ubuntu/Debian/RHEL-family cloud images do) so the receiver
+  auto-installs. If it doesn't, the migration **no longer hangs**: Start stays
+  disabled and the card shows a **manual install command** to paste in the
+  destination's Lish console (you log in with the root password you set when
+  creating the destination). Either way, Start unlocks only once the receiver is
+  actually reachable.
 - The **source must reach the destination's public IP** on TCP 5999.
 - A leftover `vmrepl-receiver` systemd service remains on the migrated instance
   (harmless — it just listens); the completion note tells you to

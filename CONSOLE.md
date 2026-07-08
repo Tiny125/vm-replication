@@ -258,8 +258,19 @@ Singapore appliance gets a Singapore bucket). Override with the
 
 ## 4. Create a migration (single or multi-disk)
 
-Click **New migration**, enter a **Name** and **hostname**, then **add one disk
-row per source disk** (device + size in GB). The **first row is the boot disk**
+> **Migration method.** The **New migration** form offers three methods from one
+> selector: **File transfer** (the default — copies only used files onto a fresh
+> Linode you pick an OS image for) and the two **block** methods (separate Block
+> Storage volume, or Linode local disk). The disk rows below apply to the **block**
+> methods. For **File transfer** you instead pick a **destination OS image** + plan
+> and, after creating the migration, use the card's **Create destination instance**
+> step (name it + set a root password) — **Start replication** unlocks only once
+> that destination's file receiver is confirmed ready (with a manual-install
+> fallback if cloud-init can't reach it). See
+> [`docs/FILE-MIGRATION.md`](docs/FILE-MIGRATION.md) for the full file-transfer flow.
+
+For the **block** methods: click **New migration**, enter a **Name** and
+**hostname**, then **add one disk row per source disk** (device + size in GB). The **first row is the boot disk**
 (the one whose partitions include the root filesystem `/`); additional rows are
 data disks. A server with everything on one disk just has a single row.
 

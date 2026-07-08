@@ -151,6 +151,9 @@ func (s *Server) routes() {
 	// these (token-gated) during first boot.
 	s.mux.HandleFunc("GET /dest/receiver", s.handleDestReceiver)
 	s.mux.HandleFunc("GET /dest/cert", s.handleDestCert)
+	// Manual receiver-install fallback (token-gated): the operator pastes this in
+	// the destination's Lish console if cloud-init didn't auto-install the receiver.
+	s.mux.HandleFunc("GET /dest/install.sh", s.handleDestInstall)
 
 	// Console API (session-protected).
 	s.mux.Handle("GET /api/v1/session", s.auth(s.handleSession))
@@ -160,6 +163,7 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/migrations/{id}/events", s.auth(s.handleMigrationEvents))
 	s.mux.Handle("DELETE /api/v1/migrations/{id}", s.auth(s.handleDeleteMigration))
 	s.mux.Handle("POST /api/v1/migrations/{id}/close", s.auth(s.handleCloseMigration))
+	s.mux.Handle("POST /api/v1/migrations/{id}/destination", s.auth(s.handleCreateDestination))
 	s.mux.Handle("POST /api/v1/migrations/{id}/replicate", s.auth(s.handleStartReplication))
 	s.mux.Handle("POST /api/v1/migrations/{id}/pause", s.auth(s.handlePauseReplication))
 	s.mux.Handle("POST /api/v1/migrations/{id}/start", s.auth(s.handleStartMigration))

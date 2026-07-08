@@ -906,6 +906,13 @@ func (s *Server) handleStartReplication(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusConflict, "the agent has not connected on all disks yet — wait for the connection to be validated")
 		return
 	}
+	// File transfer (direct): the destination instance must be created and its
+	// receiver reachable before the agent can copy into it. This mirrors the
+	// disabled Start button and rejects a raced/scripted call.
+	if !s.destReady(m) {
+		writeErr(w, http.StatusConflict, "create the destination instance first and wait for it to be ready before starting the copy")
+		return
+	}
 	resuming := replicationHasRun(m)
 	if err := s.st.SetReplicationEnabled(ctx, id, true); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -921,11 +928,9 @@ func (s *Server) handleStartReplication(w http.ResponseWriter, r *http.Request) 
 	default:
 		_ = s.st.AddEvent(ctx, id, "info", "replication started by operator; the agent will stream the initial full sync on its next pass (within ~60s)")
 	}
-	// File transfer (direct): launch the destination now so the agent copies
-	// straight into it. Idempotent; a no-op for block methods and file-fallback.
-	if isFileMethod(m.BootTarget) {
-		s.ensureFileDestination(m)
-	}
+	// File transfer (direct): the destination is created explicitly by the operator
+	// ("Create destination instance") BEFORE this point, and Start is gated on its
+	// receiver being ready (see CanReplicate), so there is nothing to launch here.
 	// Receivers are already listening from create time; they will now accept data.
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "replicating"})
 }
@@ -2076,10 +2081,15 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	v.ReplicationActive = m.ReplicationEnabled
 	v.ReplicationStarted = m.ReplicationEnabled || hasRun
 	v.ReplicationPaused = !m.ReplicationEnabled && hasRun && replicationControllable(m.State)
+	// File-transfer destination status (direct method): drives the "Create
+	// destination instance" step and gates Start until the receiver is ready.
+	v.DestState, v.DestLinodeID, v.DestIP, v.DestError, v.DestManualCmd = s.destStatusFor(m)
+
 	if !m.ReplicationEnabled && replicationControllable(m.State) {
 		// The gate is off: either not started yet, or paused. Either way the
-		// Start/Resume button is enabled once the connection is validated.
-		v.CanReplicate = v.AgentConnected
+		// Start/Resume button is enabled once the connection is validated — and, for
+		// direct file transfer, once the destination's receiver is ready to receive.
+		v.CanReplicate = v.AgentConnected && s.destReady(m)
 		// "Connection failed" only applies pre-start (a paused migration's agent is
 		// connected and simply held); never flag it once replication has run.
 		if !hasRun && !v.AgentConnected && !m.EnrolledAt.IsZero() && time.Since(m.EnrolledAt) > agentConnectGrace {
@@ -2213,15 +2223,27 @@ func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCh
 	// and instead needs a destination OS image + plan chosen ("Destination ready").
 	var first api.ValidationCheck
 	if isFileMethod(m.BootTarget) {
-		ready := m.OSImage != "" && m.LinodeType != ""
-		// The destination Linode is not created yet — it launches when the operator
-		// clicks Start replication. Say so, so a green tick isn't read as "the
-		// instance already exists".
-		detail := "OS image + plan chosen — Linode launches on Start"
-		if !ready {
-			detail = "choose a destination OS image and plan"
+		configured := m.OSImage != "" && m.LinodeType != ""
+		switch {
+		case !configured:
+			first = api.ValidationCheck{Name: "Destination configured", OK: false, Detail: "choose a destination OS image and plan", Group: "pre"}
+		case !s.fileAutomation():
+			// No Linode automation: data is staged on the appliance (fallback); there
+			// is no destination instance to create.
+			first = api.ValidationCheck{Name: "Destination configured", OK: true, Detail: "OS image + plan chosen (appliance-staging fallback)", Group: "pre"}
+		default:
+			// The destination instance is created explicitly ("Create destination
+			// instance") and this check tracks its lifecycle up to receiver-ready.
+			state, _, _, _, _ := s.destStatusFor(m)
+			detail := map[string]string{
+				"none":       "create the destination instance to continue",
+				"launching":  "destination instance launching…",
+				"installing": "instance up — installing the file receiver…",
+				"ready":      "destination instance ready to receive",
+				"failed":     "destination launch failed — retry Create destination",
+			}[state]
+			first = api.ValidationCheck{Name: "Destination ready", OK: state == "ready", Detail: detail, Group: "pre"}
 		}
-		first = api.ValidationCheck{Name: "Destination configured", OK: ready, Detail: detail, Group: "pre"}
 	} else {
 		first = api.ValidationCheck{Name: "Storage provisioned", OK: allStorage, Detail: diskWord(storageOK) + " ready", Group: "pre"}
 	}
