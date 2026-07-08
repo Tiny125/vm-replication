@@ -52,6 +52,48 @@ func TestConsoleRendersCutoverCopyCommand(t *testing.T) {
 	}
 }
 
+// The Start-replication confirmation must be method-aware. File transfer copies
+// FILES onto a launched destination — it must NOT tell the operator "the agent
+// streams every block" (that's the block-method wording and confused users into
+// thinking no destination existed). The file variant must mention launching the
+// destination and copying files.
+func TestConsoleStartDialogIsMethodAware(t *testing.T) {
+	js := extractJSFunc(t, "async function startReplication(")
+	// It must branch on the migration's method.
+	if !strings.Contains(js, "boot_target") {
+		t.Error("startReplication must pick its wording from the migration's boot_target")
+	}
+	// File-transfer wording present…
+	for _, want := range []string{"launches the destination", "used files"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("file-transfer Start dialog missing %q", want)
+		}
+	}
+	// …and the block wording still present for block methods.
+	if !strings.Contains(js, "streams every block") {
+		t.Error("block-method Start dialog should keep its 'streams every block' wording")
+	}
+}
+
+// The file-transfer flow must render file-appropriate wording (not block-method
+// vocabulary) across the card: the completion banner, the guided-cutover freeze
+// and awaiting-cutover banners, and the action-button tooltips all carry a
+// file-specific branch. This guards the message sweep so block wording can't
+// silently creep back into the file path.
+func TestConsoleFileFlowMessagesAreMethodAware(t *testing.T) {
+	for _, want := range []string{
+		"Your files were copied onto Linode",       // file completion banner branch
+		"Finishing the last file-copy pass",        // file freeze banner
+		"the copied files are held for launch",     // file awaiting-cutover banner
+		"reboots the already-launched destination", // file cutover button tooltip
+		"initial file copy complete",               // file validation-check explainer
+	} {
+		if !strings.Contains(consoleHTML, want) {
+			t.Errorf("file-transfer flow missing method-aware wording %q", want)
+		}
+	}
+}
+
 // The guided cutover must tell the operator, ON THE CARD, when it is safe to
 // power off the source: a "keep the source running" banner while step 1's
 // freeze/drain runs (cutover_freezing), then a "power off the source server
@@ -120,6 +162,30 @@ func TestConsoleSourceHelperReportsOSAndUsed(t *testing.T) {
 	for _, want := range []string{"os-release", "Used"} {
 		if !strings.Contains(consoleHTML, want) {
 			t.Errorf("source-details helper should report %q", want)
+		}
+	}
+}
+
+// The source-details helper lists whole disks via lsblk. It must skip pseudo
+// block devices (nbd/loop/ram/zram/sr/fd) and zero-size nodes so a destination
+// (or any host) with the nbd kernel module loaded doesn't print 16 empty
+// "/dev/nbdN — Size 0" lines that look like extra disks.
+func TestConsoleSourceHelperSkipsPseudoDisks(t *testing.T) {
+	i := strings.Index(consoleHTML, `id="srcCmd"`)
+	if i < 0 {
+		t.Fatal("source-details helper (srcCmd) not found")
+	}
+	cmd := consoleHTML[i:]
+	if end := strings.Index(cmd, "</pre>"); end >= 0 {
+		cmd = cmd[:end]
+	}
+	// The lsblk|awk pipeline must filter by size and by device-name prefix.
+	if !strings.Contains(cmd, "$2>0") {
+		t.Error("helper must skip zero-size block devices ($2>0)")
+	}
+	for _, pseudo := range []string{"nbd", "loop", "ram", "zram", "sr", "fd"} {
+		if !strings.Contains(cmd, pseudo) {
+			t.Errorf("helper must exclude pseudo device %q from the disk list", pseudo)
 		}
 	}
 }

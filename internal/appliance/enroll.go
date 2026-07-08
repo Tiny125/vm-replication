@@ -132,7 +132,7 @@ done
 chmod 600 "$ETC/agent.key"
 
 if command -v systemctl >/dev/null 2>&1; then
-  echo ">> Installing systemd timer (replicate all disks every 60s)"
+  echo ">> Installing systemd timer (runs the replication agent every 60s)"
   cat >/etc/systemd/system/vmrepl-agent.service <<UNIT
 [Unit]
 Description=vm-replication source agent
@@ -160,7 +160,7 @@ UNIT
   if systemctl start vmrepl-agent.service; then
     echo ">> Connection check ran. The agent connects every 60s and will NOT copy any"
     echo ">> data yet: go to the console, confirm the connection shows a green tick,"
-    echo ">> then click 'Start replication' to begin the initial full sync."
+    echo ">> then click 'Start replication' to begin the initial copy."
   else
     echo ">> Connection check FAILED — see: journalctl -u vmrepl-agent -n 30"
     echo ">> No reinstall needed: the agent retries every 60s automatically."

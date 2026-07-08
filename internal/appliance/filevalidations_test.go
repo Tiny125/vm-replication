@@ -19,12 +19,31 @@ func TestValidationsFileMethod(t *testing.T) {
 		BootTarget: api.BootTargetFile, OSImage: "linode/ubuntu24.04", LinodeType: "g6-nanode-1",
 		Disks: []api.Disk{{ID: 1}},
 	}
-	names := checkNames(s.validations(file, 0))
+	checks := s.validations(file, 0)
+	names := checkNames(checks)
 	if names["Storage provisioned"] {
 		t.Error("file migrations must not show the block 'Storage provisioned' check")
 	}
 	if !hasPrefix(names, "Destination") {
 		t.Errorf("file migrations should show a destination-readiness check; got %v", names)
+	}
+	// The destination Linode is launched at Start, not at Create — the check
+	// detail must say so, so a green tick isn't mistaken for "instance exists".
+	destDetail := ""
+	for _, c := range checks {
+		if strings.HasPrefix(c.Name, "Destination") {
+			destDetail = c.Detail
+		}
+	}
+	if !strings.Contains(strings.ToLower(destDetail), "start") {
+		t.Errorf("destination check detail should note the Linode launches on Start; got %q", destDetail)
+	}
+	// The cutover-gate check must use file wording, not "Initial full sync complete".
+	if names["Initial full sync complete"] {
+		t.Error("file migrations must not show the block 'Initial full sync complete' check name")
+	}
+	if !names["Initial file copy complete"] {
+		t.Errorf("file migrations should show 'Initial file copy complete'; got %v", names)
 	}
 
 	block := api.Migration{BootTarget: api.BootTargetVolume, Disks: []api.Disk{{ID: 1, VolumeDevice: "/dev/x"}}}
