@@ -611,9 +611,9 @@ async function startMig(id,btn){
   // fsck on convert). If the operator confirms the source is already powered off
   // or idle, they can tick the box to skip that quiesce. Step 3 launches.
   const how='<div style="margin-bottom:8px"><b>Cutover has 3 steps:</b>'+
-    '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> '+(file?'stop replication and hold the copied files for launch.':'stop replication and take a consistent final pass (the source root is briefly remounted read-only), then hold it as the image.')+'</div>'+
-    '<div style="margin-top:4px"><b>Step 2:</b> power off the source server.</div>'+
-    '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(file?('reboots the destination Linode'+planNote+' (already launched at Start, with your files copied straight into it) so it boots into your migrated system — the migration is then complete. No Lish paste needed.'):disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('launches a new Linode'+planNote+' from the frozen image.'):'clones every disk into launchable volumes.'))+'</div></div>';
+    '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> '+(file?'stop replication and hold the copied files for launch.':'stop replication, take a consistent final pass (the source root is briefly remounted read-only), then <b>convert the boot image and validate it is bootable</b> — all while the source is still running, so any problem surfaces before you power off.')+'</div>'+
+    '<div style="margin-top:4px"><b>Step 2:</b> '+(file?'power off the source server.':'once step 1 reports the image is validated, power off the source server.')+'</div>'+
+    '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(file?('reboots the destination Linode'+planNote+' (already launched at Start, with your files copied straight into it) so it boots into your migrated system — the migration is then complete. No Lish paste needed.'):disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the validated image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('clones the validated image and launches a new Linode'+planNote+'.'):'clones every disk into launchable volumes.'))+'</div></div>';
   const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the '+(file?'copied files are current.':'final pass is current. The final pass remounts the source root <b>read-only</b> for a clean, fsck-passing image — if writers are still holding the root open, the cutover fails fast and asks you to stop them (or tick the box below if the source is already powered off).')+'</div>';
   // Optional names for what the cutover creates: the instance (both methods)
   // and, for volume boot, the cutover volume. Blank keeps <name>-cutover.
@@ -647,7 +647,7 @@ async function startMig(id,btn){
 }
 async function completeCutover(id,btn){
   const file=((migMeta[id]||{}).boot_target==='file');
-  if(!await confirmModal({title:'Source powered off — launch the migrated instance?',html:'Confirm the <b>source server is shut down</b> (both machines must not run at once). This '+(file?'reboots the destination Linode into your copied files':'converts the frozen image, clones the disk(s), and launches the new instance')+'. This is the final step.',okText:'Launch instance'}))return;
+  if(!await confirmModal({title:'Source powered off — launch the migrated instance?',html:'Confirm the <b>source server is shut down</b> (both machines must not run at once). This '+(file?'reboots the destination Linode into your copied files':'clones the already-validated boot image and launches the new instance')+'. This is the final step.',okText:'Launch instance'}))return;
   busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/complete',{});await refreshMig(id)}catch(e){alertModal({title:'Cannot complete',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function stopMig(id,btn){
@@ -1112,17 +1112,17 @@ function migCard(v){
   // Step 1 in progress (drain + freeze): the operator must NOT power off yet.
   if(m.state==='migrating' && v.cutover_freezing){
     b+='<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05">'+
-      '<b>'+(file?'Finishing the last file-copy pass':'Freezing the image')+' — keep the source server running.</b>'+
-      '<div style="margin-top:6px">The appliance is waiting for the '+(file?'file-copy':'replication')+' pass currently in flight to finish, so the '+(file?'copied files carry':'frozen image carries')+' your latest changes (this can take a few minutes on a large '+(file?'filesystem':'disk')+').</div>'+
-      '<div style="margin-top:4px">This card will tell you when to power off the source — nothing to do yet. (Powering off early is safe: an unfinished pass is discarded whole and the '+(file?'copy stays':'image stays')+' at the last complete pass, just slightly older.)</div></div>';
+      '<b>'+(file?'Finishing the last file-copy pass':'Preparing &amp; validating the boot image')+' — keep the source server running.</b>'+
+      '<div style="margin-top:6px">'+(file?'The appliance is waiting for the file-copy pass currently in flight to finish, so the copied files carry your latest changes':'The appliance is finishing the last replication pass, then converting the boot image and checking it is bootable — all BEFORE you power off, so any problem surfaces while the source is still running')+' (this can take a few minutes on a large '+(file?'filesystem':'disk')+').</div>'+
+      '<div style="margin-top:4px">This card will tell you when it is safe to power off the source — <b>do not power it off yet</b>.</div></div>';
   }
   // Step 1 done: NOW the operator powers the source off, then launches.
   if(m.state==='awaiting_cutover'){
     b+='<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05">'+
-      '<b>Action needed — power off the source server now.</b>'+
-      '<div style="margin-top:6px">✓ <b>Step 1 done</b> — replication is stopped and '+(file?'the copied files are held for launch':'the copy is frozen as the image')+'.</div>'+
+      '<b>Action needed — it is now safe to power off the source server.</b>'+
+      '<div style="margin-top:6px">✓ <b>Step 1 done</b> — replication is stopped and '+(file?'the copied files are held for launch':'the boot image has been <b>converted and validated as bootable</b>')+'.</div>'+
       '<div style="margin-top:4px"><b>Step 2 — now:</b> <b>power off the source server</b> (so the old and new machines aren’t both running at once).</div>'+
-      '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> below to '+(file?'reboot the destination into your files':'convert and launch')+'.</div></div>';
+      '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> below to '+(file?'reboot the destination into your files':'clone the validated image and launch')+'.</div></div>';
   }
   b+='<div class="actions">';
   const migDone=['image_ready','launched'].includes(m.state);

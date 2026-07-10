@@ -425,29 +425,29 @@ local-disk boot):
    (names are sanitized to Linode's label rules; instances ≤64 chars, volumes
    ≤32, multi-disk volumes get a `-N` suffix). You can also set a **root
    password / SSH key** (so you can log into the launched instance via the
-   Lish console). Then click **Stop replication & continue**. The appliance stops new replication passes and takes
+   Lish console). Then click **Stop replication & continue**. The appliance stops new replication passes, takes
    **one consistent final pass** with the source root briefly **remounted
-   read-only**, so the cloned/converted image is a clean point-in-time — not a
-   live "smear" that fails `fsck` and boots to a `grub>` prompt. If the root
-   can't be remounted read-only because apps are still writing to it, the
-   cutover **fails fast** and asks you to stop those writers and retry (rather
-   than silently producing a corrupt image). If the source is **already powered
-   off or idle**, tick **"skip the read-only snapshot"** in the dialog to skip
-   that step. **Delta passes are applied atomically**: the receiver stages each
-   pass and writes it to the volume only once the whole pass has arrived, so an
-   interrupted pass is **discarded whole** and the image is always exactly the
-   **last complete pass**. The migration pauses in state `awaiting_cutover`.
+   read-only** (so the image is a clean point-in-time, not a live "smear" that
+   fails `fsck` and boots to `grub>`), and then **converts the boot image and
+   validates it is bootable** — *all while the source is still running*. So if
+   anything is wrong (wrong disk, inconsistent/incomplete copy, a remount the
+   root won't allow because apps are still writing), the cutover **fails fast
+   BEFORE you power anything off** and tells you how to fix it — you lose no
+   uptime. If the source is **already powered off or idle**, tick **"skip the
+   read-only snapshot"** in the dialog. **Delta passes are applied atomically**:
+   an interrupted pass is **discarded whole**, so the image is always the **last
+   complete pass**. Once the image is validated the migration pauses in state
+   `awaiting_cutover`.
 
-   The card guides the timing: while step 1 runs it shows **"Freezing the
-   image — keep the source server running"** (so the in-flight pass can finish
-   and the image carries your latest changes); once frozen it switches to
-   **"Action needed — power off the source server now"**. Follow the card —
-   there is no need to guess when it is safe.
-3. **Power off the source server**, then click **Launch instance**. The appliance:
-   - runs the **machine conversion** on the boot disk so it boots on Linode
-     (virtio initramfs, GRUB, fstab, Lish serial console, network reset),
+   The card guides the timing: while step 1 runs it shows **"Preparing &
+   validating the boot image — keep the source server running"** (don't power
+   off yet); once the image is validated it switches to **"it is now safe to
+   power off the source server"**. Follow the card — there is no need to guess.
+3. **Power off the source server** (now that the image is validated), then click
+   **Launch instance**. The appliance:
    - **clones every disk's volume** into an image volume
-     (`vmrepl-img-<id>-<diskIndex>`) — your migrated "snapshot(s)",
+     (`vmrepl-img-<id>-<diskIndex>`) — your migrated "snapshot(s)" (the boot
+     conversion already ran and was validated in step 1),
    - **launches a new Linode** with all image volumes attached (boot as `sda`,
      data disks as `sdb`, `sdc`, …) and boots it.
 

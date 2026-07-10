@@ -70,6 +70,12 @@ type Server struct {
 	// the /complete endpoint (phase 2) can reuse the operator's options without
 	// re-prompting (keyed by migrationID, guarded by recMu).
 	pendingCutover map[int64]api.FinalizeRequest
+	// cutoverConvert caches the boot-disk conversion result from a guided cutover's
+	// phase 1 (the block methods convert BEFORE prompting the operator to power off,
+	// so a conversion failure surfaces while the source is still running). Phase 2
+	// reuses it instead of re-converting; if it is absent (e.g. applianced restarted
+	// between phases) phase 2 converts fresh. Keyed by migrationID.
+	cutoverConvert sync.Map
 	progress       sync.Map // migrationID -> *syncProgress
 	// Disk-boot cutover image streaming (see cutover_stream.go):
 	// cutoverStreams: token -> *cutoverStream (authorized image downloads);

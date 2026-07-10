@@ -1084,6 +1084,7 @@ func (s *Server) handleStopMigration(w http.ResponseWriter, r *http.Request) {
 	delete(s.finalizes, id)
 	delete(s.pendingCutover, id)
 	s.recMu.Unlock()
+	s.cutoverConvert.Delete(id) // discard any phase-1 conversion result; a retry re-converts
 	if cancel != nil {
 		cancel()
 	}
@@ -1190,7 +1191,8 @@ func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration,
 	}
 	s.recMu.Unlock()
 	s.stopReceivers(m)
-	s.dropFileDest(m.ID) // forget any direct file-transfer destination tracking
+	s.dropFileDest(m.ID)          // forget any direct file-transfer destination tracking
+	s.cutoverConvert.Delete(m.ID) // forget any cached phase-1 conversion result
 
 	cl, haveLinode := s.linodeClient(ctx)
 	// Remove cutover artifacts (launched instance + clone volumes) unless the
@@ -1330,19 +1332,137 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 
 	if req.GuidedShutdown {
 		// Guided cutover: a consistent point-in-time image is now frozen (receivers
-		// stopped). Pause for the operator to power the source off (verified by the
-		// agent going silent), then resume via /complete. Stash the request so phase
-		// 2 reuses the options.
+		// stopped). For the BLOCK methods, run — and validate — the boot-disk
+		// conversion NOW, while the source is still running, so a conversion failure
+		// (wrong disk, inconsistent image, bad environment) surfaces BEFORE the
+		// operator powers the source off. Only once it is validated do we ask them to
+		// power off. File transfer has no block image to convert, so it skips this.
+		if !isFileMethod(m.BootTarget) {
+			co, canc := s.convertBootDisk(ctx, m, req)
+			if canc {
+				return
+			}
+			if co.failed {
+				// Fail now — the source is still running and nothing was launched, so
+				// the operator can fix the cause and retry without any downtime.
+				switch {
+				case co.noRoot:
+					s.fail(m.ID, "cutover aborted before power-off — "+wrongDiskMsg)
+				case co.mountIssue:
+					s.fail(m.ID, convertMountMsg)
+				case co.envIssue:
+					s.fail(m.ID, "boot disk conversion failed because a required command was missing in the conversion environment (exit 127 / \"command not found\"). This is an appliance/PATH bug, NOT an inconsistent source — re-syncing won't help. Update the appliance to the latest build, restart applianced, and retry the cutover. Nothing was launched and the source was NOT powered off.")
+				default:
+					s.fail(m.ID, "boot disk conversion failed BEFORE power-off, so the launched instance would not boot (grub> prompt). The replicated filesystem is most likely inconsistent — retry the cutover and let it take the read-only snapshot (don't tick \"skip\" unless the source is already powered off). Nothing was launched and the source was NOT powered off; see the conversion detail above.")
+				}
+				return
+			}
+			s.storeCutoverConvert(m.ID, co)
+		}
+		// Pause for the operator to power the source off (verified by the agent going
+		// silent), then resume via /complete. Stash the request so phase 2 reuses the
+		// options.
 		s.recMu.Lock()
 		s.pendingCutover[m.ID] = req
 		s.recMu.Unlock()
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigAwaitingCutover, "")
 		_ = s.st.AddEvent(sctx, m.ID, "info", msg(
 			"cutover step 1 done: replication stopped and the copied files held for launch. Now POWER OFF the source server, then click \"Launch instance\" to reboot the destination into your migrated files.",
-			"cutover step 1 done: replication stopped and the current copy frozen as the image. Now POWER OFF the source server, then click \"Launch instance\" to convert, clone and launch."))
+			"cutover step 1 done: the boot image was converted and VALIDATED as bootable. It is now safe to POWER OFF the source server — then click \"Launch instance\" to clone and launch."))
 		return
 	}
 	s.finalizeComplete(ctx, m, req)
+}
+
+// convertOutcome captures the result of running the boot-disk conversion so a
+// guided cutover can convert in phase 1 (before power-off) and reuse it in phase 2.
+type convertOutcome struct {
+	kernel, rootDevice string
+	failed             bool // convert ran and returned an error
+	envIssue           bool // missing command / bad conversion environment (not inconsistent data)
+	noRoot             bool // no root/OS filesystem found (wrong source device or incomplete sync)
+	mountIssue         bool // chroot setup failed (a pseudo-fs mount point was not a directory)
+}
+
+// storeCutoverConvert / takeCutoverConvert cache a guided cutover's phase-1
+// conversion result for phase 2 (consumed once).
+func (s *Server) storeCutoverConvert(migID int64, co convertOutcome) {
+	s.cutoverConvert.Store(migID, co)
+}
+func (s *Server) takeCutoverConvert(migID int64) (convertOutcome, bool) {
+	v, ok := s.cutoverConvert.LoadAndDelete(migID)
+	if !ok {
+		return convertOutcome{}, false
+	}
+	return v.(convertOutcome), true
+}
+
+// convertBootDisk runs machine-convert.sh on the migration's boot disk to make it
+// bootable on Linode (virtio/GRUB/fstab/etc), emitting the same progress/failure
+// events regardless of which cutover phase calls it. It returns the outcome and
+// canceled=true if the run was cancelled (the caller should return). It never
+// fails the migration itself — the caller decides (fail fast in phase 1, or the
+// existing best-effort handling in phase 2). kernel/rootDevice default to the
+// GRUB2 path; a partitionless whole-disk root switches to a Linode kernel.
+func (s *Server) convertBootDisk(ctx context.Context, m api.Migration, req api.FinalizeRequest) (convertOutcome, bool) {
+	sctx := s.ctx
+	co := convertOutcome{kernel: "linode/grub2", rootDevice: "/dev/sda"}
+	boot := m.Disks[0]
+	bootDevice := s.diskDevicePath(m, boot)
+	if s.cfg.ConvertScript == "" || !isBlockDevice(bootDevice) {
+		log.Printf("appliance: migration %d: skipping machine-convert (no script or non-block device)", m.ID)
+		return co, false
+	}
+	log.Printf("appliance: migration %d: machine conversion on boot disk %s", m.ID, bootDevice)
+	// machine-convert.sh requires bash (set -o pipefail, etc). Run it under bash
+	// explicitly — /bin/sh would use dash on Debian/Ubuntu and fail on -o pipefail.
+	cmd := exec.CommandContext(ctx, bashPath(), s.cfg.ConvertScript, bootDevice)
+	// Pass console/SSH access via the environment (not argv) so the secrets don't
+	// show up in `ps`. The script seeds them into the migrated image's root account.
+	cmd.Env = os.Environ()
+	if req.RootPassword != "" {
+		cmd.Env = append(cmd.Env, "VMREPL_ROOT_PASSWORD="+req.RootPassword)
+	}
+	if req.SSHAuthorizedKey != "" {
+		cmd.Env = append(cmd.Env, "VMREPL_SSH_AUTHORIZED_KEY="+req.SSHAuthorizedKey)
+	}
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return co, true
+	}
+	if strings.Contains(string(out), "vmrepl-layout: wholedisk") {
+		// Partitionless filesystem: no on-disk bootloader, so boot with a Linode
+		// kernel that mounts the whole volume as root.
+		co.kernel = "linode/latest-64bit"
+	}
+	// Use the exact root device the convert script detected (e.g. /dev/sda1 for a
+	// partitioned disk) — booting a partitioned disk with root_device /dev/sda
+	// panics with "unable to mount root fs".
+	if rd := convertField(string(out), "vmrepl-root:"); rd != "" {
+		co.rootDevice = rd
+	}
+	if err != nil {
+		co.failed = true
+		co.envIssue = convertFailureEnvIssue(err, string(out))
+		co.noRoot = convertFailureNoRoot(string(out))
+		co.mountIssue = convertFailureMountIssue(string(out))
+		log.Printf("appliance: migration %d: machine-convert failed: %v\n%s", m.ID, err, trimOut(out))
+		if co.noRoot {
+			_ = s.st.AddEvent(sctx, m.ID, "error", "boot disk conversion failed: "+wrongDiskMsg+" Detail: "+oneLine(trimOut(out)))
+		} else if co.mountIssue {
+			_ = s.st.AddEvent(sctx, m.ID, "warn", convertMountMsg+" Detail: "+oneLine(trimOut(out)))
+		} else if co.envIssue {
+			_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish because a command was missing in the conversion environment (exit 127 / \"command not found\"). This is an appliance/PATH problem, NOT an inconsistent source — re-syncing won't help. Update the appliance to the latest build (the convert step now pins a full PATH) and retry the cutover. Detail: "+oneLine(trimOut(out)))
+		} else {
+			_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish, so the launched instance may not boot. Most often the replicated filesystem is inconsistent because the source kept changing during the copy — the reliable fix is a fresh full sync of a quiesced/idle source, then cut over again. The image volume is still created so you can also repair it manually in Rescue Mode (see docs/TROUBLESHOOTING.md). Detail: "+oneLine(trimOut(out)))
+		}
+	} else {
+		_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("boot disk converted for Linode (virtio, network); boot kernel %s root %s", co.kernel, co.rootDevice))
+		if access := accessSeededNote(req); access != "" {
+			_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: "+access+" — you can log in to the launched instance without rescue mode")
+		}
+	}
+	return co, false
 }
 
 // finalizeComplete is cutover phase 2: convert the boot disk, clone every disk
@@ -1368,80 +1488,23 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 		return
 	}
 
-	boot := m.Disks[0]
-	bootDevice := s.diskDevicePath(m, boot)
+	boot := m.Disks[0] // the boot disk (its cloned volume is the headline artifact)
 
-	// 1) Make the boot disk bootable on Linode (virtio/GRUB/fstab/etc). This is
-	//    best-effort: if it fails we still clone the replicated data into an image
-	//    volume so the operator can attach it to a Linode and finish by hand,
-	//    rather than being stranded with a failed migration and no artifact.
-	//    kernel/rootDevice default to the GRUB2 path; the convert script tells us
-	//    (via "vmrepl-layout:") when the disk is a partitionless whole-disk root,
-	//    which must boot via a Linode-supplied kernel instead.
-	kernel, rootDevice := "linode/grub2", "/dev/sda"
-	convertFailed := false
-	convertEnvIssue := false   // failure was a missing command / bad env, not inconsistent data
-	convertNoRoot := false     // no root/OS filesystem on the disk (wrong source device)
-	convertMountIssue := false // chroot setup failed (a pseudo-fs mount point was not a directory)
-	if s.cfg.ConvertScript != "" && isBlockDevice(bootDevice) {
-		log.Printf("appliance: migration %d: machine conversion on boot disk %s", m.ID, bootDevice)
-		// machine-convert.sh requires bash (set -o pipefail, etc). Run it under
-		// bash explicitly — invoking via /bin/sh would use dash on Debian/Ubuntu
-		// and fail with "Illegal option -o pipefail".
-		cmd := exec.CommandContext(ctx, bashPath(), s.cfg.ConvertScript, bootDevice)
-		// Pass any console/SSH access the operator entered via the environment (not
-		// argv) so the secrets don't show up in `ps`. The script seeds them into the
-		// migrated image's root account inside the chroot.
-		cmd.Env = os.Environ()
-		if req.RootPassword != "" {
-			cmd.Env = append(cmd.Env, "VMREPL_ROOT_PASSWORD="+req.RootPassword)
-		}
-		if req.SSHAuthorizedKey != "" {
-			cmd.Env = append(cmd.Env, "VMREPL_SSH_AUTHORIZED_KEY="+req.SSHAuthorizedKey)
-		}
-		// (Disk-boot: no in-guest installer is baked in any more — the copy runs
-		// in RESCUE MODE, streamed from the appliance; see finalizeDisk. The
-		// whole-disk ext shrink also runs in finalizeDisk, sized to the ACTUAL
-		// local disk Linode creates rather than the plan's nominal size.)
-		out, err := cmd.CombinedOutput()
-		if canceled() {
+	// 1) Make the boot disk bootable on Linode (virtio/GRUB/fstab/etc). A GUIDED
+	//    cutover already ran — and validated — this in phase 1, BEFORE the operator
+	//    powered off the source, so reuse that result. If it is absent (a non-guided
+	//    cutover, or applianced restarted between phases) convert fresh here.
+	co, cached := s.takeCutoverConvert(m.ID)
+	if !cached {
+		var canc bool
+		co, canc = s.convertBootDisk(ctx, m, req)
+		if canc {
 			return
 		}
-		if strings.Contains(string(out), "vmrepl-layout: wholedisk") {
-			// Partitionless filesystem: no on-disk bootloader, so boot with a
-			// Linode kernel that mounts the whole volume as root.
-			kernel = "linode/latest-64bit"
-		}
-		// Use the exact root device the convert script detected (e.g. /dev/sda1
-		// for a partitioned disk) — booting a partitioned disk with root_device
-		// /dev/sda panics with "unable to mount root fs".
-		if rd := convertField(string(out), "vmrepl-root:"); rd != "" {
-			rootDevice = rd
-		}
-		if err != nil {
-			convertFailed = true
-			convertEnvIssue = convertFailureEnvIssue(err, string(out))
-			convertNoRoot = convertFailureNoRoot(string(out))
-			convertMountIssue = convertFailureMountIssue(string(out))
-			log.Printf("appliance: migration %d: machine-convert failed: %v\n%s", m.ID, err, trimOut(out))
-			if convertNoRoot {
-				_ = s.st.AddEvent(sctx, m.ID, "error", "boot disk conversion failed: "+wrongDiskMsg+" Detail: "+oneLine(trimOut(out)))
-			} else if convertMountIssue {
-				_ = s.st.AddEvent(sctx, m.ID, "warn", convertMountMsg+" Detail: "+oneLine(trimOut(out)))
-			} else if convertEnvIssue {
-				_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish because a command was missing in the conversion environment (exit 127 / \"command not found\"). This is an appliance/PATH problem, NOT an inconsistent source — re-syncing won't help. Update the appliance to the latest build (the convert step now pins a full PATH) and retry the cutover. Detail: "+oneLine(trimOut(out)))
-			} else {
-				_ = s.st.AddEvent(sctx, m.ID, "warn", "boot disk conversion could not finish, so the launched instance may not boot. Most often the replicated filesystem is inconsistent because the source kept changing during the copy — the reliable fix is a fresh full sync of a quiesced/idle source, then cut over again. The image volume is still created so you can also repair it manually in Rescue Mode (see docs/TROUBLESHOOTING.md). Detail: "+oneLine(trimOut(out)))
-			}
-		} else {
-			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("boot disk converted for Linode (virtio, network); boot kernel %s root %s", kernel, rootDevice))
-			if access := accessSeededNote(req); access != "" {
-				_ = s.st.AddEvent(sctx, m.ID, "info", "cutover: "+access+" — you can log in to the launched instance without rescue mode")
-			}
-		}
-	} else {
-		log.Printf("appliance: migration %d: skipping machine-convert (no script or non-block device)", m.ID)
 	}
+	kernel, rootDevice := co.kernel, co.rootDevice
+	convertFailed, convertNoRoot := co.failed, co.noRoot
+	convertMountIssue, convertEnvIssue := co.mountIssue, co.envIssue
 
 	cl, ok := s.linodeClient(sctx)
 	if !ok || boot.VolumeID == 0 {

@@ -121,14 +121,14 @@ func TestConsoleDestinationStep(t *testing.T) {
 
 // The guided cutover must tell the operator, ON THE CARD, when it is safe to
 // power off the source: a "keep the source running" banner while step 1's
-// freeze/drain runs (cutover_freezing), then a "power off the source server
-// now" action banner once frozen (awaiting_cutover). Same visual style as the
-// disk-copy action box, and no emoji icons.
+// freeze/convert/validate runs (cutover_freezing), then a "safe to power off the
+// source server" action banner once the image is validated (awaiting_cutover).
+// Same visual style as the disk-copy action box, and no emoji icons.
 func TestConsoleCutoverGuidance(t *testing.T) {
 	for _, want := range []string{
-		"cutover_freezing",                // freeze-in-progress view flag is consumed
-		"keep the source server running",  // the wait guidance
-		"power off the source server now", // the go-ahead action banner
+		"cutover_freezing",                    // freeze-in-progress view flag is consumed
+		"keep the source server running",      // the wait guidance
+		"safe to power off the source server", // the go-ahead action banner
 	} {
 		if !strings.Contains(consoleHTML, want) {
 			t.Errorf("console should render the cutover guidance (missing %q)", want)
