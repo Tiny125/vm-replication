@@ -1072,13 +1072,25 @@ function migCard(v){
   }
 
   // Two groups: pre-migration (environment readiness while replicating) and
-  // migration (the cutover gate: initial full sync).
-  const checkRow=c=>'<div style="font-size:13px;margin:2px 0"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>';
+  // migration (the cutover gate: initial full sync). Once cutover has been reached
+  // (awaiting_cutover / migrating / launched, or a post-baseline failure), the
+  // PRE-migration checks are only informational — the source agent is stopped, so
+  // "Agent connected" and "Replication lag" naturally go red. Render those as a
+  // muted "–" (not an alarming ✗) so a completed/failed cutover doesn't look like
+  // it has outstanding errors.
+  const postCutover=['awaiting_cutover','migrating','image_ready','launched'].includes(m.state)||(m.state==='failed'&&allDone(m));
+  const checkRow=(c,info)=>{
+    const mark=c.ok?'y">✔':(info?'muted">–':'x">✘');
+    const note=(info&&!c.ok)?' <span style="font-style:italic">(not applicable after cutover)</span>':'';
+    return '<div style="font-size:13px;margin:2px 0"><span class="'+mark+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+note+'</span></div>';
+  };
   const subHead=t=>'<div class="muted" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin:10px 0 4px">'+t+'</div>';
   const pre=(v.validations||[]).filter(c=>c.group!=='migration'),mig=(v.validations||[]).filter(c=>c.group==='migration');
-  let checks=subHead('Pre-migration validation checks')+pre.map(checkRow).join('')+
-             subHead('Migration validation check')+mig.map(checkRow).join('');
-  const allOk=(v.validations||[]).every(c=>c.ok);
+  let checks=subHead('Pre-migration validation checks')+pre.map(c=>checkRow(c,postCutover)).join('')+
+             subHead('Migration validation check')+mig.map(c=>checkRow(c,false)).join('');
+  // After cutover only the migration check is meaningful; don't let the muted
+  // pre-checks force the section open or drop the "all passing" note.
+  const allOk=postCutover?mig.every(c=>c.ok):(v.validations||[]).every(c=>c.ok);
   b+='<details'+(allOk?'':' open')+'><summary>Validation checks'+(allOk?' (all passing)':'')+'</summary><div>'+
      '<div class="muted" style="font-size:12px;margin-bottom:6px">Pre-migration checks track readiness while replicating (informational after cutover). The migration check — <b>'+(file?'initial file copy complete':'initial full sync complete')+'</b> — is what allows cutover.</div>'+checks+'</div></details>';
   b+='<details><summary>Disks ('+disks(m).length+')</summary><div>'+diskTable(m)+'</div></details>';
