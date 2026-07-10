@@ -24,6 +24,25 @@ func TestCutoverConvertCache(t *testing.T) {
 	}
 }
 
+// Once cutover has been reached, the PRE-migration validation checks (agent
+// connected, replication lag) are only informational — the source agent is
+// stopped — so the card must render them as a muted "not applicable" marker
+// rather than an alarming red ✗ that reads as an outstanding error.
+func TestConsoleNeutralizesPostCutoverChecks(t *testing.T) {
+	js := extractJSFunc(t, "function migCard(")
+	if !strings.Contains(js, "postCutover") {
+		t.Error("card must compute a post-cutover flag to neutralize informational checks")
+	}
+	// Post-cutover pre-checks render muted with a clarifying note instead of ✗.
+	if !strings.Contains(js, "not applicable after cutover") {
+		t.Error("post-cutover pre-migration checks should be labelled not-applicable, not shown as errors")
+	}
+	// The neutralized marker is muted, not the red ✗ class.
+	if !strings.Contains(js, `info?'muted">`) {
+		t.Error("an informational failed check must use the muted marker, not the red ✗")
+	}
+}
+
 // The block cutover flow must tell the operator, in the dialog and on the card,
 // that the boot image is converted and VALIDATED before they power off the source
 // — the whole point of moving the conversion into phase 1.
