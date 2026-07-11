@@ -414,7 +414,9 @@ while read -r name size type; do
   case "$name" in nbd*|loop*|ram*|zram*|sr*|fd*) continue;; esac
   [ -n "$DISKS_JSON" ] && DISKS_JSON="$DISKS_JSON,"
   DISKS_JSON="$DISKS_JSON{\"name\":\"$(js "$name")\",\"size_bytes\":$size}"
+  [ "$size" -gt "${MAXDISK:-0}" ] && MAXDISK=$size
 done < <(lsblk -b -d -n -o NAME,SIZE,TYPE 2>/dev/null)
+MAXDISK="${MAXDISK:-0}"
 
 USED="$(df -B1 --total -x tmpfs -x devtmpfs -x overlay 2>/dev/null | awk '/^total/{print $3}')"
 USED="${USED:-0}"
@@ -452,13 +454,109 @@ REPORT="{
  \"data_port_tried\":$PROBE_PORT
 }"
 
+# ---------------------------------------------------------------------------
+# Local assessment — printed HERE so the operator sees the full result in this
+# terminal even when the report cannot reach the console. Mirrors the core
+# rules of the appliance's assessment (which stays authoritative when online).
+# ---------------------------------------------------------------------------
+FILE_V=ok; VOL_V=ok; DSK_V=ok
+FILE_N=""; VOL_N=""; DSK_N=""
+worsen(){ # worsen <FILE|VOL|DSK> <warn|fail> <note>
+  local cur; eval "cur=\$${1}_V"
+  if [ "$2" = fail ]; then eval "${1}_V=fail"
+  elif [ "$cur" = ok ]; then eval "${1}_V=warn"; fi
+  eval "${1}_N=\"\${${1}_N}     - $3\n\""
+}
+if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "amd64" ]; then
+  for m in FILE VOL DSK; do worsen $m fail "CPU is $ARCH - only x86_64 servers can migrate"; done
+fi
+[ -n "${ID:-}" ] || for m in FILE VOL DSK; do worsen $m warn "OS could not be identified (/etc/os-release missing)"; done
+if [ "$HAS_SYSTEMD" != "true" ]; then
+  for m in FILE VOL DSK; do worsen $m warn "no systemd: the replication agent must be scheduled manually"; done
+fi
+if [ "$PORT_OK" = "false" ]; then
+  for m in FILE VOL DSK; do worsen $m warn "replication port TCP $PROBE_PORT blocked - open 5000-5100 (source to appliance)"; done
+fi
+[ "$SELINUX" = "enforcing" ] && worsen FILE warn "SELinux enforcing: file copy does not preserve contexts - plan /.autorelabel or use a block method"
+if [ "$LUKS" = "true" ]; then
+  worsen VOL fail "root is LUKS-encrypted - the block image cannot boot on Linode; use file transfer"
+  worsen DSK fail "root is LUKS-encrypted - the block image cannot boot on Linode; use file transfer"
+else
+  case "$ROOTFS" in
+    ext2|ext3|ext4|xfs) : ;;
+    btrfs) worsen VOL warn "btrfs root: boot conversion is unvalidated - file transfer is safer"
+           worsen DSK warn "btrfs root: boot conversion is unvalidated - file transfer is safer" ;;
+    "")    worsen VOL warn "root filesystem type unknown - boot conversion unverified"
+           worsen DSK warn "root filesystem type unknown - boot conversion unverified" ;;
+    *)     worsen VOL fail "$ROOTFS root cannot be converted to boot on Linode - use file transfer"
+           worsen DSK fail "$ROOTFS root cannot be converted to boot on Linode - use file transfer" ;;
+  esac
+fi
+if [ "$RAID" = "true" ]; then
+  worsen VOL warn "root on software RAID - the array is flattened on the destination"
+  worsen DSK warn "root on software RAID - the array is flattened on the destination"
+fi
+if [ "${MAXDISK:-0}" -gt 10995116277760 ] 2>/dev/null; then
+  worsen VOL fail "a disk exceeds Linode Block Storage's 10 TiB volume limit"
+  worsen DSK warn "a disk exceeds 10 TiB - a plan with that much local disk is required"
+fi
+# Recommended destination image for file transfer (closest Linode image).
+REC=""; MAJ="${VERSION_ID%%%%.*}"
+case "${ID:-}" in
+  ubuntu) case "${VERSION_ID:-}" in 24*) REC=linode/ubuntu24.04;; 22*) REC=linode/ubuntu22.04;; 20*) REC=linode/ubuntu20.04;; *) REC=linode/ubuntu24.04;; esac;;
+  debian) case "$MAJ" in 11) REC=linode/debian11;; *) REC=linode/debian12;; esac;;
+  almalinux) REC=linode/almalinux${MAJ:-9};;
+  rocky) REC=linode/rocky${MAJ:-9};;
+  rhel|redhat) REC=linode/almalinux${MAJ:-9};;
+  centos) [ "$MAJ" = "7" ] && REC=linode/centos7 || REC=linode/centos-stream${MAJ:-9};;
+  fedora) REC=linode/fedora${MAJ:-40};;
+  opensuse|opensuse-leap) REC=linode/opensuse15.6;;
+  arch) REC=linode/arch;;
+  alpine) REC=linode/alpine3.20;;
+  gentoo) REC=linode/gentoo;;
+  amzn) REC=linode/almalinux9;;
+esac
+label(){ case "$1" in ok) echo "SUPPORTED";; warn) echo "SUPPORTED WITH CAUTIONS";; *) echo "NOT SUPPORTED";; esac; }
+USED_GB=$(( (USED + 1073741823) / 1073741824 ))
+echo
+echo "==================== SOURCE CHECK RESULT ===================="
+echo " OS:        ${PRETTY_NAME:-unknown} ($ARCH, kernel $KERNEL)"
+echo " Root:      ${ROOTFS:-unknown} on ${ROOTSRC:-unknown}$( [ "$LVM" = true ] && echo ' (LVM)')$( [ "$LUKS" = true ] && echo ' (LUKS)')$( [ "$RAID" = true ] && echo ' (RAID)')"
+echo " systemd:   $( [ "$HAS_SYSTEMD" = true ] && echo present || echo 'NOT FOUND')     SELinux: ${SELINUX:-n/a}"
+echo " Used:      ${USED_GB} GB (size a file-transfer plan by this)"
+case "$PORT_OK" in
+  true)  echo " Network:   replication port TCP $PROBE_PORT reachable";;
+  false) echo " Network:   replication port TCP $PROBE_PORT BLOCKED - open 5000-5100";;
+  *)     echo " Network:   replication ports not tested - ensure TCP 5000-5100 is open";;
+esac
+echo
+echo " File transfer : $(label $FILE_V)"
+[ -n "$REC" ] && echo "     recommended destination OS image: $REC" || echo "     recommended destination OS image: no close match - pick manually"
+[ -n "$FILE_N" ] && printf '%%b' "$FILE_N"
+echo " Volume boot   : $(label $VOL_V)   (destination boots your migrated disk)"
+[ -n "$VOL_N" ] && printf '%%b' "$VOL_N"
+echo " Disk boot     : $(label $DSK_V)   (destination boots your migrated disk)"
+[ -n "$DSK_N" ] && printf '%%b' "$DSK_N"
+if [ "$FILE_V" = fail ] && [ "$VOL_V" = fail ] && [ "$DSK_V" = fail ]; then
+  echo " VERDICT: this server cannot migrate with any method (see reasons above)."
+else
+  echo " VERDICT: this server can migrate - use a supported method above."
+fi
+echo "============================================================="
+echo
+
 CURL="curl -fsSL"
 [ -n "$PIN" ] && CURL="$CURL $PIN"
-echo ">> Reporting the assessment to your console…"
-if echo "$REPORT" | $CURL -X POST -H 'Content-Type: application/json' --data-binary @- "$BASE/check/report?token=$TOKEN" >/dev/null; then
-  echo ">> Done. Return to the console — the result is displayed on the Source check tab."
+echo ">> Delivering the result to your migration console…"
+if echo "$REPORT" | $CURL -X POST -H 'Content-Type: application/json' --data-binary @- "$BASE/check/report?token=$TOKEN" >/dev/null 2>&1; then
+  echo ">> Delivered. The Source check tab in the console now shows this result too."
 else
-  echo ">> Could not reach the console to deliver the report."
-  echo ">> Check that this server can reach $BASE, then re-run the command."
+  echo
+  echo "!! NOTE: the result could NOT be delivered to the migration console."
+  echo "!! The network from this server to the migration instance ($BASE)"
+  echo "!! is not accessible, so the console will keep showing 'waiting'."
+  echo "!! The result printed above is complete and valid."
+  echo "!! Before migrating, open the console port and TCP 5000-5100 from this"
+  echo "!! server to the migration instance, then re-run this command."
 fi
 `

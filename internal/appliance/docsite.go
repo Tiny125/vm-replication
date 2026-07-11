@@ -266,6 +266,7 @@ sudo scripts/install-replication-server.sh</pre><button class="copy" onclick="cp
 </ol>
 <figure><img src="/documentation/img/source-check.png" alt="A completed source check"><figcaption>A completed check: source facts, a verdict per migration method (Supported / Supported with cautions / Not supported) with the reasons, and the recommended destination OS image for file transfer.</figcaption></figure>
 <div class="adm tip"><span class="t">Tip</span>Run this on every server you plan to migrate, before anything else. A "Not supported" verdict (for example a LUKS-encrypted root for the block methods) tells you up front to use a different method — instead of finding out at cutover.</div>
+<div class="adm"><span class="t">Note</span>The full result is also printed <b>in the source server's own terminal</b>. If the source cannot reach the replication server, the terminal result still appears in full, with a note that the network to the migration instance is not accessible — fix the ports (console port + TCP 5000–5100), then re-run so the console receives it too.</div>
 </section>
 
 <section id="source-details">

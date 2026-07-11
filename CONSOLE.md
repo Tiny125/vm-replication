@@ -289,6 +289,13 @@ fine; btrfs cautioned; ZFS/LUKS refused), software-RAID caution, the 10 TiB
 Block Storage per-volume limit, SELinux mode for file transfer, and data-plane
 reachability (TCP 5000–5100).
 
+**Works offline too.** The script prints the **full result in the source
+server's own terminal** before delivering it, so even when the network to the
+migration instance is not accessible you still get the complete assessment
+locally — with a prominent note that the report could not be delivered and
+which ports to open. Fix the network, re-run the same command, and the console
+receives it as well.
+
 ---
 
 ## 4. Create a migration (single or multi-disk)

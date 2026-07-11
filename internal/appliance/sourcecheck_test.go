@@ -233,6 +233,34 @@ func TestSourceCheckRoundTrip(t *testing.T) {
 	}
 }
 
+// The check script must be self-sufficient: it prints the FULL assessment in
+// the source server's own terminal (facts, per-method verdicts, recommended
+// image) BEFORE attempting to deliver the report — so the operator still gets
+// the result when the network to the migration instance is not accessible —
+// and on delivery failure it prints a prominent note saying exactly that.
+func TestSourceCheckScriptPrintsLocalResult(t *testing.T) {
+	for _, want := range []string{
+		"SOURCE CHECK RESULT",              // the local result banner
+		"recommended destination OS image", // image recommendation printed locally
+		"NOT SUPPORTED",                    // local verdict labels exist
+		"VERDICT:",                         // bottom-line verdict
+		"could NOT be delivered",           // the offline note…
+		"is not accessible",                // …says the network to the instance is blocked
+		"printed above is complete",        // …and that the local result still stands
+	} {
+		if !strings.Contains(sourceCheckScript, want) {
+			t.Errorf("check script missing local-result piece %q", want)
+		}
+	}
+	// The local verdicts must be computed BEFORE the report POST, so they print
+	// even when the console is unreachable.
+	res := strings.Index(sourceCheckScript, "SOURCE CHECK RESULT")
+	post := strings.Index(sourceCheckScript, "/check/report?token=")
+	if res < 0 || post < 0 || res > post {
+		t.Error("the local result must print before the report is delivered")
+	}
+}
+
 // The console must carry the Source check tab, its view, and the check flow.
 func TestConsoleSourceCheckTab(t *testing.T) {
 	for _, want := range []string{
