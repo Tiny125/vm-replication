@@ -392,6 +392,64 @@ type ConnTestResult struct {
 	Ports      []PortProbe `json:"ports"`
 }
 
+// SourceCheckReport is the raw facts a source server reports about itself when
+// the operator runs the one-shot pre-assessment script (Source check tab). The
+// script only READS system facts and POSTs them here — nothing is installed.
+// The appliance turns these into a SourceAssessment (per-method verdicts).
+type SourceCheckReport struct {
+	Hostname   string `json:"hostname"`
+	OSID       string `json:"os_id"`      // /etc/os-release ID (ubuntu, debian, almalinux, …)
+	OSVersion  string `json:"os_version"` // /etc/os-release VERSION_ID
+	OSPretty   string `json:"os_pretty"`  // /etc/os-release PRETTY_NAME
+	Arch       string `json:"arch"`       // uname -m
+	Kernel     string `json:"kernel"`     // uname -r
+	Virt       string `json:"virt"`       // systemd-detect-virt (kvm, xen, none, …)
+	HasSystemd bool   `json:"has_systemd"`
+	RootFS     string `json:"root_fs"`     // filesystem type of / (ext4, xfs, btrfs, …)
+	RootDevice string `json:"root_device"` // findmnt -no SOURCE /
+	RootOnLVM  bool   `json:"root_on_lvm"`
+	RootOnLUKS bool   `json:"root_on_luks"`
+	RootOnRAID bool   `json:"root_on_raid"`
+	EFIBoot    bool   `json:"efi_boot"`
+	SELinux    string `json:"selinux"` // enforcing | permissive | disabled | ""
+	// Real data disks (pseudo devices already filtered by the script).
+	Disks     []SourceCheckDisk `json:"disks"`
+	UsedBytes int64             `json:"used_bytes"` // used storage across real filesystems
+	// Data-plane reachability, tested source → appliance against a probe port in
+	// the receiver range. Nil means the script could not run the test.
+	DataPortOK    *bool `json:"data_port_ok,omitempty"`
+	DataPortTried int   `json:"data_port_tried,omitempty"`
+}
+
+// SourceCheckDisk is one whole data disk on the source.
+type SourceCheckDisk struct {
+	Name      string `json:"name"` // sda, vda, nvme0n1
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+// MethodAssessment is the verdict for one migration method.
+type MethodAssessment struct {
+	Method  string   `json:"method"`  // file | volume | disk
+	Verdict string   `json:"verdict"` // ok | warn | fail
+	Reasons []string `json:"reasons,omitempty"`
+	// RecommendedImage is the Linode OS image to pick as the destination (file
+	// method only; the block methods boot the source's own migrated disk).
+	RecommendedImage string `json:"recommended_image,omitempty"`
+}
+
+// SourceAssessment is the appliance's evaluation of a SourceCheckReport.
+type SourceAssessment struct {
+	Checks  []ValidationCheck  `json:"checks"`  // general facts (arch, network, …)
+	Methods []MethodAssessment `json:"methods"` // one verdict per migration method
+}
+
+// SourceCheckStatus is the console's poll response for a pending/complete check.
+type SourceCheckStatus struct {
+	Status     string             `json:"status"` // pending | done
+	Report     *SourceCheckReport `json:"report,omitempty"`
+	Assessment *SourceAssessment  `json:"assessment,omitempty"`
+}
+
 // LoginRequest authenticates to the console.
 type LoginRequest struct {
 	Password string `json:"password"`

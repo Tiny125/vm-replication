@@ -162,6 +162,7 @@ const docsHTML = `<!DOCTYPE html>
   <div class="navgroup"><div class="gtitle">Console guide</div>
     <a href="#overview">Console overview</a>
     <a href="#api-token">Add your Linode API token</a>
+    <a href="#source-check">Check the source first</a>
     <a href="#source-details">Find your source details</a>
   </div>
   <div class="navgroup"><div class="gtitle">Create a migration</div>
@@ -253,6 +254,18 @@ sudo scripts/install-replication-server.sh</pre><button class="copy" onclick="cp
 <figure><img src="/documentation/img/settings-token.png" alt="The Linode automation card"><figcaption>The token is stored encrypted at rest (AES-256-GCM) and only ever sent to api.linode.com.</figcaption></figure></li>
 </ol>
 <div class="adm warn"><span class="t">Warning</span>Without a token, the <b>Destination OS image</b> dropdown on the New-migration form stays empty ("add a Linode token in Settings to load OS images") and a file-transfer migration cannot be created.</div>
+</section>
+
+<section id="source-check">
+<h2>Check the source first</h2>
+<p>Before creating a migration, run the <b>Source check</b> (its own tab in the console header) — a <b>read-only pre-migration assessment</b> that tells you whether a server can migrate, <b>which of the three methods it supports</b>, and which <b>destination OS image</b> to pick.</p>
+<ol class="steps">
+<li>Open the <b>Source check</b> tab and press <span class="btn-demo primary">Generate check command</span>.</li>
+<li>Run the shown one-line command on the <b>source server</b> as root (it is valid for 30 minutes). The command only <b>reads</b> system facts — OS, CPU architecture, disk layout, filesystems, SELinux, and live network reachability of the replication port — sends one report back, and exits. <b>Nothing is installed</b>, so there is nothing to remove afterwards.</li>
+<li>The tab updates by itself when the report arrives:</li>
+</ol>
+<figure><img src="/documentation/img/source-check.png" alt="A completed source check"><figcaption>A completed check: source facts, a verdict per migration method (Supported / Supported with cautions / Not supported) with the reasons, and the recommended destination OS image for file transfer.</figcaption></figure>
+<div class="adm tip"><span class="t">Tip</span>Run this on every server you plan to migrate, before anything else. A "Not supported" verdict (for example a LUKS-encrypted root for the block methods) tells you up front to use a different method — instead of finding out at cutover.</div>
 </section>
 
 <section id="source-details">
