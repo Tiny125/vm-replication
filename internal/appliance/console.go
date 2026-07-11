@@ -175,6 +175,7 @@ const consoleHTML = `<!DOCTYPE html>
       <button id="tabMig" class="tab active" onclick="nav('mig')">Migrations</button>
       <button id="tabConn" class="tab" onclick="nav('conn')">Connection test</button>
       <span style="flex:1"></span>
+      <a href="/documentation" target="_blank" rel="noopener" style="text-decoration:none"><button>Documentation</button></a>
       <button onclick="logout()">Sign out</button>
     </div>
 

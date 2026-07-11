@@ -5,6 +5,11 @@ This is the turnkey way to use the **vm-replication tool**: install one service 
 from the browser. No manual cert copying or command crafting — the console
 generates a one-line command for each source.
 
+> **The same guide, with screenshots of every step, is served by your own
+> replication server at `https://<ip>:8080/documentation`** (also linked from
+> the console's header). This file is the Markdown companion with extra sizing
+> and operational detail.
+
 For the manual/CLI workflow instead, see [`GETTING_STARTED.md`](docs/GETTING_STARTED.md).
 
 ---

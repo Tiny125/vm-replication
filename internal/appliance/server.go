@@ -137,6 +137,10 @@ func New(ctx context.Context, cfg Config) *Server {
 func (s *Server) routes() {
 	// Public: console shell, health, auth.
 	s.mux.HandleFunc("GET /", s.handleConsole)
+	// The how-to guide (unauthenticated, like the install scripts): the full
+	// console manual with screenshots, served by the appliance itself.
+	s.mux.HandleFunc("GET /documentation", s.handleDocs)
+	s.mux.HandleFunc("GET /documentation/img/", s.handleDocsImage)
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok")) })
 	s.mux.HandleFunc("POST /login", s.handleLogin)
 	s.mux.HandleFunc("POST /logout", s.handleLogout)
