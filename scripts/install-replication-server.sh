@@ -97,6 +97,17 @@ if [ -x "$ROOT/bin/applianced" ] && [ -x "$ROOT/bin/agent" ] && [ -x "$ROOT/bin/
    && [ -x "$ROOT/bin/controld" ] && [ -x "$ROOT/bin/replctl" ]; then
   NEED_BUILD=0
 fi
+# Upgrade path: re-running the installer after `git pull` must NOT silently
+# reuse stale binaries. If this is a git checkout and the last commit is newer
+# than the built applianced, rebuild.
+if [ "$NEED_BUILD" -eq 0 ] && command -v git >/dev/null 2>&1 && [ -d "$ROOT/.git" ]; then
+  commit_ts="$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 0)"
+  bin_ts="$(stat -c %Y "$ROOT/bin/applianced" 2>/dev/null || echo 0)"
+  if [ "${commit_ts:-0}" -gt "${bin_ts:-0}" ]; then
+    echo ">> Repository is newer than the built binaries — rebuilding"
+    NEED_BUILD=1
+  fi
+fi
 
 # Install OS packages if any required tool is missing (runtime tools always;
 # build tools only when we must compile).
@@ -175,6 +186,9 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now applianced.service
+# `enable --now` does NOT restart an already-running service, so an upgrade
+# would keep the old binary in memory. Restart to pick up what we installed.
+systemctl restart applianced.service
 
 # --- best-effort firewall ---
 if command -v ufw >/dev/null 2>&1; then
