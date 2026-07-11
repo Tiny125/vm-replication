@@ -9,8 +9,6 @@
 #
 #   sudo scripts/install-replication-server.sh [--public-host IP] [--region us-ord] [--port 8080]
 #
-#   sudo scripts/install-replication-server.sh [--public-host IP] [--region us-ord] [--port 8080]
-#
 # It installs everything it needs (git, make, gcc, curl, openssl, jq, tar and a
 # recent Go) using the system package manager (apt/dnf/yum/zypper), builds the
 # binaries, and sets up the service. Requires: bash, root, and internet access.
@@ -210,32 +208,15 @@ cat <<EOF
 
 ================ REPLICATION SERVER READY ================
  Console:   https://$PUBLIC_HOST:$PORT
- Guide:     https://$PUBLIC_HOST:$PORT/documentation  (step-by-step, with screenshots)
+ Guide:     https://$PUBLIC_HOST:$PORT/documentation
  Password:  $( [ -f "$PWFILE" ] && cat "$PWFILE" || echo "see: journalctl -u applianced" )
- Cert SHA-256 (verify this in your browser's certificate dialog):
+ Cert SHA-256 (verify in the browser's certificate dialog):
    ${FPR:-see: journalctl -u applianced}
 
- The console uses a self-signed certificate, so your browser will warn on first
- visit — that's expected. Click through, then confirm the certificate's SHA-256
- fingerprint matches the value above before entering the password.
+ The browser warns about the self-signed certificate on first visit — verify
+ the fingerprint above, then sign in. The Guide covers everything from there.
 
- Open the console in your browser, sign in with the password above, then:
-   1. (optional) paste your Linode API token to enable volume provisioning
-      and one-click finalize.
-   2. Create a migration: enter your source server's hostname, disk device
-      (e.g. /dev/sda), and disk size.
-   3. Copy the generated one-line command and run it on your SOURCE server.
-      (It pins this server's key, so the agent download is MITM-proof.)
-   4. Watch replication status; when checks pass, click "Start migration".
-   5. The migrated image (a cloned volume) can launch new Linode instances.
-
- Forgot the password? Retrieve it any time on this server with:
-   sudo /usr/local/bin/applianced -data-dir $LIB -show-password
- (Signing out of the console does NOT stop migrations — replication keeps
-  running in the background regardless of console sessions.)
-
- The console (HTTPS) and the replication data plane (mutual TLS) are both
- encrypted. Still, restrict port $PORT to trusted networks where you can.
- Logs: journalctl -u applianced -f
+ Forgot the password?  sudo /usr/local/bin/applianced -data-dir $LIB -show-password
+ Logs:                 journalctl -u applianced -f
 ==========================================================
 EOF
