@@ -16,7 +16,7 @@ console never needs inbound access to your sources.
 
 | Method | What moves | Best for |
 |---|---|---|
-| **File transfer** *(default)* | Only the **used files** — a mostly-empty 80 GB disk copies its ~4 GB — onto a brand-new Linode running an OS image you pick | Most servers: cheapest, usually fastest, no partition/bootloader concerns |
+| **File transfer** *(default)* | Only the **used files**, copies only the used storage onto a brand-new Linode running an OS image you pick | Most servers: cheapest, usually fastest, no partition/bootloader concerns |
 | **Volume boot** | Every disk, **block for block**, onto Block Storage volumes cloned into launchable image volumes | Exact disk-level replicas, multi-disk servers, keeping volumes as artifacts |
 | **Disk boot** | Every disk, block for block, onto the new Linode's own **local NVMe disk** | Disk-level replica without a separate volume |
 
