@@ -173,11 +173,34 @@ const consoleHTML = `<!DOCTYPE html>
   <div id="app" class="hide">
     <div class="bar">
       <button id="tabMig" class="tab active" onclick="nav('mig')">Migrations</button>
+      <button id="tabSrc" class="tab" onclick="nav('src')">Source check</button>
       <button id="tabConn" class="tab" onclick="nav('conn')">Connection test</button>
       <span style="flex:1"></span>
       <a href="/documentation" target="_blank" rel="noopener" style="text-decoration:none"><button>Documentation</button></a>
       <button onclick="logout()">Sign out</button>
     </div>
+
+  <!-- VIEW: SOURCE CHECK -->
+  <div id="view-src" class="hide">
+    <div class="card">
+      <h2>Source check</h2>
+      <div class="muted" style="font-size:13.5px;margin-bottom:14px">
+        A <b>read-only pre-migration assessment</b> of a source server — run it <b>before</b> creating a
+        migration to learn whether the server can migrate, <b>which methods are supported</b>, and which
+        <b>destination OS image</b> to pick. One command gathers the facts (OS, CPU architecture, disk
+        layout, filesystems, SELinux, network reachability) and reports them back here.
+        <b>Nothing is installed on the source</b> — the command reads system facts, sends one report, and exits.
+      </div>
+      <div style="margin-top:6px"><button id="srcBtn" class="primary" onclick="runSourceCheck(this)">Generate check command</button></div>
+      <div id="srcCmdBox" class="hide" style="margin-top:16px">
+        <label>Run this on the source server (valid for 30 minutes)</label>
+        <div style="display:flex;gap:8px;align-items:flex-start"><pre id="srcChkCmd" style="flex:1;margin:0"></pre>
+        <button onclick="copyText(document.getElementById('srcChkCmd').textContent,this)">Copy</button></div>
+        <div id="srcWait" class="resultbox" style="margin-top:10px">Waiting for the source to report…</div>
+      </div>
+      <div id="srcOut" class="hide" style="margin-top:16px"></div>
+    </div>
+  </div>
 
   <!-- VIEW: CONNECTION TEST -->
   <div id="view-conn" class="hide">
@@ -361,11 +384,72 @@ async function login(btn){
 async function logout(){try{await api('POST','/logout')}catch(e){}show('login')}
 
 function nav(which){
-  const mig=which==='mig';
-  $('view-mig').classList.toggle('hide',!mig);
-  $('view-conn').classList.toggle('hide',mig);
-  $('tabMig').classList.toggle('active',mig);
-  $('tabConn').classList.toggle('active',!mig);
+  for(const t of ['mig','src','conn']){
+    $('view-'+t).classList.toggle('hide',which!==t);
+    $('tab'+t[0].toUpperCase()+t.slice(1)).classList.toggle('active',which===t);
+  }
+}
+// ---- Source check: pre-migration assessment ----
+let srcPoll=null;
+async function runSourceCheck(btn){
+  busy(btn,true);
+  try{
+    const r=await api('POST','/api/v1/sourcecheck',{});
+    $('srcChkCmd').textContent=r.cmd;
+    $('srcCmdBox').classList.remove('hide');
+    $('srcOut').classList.add('hide');$('srcOut').innerHTML='';
+    $('srcWait').textContent='Waiting for the source to report… run the command above, then this page updates by itself.';
+    if(srcPoll)clearInterval(srcPoll);
+    srcPoll=setInterval(async()=>{
+      try{
+        const st=await api('GET','/api/v1/sourcecheck/'+r.token);
+        if(st.status==='done'){clearInterval(srcPoll);srcPoll=null;renderSourceCheck(st);}
+      }catch(e){ /* token expired: stop polling and say so */
+        clearInterval(srcPoll);srcPoll=null;
+        $('srcWait').textContent='The check expired before a report arrived — generate a fresh command.';
+      }
+    },3000);
+  }catch(e){alertModal({title:'Cannot start the check',html:esc(e.message),danger:true});}
+  finally{busy(btn,false);}
+}
+// renderSourceCheck draws the assessment: facts, general checks, and the
+// per-method verdict table with the recommended destination image.
+function renderSourceCheck(st){
+  const rep=st.report||{},a=st.assessment||{checks:[],methods:[]};
+  $('srcWait').textContent='Report received.';
+  const V={ok:['ok','Supported'],warn:['warn','Supported with cautions'],bad:['bad','Not supported'],fail:['bad','Not supported']};
+  const MNAME={file:'File transfer',volume:'Volume boot',disk:'Disk boot'};
+  let h='<div class="banner" style="border-color:#cdd6e8;background:#f3f6fc;color:#22408a"><b>'+esc(rep.os_pretty||'Unknown OS')+'</b>'+
+    ' — '+esc(rep.arch||'?')+', kernel '+esc(rep.kernel||'?')+(rep.virt&&rep.virt!=='unknown'?(', virtualization: '+esc(rep.virt)):'')+
+    (rep.hostname?(' <span class="muted">('+esc(rep.hostname)+')</span>'):'')+'</div>';
+  // General checks.
+  h+='<div class="muted" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin:10px 0 4px">Source facts</div>';
+  for(const c of (a.checks||[]))
+    h+='<div style="font-size:13px;margin:2px 0"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>';
+  // Per-method verdicts.
+  h+='<div class="muted" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin:14px 0 4px">Migration methods</div>';
+  h+='<table><tr><th>Method</th><th>Verdict</th><th>Recommended destination</th><th>Notes</th></tr>';
+  for(const m of (a.methods||[])){
+    const v=V[m.verdict]||V.warn;
+    const dest=m.method==='file'
+      ?(m.recommended_image?('<code style="display:inline;padding:1px 5px">'+esc(m.recommended_image)+'</code> (pick this OS image)')
+        :'no close image match — pick the nearest OS manually')
+      :'<span class="muted">not applicable — the destination boots your migrated disk</span>';
+    h+='<tr><td><b>'+esc(MNAME[m.method]||m.method)+'</b></td>'+
+       '<td><span class="pill '+v[0]+'">'+v[1]+'</span></td>'+
+       '<td>'+dest+'</td>'+
+       '<td style="font-size:12.5px">'+((m.reasons||[]).map(esc).join('<br>')||'<span class="muted">—</span>')+'</td></tr>';
+  }
+  h+='</table>';
+  // Bottom line.
+  const okAny=(a.methods||[]).some(m=>m.verdict!=='fail');
+  h+=okAny
+    ?'<div class="resultbox ok" style="margin-top:10px"><b>✔ This server can migrate.</b> Use a supported method above — then create the migration on the Migrations tab.</div>'
+    :'<div class="resultbox bad" style="margin-top:10px"><b>✘ This server cannot migrate with any method.</b> See the notes above for the blocking reasons.</div>';
+  if(rep.used_bytes>0)h+='<div class="muted" style="font-size:12.5px;margin-top:8px">Used storage on the source: <b>'+fmtBytes(rep.used_bytes)+'</b> — size a file-transfer plan by this. '+
+    ((rep.disks&&rep.disks.length)?('Disks: '+rep.disks.map(d=>esc(d.name)+' ('+fmtBytes(d.size_bytes)+')').join(', ')+' — block methods replicate these whole.'):'')+'</div>';
+  $('srcOut').innerHTML=h;
+  $('srcOut').classList.remove('hide');
 }
 async function runConnTest(btn){
   const ip=$('conn_ip').value.trim();const out=$('connOut');

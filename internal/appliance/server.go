@@ -70,6 +70,9 @@ type Server struct {
 	// the /complete endpoint (phase 2) can reuse the operator's options without
 	// re-prompting (keyed by migrationID, guarded by recMu).
 	pendingCutover map[int64]api.FinalizeRequest
+	// sourceChecks tracks pre-migration source assessments (Source check tab):
+	// token -> *sourceCheck (probe listener + the script's reported facts).
+	sourceChecks sync.Map
 	// cutoverConvert caches the boot-disk conversion result from a guided cutover's
 	// phase 1 (the block methods convert BEFORE prompting the operator to power off,
 	// so a conversion failure surfaces while the source is still running). Phase 2
@@ -165,6 +168,11 @@ func (s *Server) routes() {
 	// the destination's Lish console if cloud-init didn't auto-install the receiver.
 	s.mux.HandleFunc("GET /dest/install.sh", s.handleDestInstall)
 
+	// Source check (pre-migration assessment): the script + its report endpoint
+	// are token-gated and unauthenticated (they run on the source server).
+	s.mux.HandleFunc("GET /check/source.sh", s.handleSourceCheckScript)
+	s.mux.HandleFunc("POST /check/report", s.handleSourceCheckReport)
+
 	// Console API (session-protected).
 	s.mux.Handle("GET /api/v1/session", s.auth(s.handleSession))
 	s.mux.Handle("GET /api/v1/migrations", s.auth(s.handleListMigrations))
@@ -180,6 +188,8 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/v1/migrations/{id}/complete", s.auth(s.handleCompleteCutover))
 	s.mux.Handle("POST /api/v1/migrations/{id}/stop", s.auth(s.handleStopMigration))
 	s.mux.Handle("POST /api/v1/diagnostics/connection", s.auth(s.handleConnTest))
+	s.mux.Handle("POST /api/v1/sourcecheck", s.auth(s.handleSourceCheckCreate))
+	s.mux.Handle("GET /api/v1/sourcecheck/{token}", s.auth(s.handleSourceCheckStatus))
 	s.mux.Handle("GET /api/v1/linode/plans", s.auth(s.handleLinodePlans))
 	s.mux.Handle("GET /api/v1/linode/images", s.auth(s.handleLinodeImages))
 	s.mux.Handle("GET /api/v1/settings", s.auth(s.handleGetSettings))

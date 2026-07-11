@@ -261,6 +261,43 @@ Singapore appliance gets a Singapore bucket). Override with the
 
 ---
 
+## 3.5 Check the source first (Source check tab)
+
+Before creating a migration, run the **Source check** — a **read-only
+pre-migration assessment** that tells you whether a server can migrate, **which
+of the three methods it supports**, and which **destination OS image** to pick
+for file transfer.
+
+1. Open the **Source check** tab and click **Generate check command**.
+2. Run the shown one-liner on the **source server** as root (valid for 30
+   minutes). It only **reads** system facts — OS, CPU architecture, disk
+   layout/filesystems (LVM/LUKS/RAID detection), SELinux, used storage, and a
+   **live reachability test of the replication port range** (the script
+   connects back to a temporary probe port on the appliance). It sends one
+   report and exits — **nothing is installed**, so there is nothing to remove.
+3. The tab updates itself when the report arrives: source facts as ✔/✘ checks,
+   plus a verdict per method — **Supported**, **Supported with cautions** (with
+   the exact reasons, e.g. *SELinux enforcing: file copy does not preserve
+   contexts*), or **Not supported** (e.g. *LUKS-encrypted root cannot be
+   converted — use file transfer*) — and the recommended Linode image
+   (e.g. Ubuntu 24.04 source → `linode/ubuntu24.04`).
+
+What it evaluates: x86_64 requirement (hard fail otherwise), distro/version
+recognition, systemd presence (the agent installs as a systemd timer),
+convertible root filesystem for the block methods (ext2/3/4/XFS supported; LVM
+fine; btrfs cautioned; ZFS/LUKS refused), software-RAID caution, the 10 TiB
+Block Storage per-volume limit, SELinux mode for file transfer, and data-plane
+reachability (TCP 5000–5100).
+
+**Works offline too.** The script prints the **full result in the source
+server's own terminal** before delivering it, so even when the network to the
+migration instance is not accessible you still get the complete assessment
+locally — with a prominent note that the report could not be delivered and
+which ports to open. Fix the network, re-run the same command, and the console
+receives it as well.
+
+---
+
 ## 4. Create a migration (single or multi-disk)
 
 > **Migration method.** The **New migration** form offers three methods from one
