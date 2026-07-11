@@ -196,6 +196,7 @@ cat <<EOF
 
 ================ REPLICATION SERVER READY ================
  Console:   https://$PUBLIC_HOST:$PORT
+ Guide:     https://$PUBLIC_HOST:$PORT/documentation  (step-by-step, with screenshots)
  Password:  $( [ -f "$PWFILE" ] && cat "$PWFILE" || echo "see: journalctl -u applianced" )
  Cert SHA-256 (verify this in your browser's certificate dialog):
    ${FPR:-see: journalctl -u applianced}
