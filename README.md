@@ -4,7 +4,7 @@
 Azure, other clouds — **to Akamai Cloud (Linode)**, driven entirely from a
 **web console** that you host yourself.
 
-You stand up one small Linode (the **replication server**), open its console in
+You spin up one small Linode (the **replication server**), open its console in
 a browser, and migrate any number of source servers from there: register a
 source, run one generated command on it, watch replication, then cut over with
 guided, validated steps. Data flows over **mutually-authenticated TLS**, and the
