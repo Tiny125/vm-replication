@@ -164,6 +164,27 @@ func TestConsoleBlockCutoverQuiesces(t *testing.T) {
 	}
 }
 
+// File-transfer cutover only reboots the destination that was already created
+// (and named/credentialed) at "Create destination instance" — so its cutover
+// dialog must show NONE of the instance-name / volume-name / root-password /
+// SSH-key fields (those only apply to the block methods, which create the
+// instance at cutover). Guards a stress-test regression where file showed a
+// "New volume name" field for a method that has no volume.
+func TestConsoleFileCutoverOmitsBlockFields(t *testing.T) {
+	js := extractJSFunc(t, "async function startMig(")
+	if !strings.Contains(js, "if(!file){") {
+		t.Error("cutover dialog must gate its optional fields behind !file")
+	}
+	// The vol_name field must be doubly gated (volume-boot only).
+	if !strings.Contains(js, "if(!disk)fields.push({id:'vol_name'") {
+		t.Error("vol_name field must be present for volume boot")
+	}
+	// The credential note (access) must be suppressed for file.
+	if !strings.Contains(js, "html:how+(file?'':access)+prep") {
+		t.Error("the root-password note must be suppressed for the file cutover dialog")
+	}
+}
+
 // The cutover dialog lets the operator NAME the launched instance (both boot
 // methods) and the cutover volume (volume-boot only), sent as label /
 // volume_label on the /start request; blank falls back to <name>-cutover.

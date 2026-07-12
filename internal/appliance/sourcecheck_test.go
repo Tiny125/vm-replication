@@ -151,8 +151,10 @@ func TestRecommendedImages(t *testing.T) {
 		{"rocky", "8", "linode/rocky8"},
 		{"fedora", "40", "linode/fedora40"},
 		{"centos", "7", "linode/centos7"},
-		{"rhel", "9", "linode/almalinux9"}, // closest free rebuild
-		{"weirdos", "1", ""},               // unknown → pick manually
+		{"rhel", "9", "linode/almalinux9"},      // closest free rebuild
+		{"sles", "15.5", "linode/opensuse15.6"}, // SLES → openSUSE Leap (shared codebase)
+		{"amzn", "2023", "linode/almalinux9"},   // Amazon Linux is RHEL-family
+		{"weirdos", "1", ""},                    // unknown → pick manually
 	} {
 		if got := recommendedImage(tc.id, tc.ver); got != tc.want {
 			t.Errorf("recommendedImage(%s,%s) = %q, want %q", tc.id, tc.ver, got, tc.want)

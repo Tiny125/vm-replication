@@ -349,7 +349,9 @@ func recommendedImage(osID, version string) string {
 		return "linode/centos-stream" + orDefault(major, "9")
 	case "fedora":
 		return "linode/fedora" + orDefault(major, "40")
-	case "opensuse", "opensuse-leap":
+	case "opensuse", "opensuse-leap", "sles", "sled", "suse":
+		// SUSE Linux Enterprise (common on Azure for SAP) shares its codebase with
+		// openSUSE Leap, which is the closest Linode image.
 		return "linode/opensuse15.6"
 	case "arch":
 		return "linode/arch"
