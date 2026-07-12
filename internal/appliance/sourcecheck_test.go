@@ -162,6 +162,74 @@ func TestRecommendedImages(t *testing.T) {
 	}
 }
 
+// Azure's ephemeral resource disk (temporary storage mounted at /mnt) must not
+// be block-migrated: the block methods warn about it (file transfer never
+// copies /mnt), and an oversized EPHEMERAL disk must NOT trip the 10 TiB
+// volume-size failure — it isn't part of the migration.
+func TestAssessAzureEphemeralDisk(t *testing.T) {
+	r := api.SourceCheckReport{
+		OSID: "ubuntu", OSVersion: "20.04", Arch: "x86_64", HasSystemd: true,
+		RootFS: "ext4", Virt: "microsoft",
+		Disks: []api.SourceCheckDisk{
+			{Name: "sda", SizeBytes: 30 << 30},
+			{Name: "sdb", SizeBytes: 11 << 40, Ephemeral: true}, // huge resource disk
+		},
+		DataPortOK: boolp(true),
+	}
+	a := assessSource(r)
+	for _, m := range []string{"volume", "disk"} {
+		got := methodByName(t, a, m)
+		if got.Verdict != "warn" {
+			t.Errorf("%s with ephemeral disk: verdict %q, want warn", m, got.Verdict)
+		}
+		found := false
+		for _, reason := range got.Reasons {
+			if strings.Contains(reason, "resource disk") || strings.Contains(reason, "ephemeral") {
+				found = true
+			}
+			if strings.Contains(reason, "10 TiB") {
+				t.Errorf("%s: ephemeral disk must be excluded from the volume size limit (got %q)", m, reason)
+			}
+		}
+		if !found {
+			t.Errorf("%s: expected an ephemeral-disk caution, got %v", m, got.Reasons)
+		}
+	}
+	if v := methodByName(t, a, "file").Verdict; v != "ok" {
+		t.Errorf("file with ephemeral disk: %q, want ok (file never copies /mnt)", v)
+	}
+}
+
+// Approximate image recommendations must carry an honest note: Amazon Linux
+// has no Linode image (AlmaLinux is RHEL-family but NOT drop-in); RHEL maps to
+// its binary-compatible rebuild; SLES maps to openSUSE. Exact matches carry no
+// note.
+func TestRecommendedImageNotes(t *testing.T) {
+	for _, tc := range []struct {
+		id      string
+		wantSub string // substring of the note; "" = no note
+	}{
+		{"amzn", "not a drop-in"},
+		{"rhel", "binary-compatible"},
+		{"sles", "openSUSE"},
+		{"ubuntu", ""},
+		{"debian", ""},
+	} {
+		got := recommendedImageNote(tc.id)
+		if tc.wantSub == "" && got != "" {
+			t.Errorf("recommendedImageNote(%s) = %q, want empty", tc.id, got)
+		}
+		if tc.wantSub != "" && !strings.Contains(got, tc.wantSub) {
+			t.Errorf("recommendedImageNote(%s) = %q, want substring %q", tc.id, got, tc.wantSub)
+		}
+	}
+	// The note reaches the file method's assessment.
+	a := assessSource(api.SourceCheckReport{OSID: "amzn", OSVersion: "2", Arch: "x86_64", HasSystemd: true, RootFS: "xfs", DataPortOK: boolp(true)})
+	if n := methodByName(t, a, "file").RecommendedImageNote; !strings.Contains(n, "not a drop-in") {
+		t.Errorf("file assessment note for amzn = %q", n)
+	}
+}
+
 // No systemd → the agent's timer can't be installed automatically: warn on all
 // methods (manual scheduling is possible but not turnkey).
 func TestAssessNoSystemd(t *testing.T) {

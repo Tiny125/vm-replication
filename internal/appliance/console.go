@@ -432,7 +432,7 @@ function renderSourceCheck(st){
   for(const m of (a.methods||[])){
     const v=V[m.verdict]||V.warn;
     const dest=m.method==='file'
-      ?(m.recommended_image?('<code style="display:inline;padding:1px 5px">'+esc(m.recommended_image)+'</code> (pick this OS image)')
+      ?(m.recommended_image?('<code style="display:inline;padding:1px 5px">'+esc(m.recommended_image)+'</code> (pick this OS image)'+(m.recommended_image_note?('<div class="muted" style="font-size:12px;margin-top:3px">'+esc(m.recommended_image_note)+'</div>'):''))
         :'no close image match — pick the nearest OS manually')
       :'<span class="muted">not applicable — the destination boots your migrated disk</span>';
     h+='<tr><td><b>'+esc(MNAME[m.method]||m.method)+'</b></td>'+
@@ -447,7 +447,7 @@ function renderSourceCheck(st){
     ?'<div class="resultbox ok" style="margin-top:10px"><b>✔ This server can migrate.</b> Use a supported method above — then create the migration on the Migrations tab.</div>'
     :'<div class="resultbox bad" style="margin-top:10px"><b>✘ This server cannot migrate with any method.</b> See the notes above for the blocking reasons.</div>';
   if(rep.used_bytes>0)h+='<div class="muted" style="font-size:12.5px;margin-top:8px">Used storage on the source: <b>'+fmtBytes(rep.used_bytes)+'</b> — size a file-transfer plan by this. '+
-    ((rep.disks&&rep.disks.length)?('Disks: '+rep.disks.map(d=>esc(d.name)+' ('+fmtBytes(d.size_bytes)+')').join(', ')+' — block methods replicate these whole.'):'')+'</div>';
+    ((rep.disks&&rep.disks.length)?('Disks: '+rep.disks.map(d=>esc(d.name)+' ('+fmtBytes(d.size_bytes)+(d.ephemeral?' — ephemeral, exclude':'')+')').join(', ')+' — block methods replicate these whole (never the ephemeral ones).'):'')+'</div>';
   $('srcOut').innerHTML=h;
   $('srcOut').classList.remove('hide');
 }

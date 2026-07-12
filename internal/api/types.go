@@ -425,6 +425,10 @@ type SourceCheckReport struct {
 type SourceCheckDisk struct {
 	Name      string `json:"name"` // sda, vda, nvme0n1
 	SizeBytes int64  `json:"size_bytes"`
+	// Ephemeral marks a cloud scratch disk whose contents the provider discards
+	// (Azure's temporary "resource disk", mounted at /mnt or /mnt/resource) — it
+	// must NOT be part of a block migration and is excluded from size checks.
+	Ephemeral bool `json:"ephemeral,omitempty"`
 }
 
 // MethodAssessment is the verdict for one migration method.
@@ -435,6 +439,9 @@ type MethodAssessment struct {
 	// RecommendedImage is the Linode OS image to pick as the destination (file
 	// method only; the block methods boot the source's own migrated disk).
 	RecommendedImage string `json:"recommended_image,omitempty"`
+	// RecommendedImageNote qualifies an APPROXIMATE recommendation (e.g. Amazon
+	// Linux → AlmaLinux is RHEL-family but not a drop-in replacement).
+	RecommendedImageNote string `json:"recommended_image_note,omitempty"`
 }
 
 // SourceAssessment is the appliance's evaluation of a SourceCheckReport.
