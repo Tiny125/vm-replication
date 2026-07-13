@@ -291,6 +291,16 @@ func assessSource(r api.SourceCheckReport) api.SourceAssessment {
 		}
 	}
 	for _, d := range r.Disks {
+		if d.Ephemeral {
+			// A cloud scratch disk (Azure's temporary "resource disk"): its contents
+			// are discarded by the provider, so it must NOT be part of a block
+			// migration — and it doesn't count against any size limit. File transfer
+			// is unaffected (it never copies /mnt).
+			for _, v := range blockPair {
+				worsen(v, "warn", fmt.Sprintf("disk %s looks like the cloud's ephemeral/resource disk (temporary storage mounted at /mnt) — do NOT add it to a block migration; its contents are provider-discarded scratch space", d.Name))
+			}
+			continue
+		}
 		if d.SizeBytes > maxVolumeBytes {
 			worsen(vol, "fail", fmt.Sprintf("disk %s is %s — larger than Linode Block Storage's 10 TiB volume limit", d.Name, humanGB(d.SizeBytes)))
 			worsen(dsk, "warn", fmt.Sprintf("disk %s is %s — a plan with that much local disk is required", d.Name, humanGB(d.SizeBytes)))
@@ -298,11 +308,27 @@ func assessSource(r api.SourceCheckReport) api.SourceAssessment {
 	}
 
 	a.Methods = []api.MethodAssessment{
-		{Method: "file", Verdict: file.verdict, Reasons: file.reasons, RecommendedImage: recommendedImage(r.OSID, r.OSVersion)},
+		{Method: "file", Verdict: file.verdict, Reasons: file.reasons,
+			RecommendedImage: recommendedImage(r.OSID, r.OSVersion), RecommendedImageNote: recommendedImageNote(r.OSID)},
 		{Method: "volume", Verdict: vol.verdict, Reasons: vol.reasons},
 		{Method: "disk", Verdict: dsk.verdict, Reasons: dsk.reasons},
 	}
 	return a
+}
+
+// recommendedImageNote qualifies APPROXIMATE image recommendations so the
+// operator knows when the mapped image is not the same OS as the source.
+func recommendedImageNote(osID string) string {
+	switch strings.ToLower(strings.TrimSpace(osID)) {
+	case "amzn":
+		return "Amazon Linux has no Linode image; AlmaLinux is RHEL-family but not a drop-in replacement — validate your application stack on it, or use a block method to keep the exact OS"
+	case "rhel", "redhat":
+		return "Linode has no RHEL images; AlmaLinux is the binary-compatible rebuild of the same major version"
+	case "sles", "sled", "suse":
+		return "SUSE Linux Enterprise has no Linode image; openSUSE Leap shares its codebase but is not identical — validate, or use a block method to keep the exact OS"
+	default:
+		return ""
+	}
 }
 
 // recommendedImage maps a source distro/version to the closest Linode image
@@ -349,7 +375,9 @@ func recommendedImage(osID, version string) string {
 		return "linode/centos-stream" + orDefault(major, "9")
 	case "fedora":
 		return "linode/fedora" + orDefault(major, "40")
-	case "opensuse", "opensuse-leap":
+	case "opensuse", "opensuse-leap", "sles", "sled", "suse":
+		// SUSE Linux Enterprise (common on Azure for SAP) shares its codebase with
+		// openSUSE Leap, which is the closest Linode image.
 		return "linode/opensuse15.6"
 	case "arch":
 		return "linode/arch"
@@ -406,15 +434,23 @@ if [ -n "$ROOTSRC" ] && [ -e "$ROOTSRC" ]; then
   echo "$CHAIN" | grep -q raid  && RAID=true
 fi
 
-# Real data disks (skip nbd/loop/ram/zram/sr/fd and zero-size).
-DISKS_JSON=""
+# Real data disks (skip nbd/loop/ram/zram/sr/fd and zero-size). On Azure
+# (virt=microsoft) the temporary "resource disk" is mounted at /mnt or
+# /mnt/resource — mark it ephemeral: its contents are provider-discarded
+# scratch space and must NOT be block-migrated (nor count against size limits).
+DISKS_JSON=""; EPHDISKS=""
 while read -r name size type; do
   [ "$type" = "disk" ] || continue
   [ "${size:-0}" -gt 0 ] || continue
   case "$name" in nbd*|loop*|ram*|zram*|sr*|fd*) continue;; esac
+  EPH=false
+  if [ "$VIRT" = "microsoft" ]; then
+    MPS=" $(lsblk -n -o MOUNTPOINT "/dev/$name" 2>/dev/null | tr '\n' ' ') "
+    case "$MPS" in *" /mnt "*|*" /mnt/resource "*) EPH=true; EPHDISKS="$EPHDISKS $name";; esac
+  fi
   [ -n "$DISKS_JSON" ] && DISKS_JSON="$DISKS_JSON,"
-  DISKS_JSON="$DISKS_JSON{\"name\":\"$(js "$name")\",\"size_bytes\":$size}"
-  [ "$size" -gt "${MAXDISK:-0}" ] && MAXDISK=$size
+  DISKS_JSON="$DISKS_JSON{\"name\":\"$(js "$name")\",\"size_bytes\":$size,\"ephemeral\":$EPH}"
+  [ "$EPH" = "false" ] && [ "$size" -gt "${MAXDISK:-0}" ] && MAXDISK=$size
 done < <(lsblk -b -d -n -o NAME,SIZE,TYPE 2>/dev/null)
 MAXDISK="${MAXDISK:-0}"
 
@@ -500,6 +536,10 @@ if [ "${MAXDISK:-0}" -gt 10995116277760 ] 2>/dev/null; then
   worsen VOL fail "a disk exceeds Linode Block Storage's 10 TiB volume limit"
   worsen DSK warn "a disk exceeds 10 TiB - a plan with that much local disk is required"
 fi
+if [ -n "$EPHDISKS" ]; then
+  worsen VOL warn "disk(s)$EPHDISKS = the cloud's ephemeral/resource disk (temporary storage at /mnt) - do NOT add to a block migration"
+  worsen DSK warn "disk(s)$EPHDISKS = the cloud's ephemeral/resource disk (temporary storage at /mnt) - do NOT add to a block migration"
+fi
 # Recommended destination image for file transfer (closest Linode image).
 REC=""; MAJ="${VERSION_ID%%%%.*}"
 case "${ID:-}" in
@@ -532,6 +572,11 @@ esac
 echo
 echo " File transfer : $(label $FILE_V)"
 [ -n "$REC" ] && echo "     recommended destination OS image: $REC" || echo "     recommended destination OS image: no close match - pick manually"
+case "${ID:-}" in
+  amzn) echo "     note: Amazon Linux has no Linode image - AlmaLinux is RHEL-family but not a drop-in; validate your stack, or use a block method to keep the exact OS";;
+  rhel|redhat) echo "     note: AlmaLinux is the binary-compatible rebuild of RHEL (same major version)";;
+  sles|sled|suse) echo "     note: openSUSE Leap shares the SUSE codebase but is not identical - validate, or use a block method";;
+esac
 [ -n "$FILE_N" ] && printf '%%b' "$FILE_N"
 echo " Volume boot   : $(label $VOL_V)   (destination boots your migrated disk)"
 [ -n "$VOL_N" ] && printf '%%b' "$VOL_N"

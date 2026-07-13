@@ -432,7 +432,7 @@ function renderSourceCheck(st){
   for(const m of (a.methods||[])){
     const v=V[m.verdict]||V.warn;
     const dest=m.method==='file'
-      ?(m.recommended_image?('<code style="display:inline;padding:1px 5px">'+esc(m.recommended_image)+'</code> (pick this OS image)')
+      ?(m.recommended_image?('<code style="display:inline;padding:1px 5px">'+esc(m.recommended_image)+'</code> (pick this OS image)'+(m.recommended_image_note?('<div class="muted" style="font-size:12px;margin-top:3px">'+esc(m.recommended_image_note)+'</div>'):''))
         :'no close image match — pick the nearest OS manually')
       :'<span class="muted">not applicable — the destination boots your migrated disk</span>';
     h+='<tr><td><b>'+esc(MNAME[m.method]||m.method)+'</b></td>'+
@@ -447,7 +447,7 @@ function renderSourceCheck(st){
     ?'<div class="resultbox ok" style="margin-top:10px"><b>✔ This server can migrate.</b> Use a supported method above — then create the migration on the Migrations tab.</div>'
     :'<div class="resultbox bad" style="margin-top:10px"><b>✘ This server cannot migrate with any method.</b> See the notes above for the blocking reasons.</div>';
   if(rep.used_bytes>0)h+='<div class="muted" style="font-size:12.5px;margin-top:8px">Used storage on the source: <b>'+fmtBytes(rep.used_bytes)+'</b> — size a file-transfer plan by this. '+
-    ((rep.disks&&rep.disks.length)?('Disks: '+rep.disks.map(d=>esc(d.name)+' ('+fmtBytes(d.size_bytes)+')').join(', ')+' — block methods replicate these whole.'):'')+'</div>';
+    ((rep.disks&&rep.disks.length)?('Disks: '+rep.disks.map(d=>esc(d.name)+' ('+fmtBytes(d.size_bytes)+(d.ephemeral?' — ephemeral, exclude':'')+')').join(', ')+' — block methods replicate these whole (never the ephemeral ones).'):'')+'</div>';
   $('srcOut').innerHTML=h;
   $('srcOut').classList.remove('hide');
 }
@@ -700,19 +700,25 @@ async function startMig(id,btn){
     '<div style="margin-top:4px"><b>Step 2:</b> '+(file?'power off the source server.':'once step 1 reports the image is validated, power off the source server.')+'</div>'+
     '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(file?('reboots the destination Linode'+planNote+' (already launched at Start, with your files copied straight into it) so it boots into your migrated system — the migration is then complete. No Lish paste needed.'):disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the validated image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('clones the validated image and launches a new Linode'+planNote+'.'):'clones every disk into launchable volumes.'))+'</div></div>';
   const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the '+(file?'copied files are current.':'final pass is current. The final pass remounts the source root <b>read-only</b> for a clean, fsck-passing image — if writers are still holding the root open, the cutover fails fast and asks you to stop them (or tick the box below if the source is already powered off).')+'</div>';
-  // Optional names for what the cutover creates: the instance (both methods)
-  // and, for volume boot, the cutover volume. Blank keeps <name>-cutover.
+  // Optional names/credentials the cutover applies. These ONLY apply to the
+  // block methods, which CREATE the instance (and, for volume boot, the cutover
+  // volume) at this step. File transfer created its destination earlier ("Create
+  // destination instance", where its name + root password were already set) and
+  // cutover merely reboots it — so file shows none of these fields.
   const defName=esc((meta.name||'')+'-cutover');
-  const fields=[{id:'inst_name',label:'New instance name (optional)',type:'text',placeholder:'default: '+defName}];
-  if(!disk)fields.push({id:'vol_name',label:'New volume name (optional)',type:'text',placeholder:'default: '+defName});
-  fields.push(
-    {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
-    {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
-  );
+  const fields=[];
+  if(!file){
+    fields.push({id:'inst_name',label:'New instance name (optional)',type:'text',placeholder:'default: '+defName});
+    if(!disk)fields.push({id:'vol_name',label:'New volume name (optional)',type:'text',placeholder:'default: '+defName});
+    fields.push(
+      {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
+      {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
+    );
+  }
   const opts={
     title:'Cut over migration #'+id+' — step 1 of 3: stop replication'+(file?'':' & take a consistent pass'),
     okText:'Stop replication & continue',
-    html:how+access+prep,
+    html:how+(file?'':access)+prep,
     fields:fields
   };
   // Block methods: default to the read-only quiesce, with an opt-out for an

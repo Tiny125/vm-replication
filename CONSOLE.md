@@ -286,8 +286,13 @@ What it evaluates: x86_64 requirement (hard fail otherwise), distro/version
 recognition, systemd presence (the agent installs as a systemd timer),
 convertible root filesystem for the block methods (ext2/3/4/XFS supported; LVM
 fine; btrfs cautioned; ZFS/LUKS refused), software-RAID caution, the 10 TiB
-Block Storage per-volume limit, SELinux mode for file transfer, and data-plane
-reachability (TCP 5000–5100).
+Block Storage per-volume limit, SELinux mode for file transfer, **cloud
+ephemeral disks** (Azure's temporary resource disk at `/mnt` is flagged
+"do not block-migrate" and excluded from size checks), and data-plane
+reachability (TCP 5000–5100). Approximate image recommendations carry an
+honest note — e.g. Amazon Linux → AlmaLinux is RHEL-family but **not a
+drop-in**; RHEL → AlmaLinux is the binary-compatible rebuild; SLES → openSUSE
+Leap shares the codebase.
 
 **Works offline too.** The script prints the **full result in the source
 server's own terminal** before delivering it, so even when the network to the
