@@ -511,7 +511,7 @@ async function removeToken(btn){
     html:'<div class="warn">Provisioning, cloning and launching will <b>stop working</b> until you add a valid token again.</div>'+
       '<div class="muted" style="margin-top:8px;font-size:13px">Only allowed when <b>no migration is active</b> (created or running) — a <b>completed</b> migration doesn’t block it. Otherwise removal is refused, because deleting an active migration needs the token to remove its Linode volumes (removing it first would orphan them). This does not delete anything in your Linode account.</div>',
     okText:'Remove token',okDanger:true}))return;
-  busy(btn,true);try{await api('DELETE','/api/v1/settings/linode-token');toast('Linode token removed','ok');loadSettings()}catch(e){alertModal({title:'Error',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
+  busy(btn,true);try{await api('DELETE','/api/v1/settings/linode-token');toast('Linode token removed','ok');await loadSettings()}catch(e){alertModal({title:'Error',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
 async function reprovisionAuditBucket(btn){
   busy(btn,true);
   try{
@@ -531,7 +531,7 @@ async function deleteAuditBucket(btn){
   if(!r)return;
   if(!r.pw){alertModal({title:'Password required',html:'Enter your console password to delete the bucket.',danger:true});return}
   busy(btn,true);
-  try{const d=await api('DELETE','/api/v1/settings/audit-bucket',{password:r.pw});toast(d&&d.already_gone?'The audit bucket was already removed — cleared it here too':'Audit bucket and its logs deleted','ok');loadSettings();}
+  try{const d=await api('DELETE','/api/v1/settings/audit-bucket',{password:r.pw});toast(d&&d.already_gone?'The audit bucket was already removed — cleared it here too':'Audit bucket and its logs deleted','ok');await loadSettings();}
   catch(e){alertModal({title:'Could not delete audit bucket',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
 
 let diskSeq=0;

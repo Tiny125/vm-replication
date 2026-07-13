@@ -261,6 +261,47 @@ func TestConsoleSourceHelperSkipsPseudoDisks(t *testing.T) {
 	}
 }
 
+// The destructive Settings buttons — "Delete audit bucket" and "Remove token"
+// — must give clear live feedback: a spinner on the button for the WHOLE
+// operation (the delete request AND the settings reload that follows), then a
+// top-right toast confirming the removal. The spinner must not drop before the
+// card re-renders, so each handler awaits loadSettings() inside the try before
+// the finally clears busy(). The supporting CSS/DOM (the .busy spinner and the
+// #toasts top-right container) must be present for that feedback to show.
+func TestConsoleDeleteButtonsSpinAndToast(t *testing.T) {
+	// Shared infrastructure: the spinner animation and the top-right toast host.
+	for _, want := range []string{
+		"button.busy::after", // the spinning-circle pseudo-element
+		"@keyframes spin",    // its rotation
+		`id="toasts"`,        // the top-right toast container...
+		".toast-wrap{position:fixed;top:18px;right:18px", // ...pinned top-right
+	} {
+		if !strings.Contains(consoleHTML, want) {
+			t.Errorf("console is missing spinner/toast infrastructure %q", want)
+		}
+	}
+	for _, fn := range []string{"async function deleteAuditBucket(", "async function removeToken("} {
+		body := extractJSFunc(t, fn)
+		checks := map[string]string{
+			"busy(btn,true)":      "must start the button spinner before the delete request",
+			"await api('DELETE'":  "must await the DELETE call (spinner shows for the whole delete period)",
+			"await loadSettings(": "must await the settings reload so the spinner persists until the card re-renders",
+			",'ok')":              "must raise a success toast (top-right notification) once removed",
+			"busy(btn,false)":     "must clear the spinner in finally",
+		}
+		for needle, why := range checks {
+			if !strings.Contains(body, needle) {
+				t.Errorf("%s %s (missing %q)", fn, why, needle)
+			}
+		}
+		// The toast must fire before the reload so the notification appears the
+		// instant the delete succeeds, not after the extra GET round-trip.
+		if ti, li := strings.Index(body, "toast("), strings.Index(body, "loadSettings("); ti < 0 || li < 0 || ti > li {
+			t.Errorf("%s must toast() before loadSettings()", fn)
+		}
+	}
+}
+
 // extractJSFunc returns the source of the embedded-JS function that begins with
 // header, up to the next top-level (column-0) "function"/"async function"
 // declaration — enough to assert what a given function contains.
