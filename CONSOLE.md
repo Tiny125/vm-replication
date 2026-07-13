@@ -313,7 +313,9 @@ receives it as well.
 > and, after creating the migration, use the card's **Create destination instance**
 > step (name it + set a root password) — **Start replication** unlocks only once
 > that destination's file receiver is confirmed ready (with a manual-install
-> fallback if cloud-init can't reach it). See
+> fallback if cloud-init can't reach it; the console **keeps watching
+> indefinitely** and unlocks Start whenever the receiver answers — even from a
+> manual Lish install done much later). See
 > [`docs/FILE-MIGRATION.md`](docs/FILE-MIGRATION.md) for the full file-transfer flow.
 
 For the **block** methods: click **New migration**, enter a **Name** and
@@ -472,19 +474,23 @@ local-disk boot):
    (names are sanitized to Linode's label rules; instances ≤64 chars, volumes
    ≤32, multi-disk volumes get a `-N` suffix). You can also set a **root
    password / SSH key** (so you can log into the launched instance via the
-   Lish console). Then click **Stop replication & continue**. The appliance stops new replication passes, takes
-   **one consistent final pass** with the source root briefly **remounted
+   Lish console). Then click **Stop replication & continue**. The appliance stops new replication passes, **tries
+   one consistent final pass** with the source root briefly **remounted
    read-only** (so the image is a clean point-in-time, not a live "smear" that
    fails `fsck` and boots to `grub>`), and then **converts the boot image and
-   validates it is bootable** — *all while the source is still running*. So if
-   anything is wrong (wrong disk, inconsistent/incomplete copy, a remount the
-   root won't allow because apps are still writing), the cutover **fails fast
-   BEFORE you power anything off** and tells you how to fix it — you lose no
-   uptime. If the source is **already powered off or idle**, tick **"skip the
-   read-only snapshot"** in the dialog. **Delta passes are applied atomically**:
-   an interrupted pass is **discarded whole**, so the image is always the **last
-   complete pass**. Once the image is validated the migration pauses in state
-   `awaiting_cutover`.
+   validates it is bootable** — *all while the source is still running*. A
+   running root usually has writers holding `/` open (systemd, journald, …), so
+   if the read-only remount is refused the cutover **automatically falls back**
+   to the current crash-consistent replicated data (with a clear warning) — it
+   is `fsck`-repaired during conversion and still validated before you power
+   off, so the cutover never dead-ends on a busy root. If anything is genuinely
+   wrong (wrong disk, incomplete copy, an image that fails validation), the
+   cutover **fails fast BEFORE you power anything off** and tells you how to fix
+   it — you lose no uptime. If the source is **already powered off or idle**,
+   tick **"skip the read-only snapshot"** in the dialog to skip the attempt.
+   **Delta passes are applied atomically**: an interrupted pass is **discarded
+   whole**, so the image is always the **last complete pass**. Once the image is
+   validated the migration pauses in state `awaiting_cutover`.
 
    The card guides the timing: while step 1 runs it shows **"Preparing &
    validating the boot image — keep the source server running"** (don't power

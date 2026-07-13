@@ -159,11 +159,15 @@ When you're ready and lag is small:
    > 1. Stop the source's databases/heavy writers and let the **RPO lag drop to
    >    ~0** (the card shows it), so the frozen copy is current.
    > 2. Click **Cutover instance**, optionally set a root password / SSH key, then
-   >    **Stop replication & continue**. This stops replication and freezes the
-   >    current replicated copy as the image — **crash-consistent** (like a
-   >    power-loss), repaired with `fsck` on convert. The migration pauses in state
-   >    `awaiting_cutover`. (No read-only remount is attempted, so it never gets
-   >    stuck on a busy root.)
+   >    **Stop replication & continue**. This stops replication and takes the final
+   >    image: it first **tries one read-only final pass** (a perfectly clean
+   >    point-in-time); if the running root refuses the remount — the normal case,
+   >    since systemd/journald always hold `/` open — it **automatically falls back**
+   >    to freezing the current replicated copy, which is **crash-consistent** (like
+   >    a power-loss) and repaired with `fsck` on convert. Either way the boot image
+   >    is **validated before you power off**, and the migration pauses in state
+   >    `awaiting_cutover` — a busy root never dead-ends the cutover. (Tick **"skip
+   >    the read-only snapshot"** to skip the attempt for an already-off/idle source.)
    > 3. **Power off the source server**, then click **Launch instance** to convert,
    >    clone and launch. Confirm the source is off — both machines must not run at
    >    once.

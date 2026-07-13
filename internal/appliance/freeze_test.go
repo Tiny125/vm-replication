@@ -86,6 +86,36 @@ func TestCutoverFreezingFlag(t *testing.T) {
 	}
 }
 
+// isNonAgentHandshake classifies receiver-port noise from clients that are NOT
+// the agent — internet scanners and health checks hitting a public port. That
+// includes a bare TCP connect-then-close, which surfaces as "read hello: EOF"
+// at the hello stage: it must NOT put a red "replication attempt failed" on a
+// healthy migration's card. A mid-stream EOF (the agent died during a pass) is
+// a real failure and must still be reported.
+func TestIsNonAgentHandshake(t *testing.T) {
+	for _, err := range []error{
+		errors.New("read hello: EOF"),
+		errors.New("read hello: unexpected EOF"),
+		errors.New("read hello: tls: client didn't provide a certificate"),
+		errors.New("read hello: tls: first record does not look like a TLS handshake"),
+		errors.New("read hello: tls: bad certificate"),
+	} {
+		if !isNonAgentHandshake(err) {
+			t.Errorf("%v should classify as non-agent connection noise", err)
+		}
+	}
+	for _, err := range []error{
+		errors.New("read frame: EOF"), // the agent died mid-pass — a real failure
+		errors.New("stream closed before done"),
+		errors.New("block at 12345 out of device bounds"),
+		nil,
+	} {
+		if isNonAgentHandshake(err) {
+			t.Errorf("%v should NOT classify as handshake noise", err)
+		}
+	}
+}
+
 // isSourceDisconnect classifies the receiver error produced when the SOURCE
 // vanishes mid-pass (powered off / rebooted): during cutover that is an
 // expected consequence of "power off the source" and must be logged softly,

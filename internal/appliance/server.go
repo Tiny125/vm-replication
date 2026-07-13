@@ -97,7 +97,10 @@ type Server struct {
 	// Token-gated bootstrap for the destination's receiver install (token ->
 	// *destBootstrap); see file_direct.go.
 	destBootstraps sync.Map
-	ctx            context.Context
+	// destProbe is the destination-receiver readiness check (file transfer; see
+	// watchFileDest/tlsProbeDest); tests inject it to avoid real network I/O.
+	destProbe func(addr string) bool
+	ctx       context.Context
 
 	auditCh chan auditEntry // buffered audit entries -> DB (best-effort)
 }

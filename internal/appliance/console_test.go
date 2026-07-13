@@ -162,6 +162,15 @@ func TestConsoleBlockCutoverQuiesces(t *testing.T) {
 	if !strings.Contains(js, "read-only") {
 		t.Error("cutover dialog should describe the read-only quiesce for block methods")
 	}
+	// A busy root must not dead-end the cutover: the dialog promises the
+	// automatic fallback to the crash-consistent data (fsck-repaired, validated
+	// before power-off) instead of the old fail-fast-and-retry loop.
+	if !strings.Contains(js, "automatically falls back") {
+		t.Error("cutover dialog must say a busy root automatically falls back to the crash-consistent data")
+	}
+	if strings.Contains(js, "the cutover fails fast and asks you to stop them") {
+		t.Error("the old fail-fast wording must be gone — the cutover no longer aborts on a busy root")
+	}
 }
 
 // File-transfer cutover only reboots the destination that was already created
