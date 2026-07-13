@@ -169,26 +169,118 @@ func (s *Server) launchFileDestination(m api.Migration, label, rootPass string) 
 	}
 	s.fileDests.Store(m.ID, &fileDest{instanceID: inst.ID, ip: ip, label: label, token: tok})
 
-	// Poll the receiver port: cloud-init needs a few minutes to install + start it.
+	// Watch the receiver port until it answers. The watch NEVER gives up while
+	// the migration still tracks this destination: after the fast window it warns
+	// once (the automatic cloud-init install has probably stalled — the card shows
+	// the manual install command) and keeps checking, so a receiver brought up
+	// LATE by the manual paste still unlocks Start replication.
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", destFilePort))
-	deadline := time.Now().Add(15 * time.Minute)
-	for time.Now().Before(deadline) {
-		if ctx.Err() != nil {
+	s.watchFileDest(m.ID, inst.ID, addr, 15*time.Minute, 10*time.Second, 30*time.Second)
+}
+
+// watchFileDest polls addr until the destination's receiver answers, marking
+// the tracked fileDest ready (and telling the operator). It polls every
+// fastEvery during fastWindow, then warns once and continues every slowEvery
+// indefinitely. It exits when the receiver is ready, the server shuts down, or
+// the migration stops tracking this instance (deleted / relaunched).
+func (s *Server) watchFileDest(migID, instID int64, addr string, fastWindow, fastEvery, slowEvery time.Duration) {
+	ctx := s.ctx
+	fastUntil := time.Now().Add(fastWindow)
+	warned := fastWindow <= 0 // a resumed watch (no fast window) needs no stall warning
+	for {
+		if ctx != nil && ctx.Err() != nil {
 			return
+		}
+		v, ok := s.fileDests.Load(migID)
+		if !ok {
+			return // migration deleted/closed
+		}
+		d := v.(*fileDest)
+		if d.instanceID != instID {
+			return // destination was relaunched; a newer watch owns it
 		}
 		c, err := net.DialTimeout("tcp", addr, 5*time.Second)
 		if err == nil {
 			_ = c.Close()
-			s.fileDests.Store(m.ID, &fileDest{instanceID: inst.ID, ip: ip, label: label, token: tok, ready: true})
-			_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("destination %s is ready to receive — you can now Start replication", addr))
+			s.fileDests.Store(migID, &fileDest{instanceID: instID, ip: d.ip, label: d.label, token: d.token, ready: true})
+			_ = s.st.AddEvent(ctx, migID, "info", fmt.Sprintf("destination %s is ready to receive — you can now Start replication", addr))
 			return
 		}
-		time.Sleep(10 * time.Second)
+		wait := fastEvery
+		if time.Now().After(fastUntil) {
+			if !warned {
+				warned = true
+				_ = s.st.AddEvent(ctx, migID, "warn", fmt.Sprintf("the destination's file receiver has not come up on %s automatically (the image/region may lack cloud-init/Metadata). Run the manual install command shown on the card in the instance's Lish console — the console keeps watching and unlocks Start replication as soon as the receiver answers.", addr))
+			}
+			wait = slowEvery
+		}
+		time.Sleep(wait)
 	}
-	// Keep the record (not failed) with its token so the console can show the
-	// manual-install command; the receiver may still come up, and the operator can
-	// run the paste command to bring it up now.
-	_ = s.st.AddEvent(ctx, m.ID, "warn", fmt.Sprintf("the destination's file receiver has not come up on %s automatically (the image/region may lack cloud-init/Metadata). Run the manual install command shown on the card in the instance's Lish console.", addr))
+}
+
+// fileDestsToResume selects the active file migrations whose destination was
+// already launched (persisted LaunchedID) — after an appliance restart their
+// in-memory tracking is gone and the watch must be rebuilt for each.
+func fileDestsToResume(migs []api.Migration) []api.Migration {
+	var out []api.Migration
+	for _, m := range migs {
+		if !isFileMethod(m.BootTarget) || m.LaunchedID == 0 {
+			continue
+		}
+		switch m.State {
+		case api.MigCreated, api.MigAwaitingAgent, api.MigReplicating, api.MigReady:
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// resumeFileDestWatches rebuilds destination tracking after an appliance
+// restart: for each active file migration with a launched destination it mints
+// a fresh bootstrap token (so the manual install command works again),
+// re-discovers the instance's IP, and restarts the readiness watch.
+func (s *Server) resumeFileDestWatches() {
+	if !s.fileAutomation() {
+		return
+	}
+	migs, err := s.st.ListMigrations(s.ctx)
+	if err != nil {
+		return
+	}
+	for _, m := range fileDestsToResume(migs) {
+		if _, loaded := s.fileDests.LoadOrStore(m.ID, &fileDest{instanceID: m.LaunchedID, token: s.registerDestBootstrap(m.ID, 6*time.Hour)}); loaded {
+			continue // already tracked
+		}
+		_ = s.st.AddEvent(s.ctx, m.ID, "info", "appliance restarted — resuming the destination readiness watch")
+		go func(m api.Migration) {
+			cl, ok := s.linodeClient(s.ctx)
+			if !ok {
+				return
+			}
+			ip := ""
+			for i := 0; i < 20 && ip == ""; i++ {
+				if got, err := cl.GetInstance(s.ctx, m.LaunchedID); err == nil {
+					for _, a := range got.IPv4 {
+						if a != "" && !isPrivateIP(a) {
+							ip = a
+							break
+						}
+					}
+				}
+				if ip == "" {
+					time.Sleep(5 * time.Second)
+				}
+			}
+			if ip == "" {
+				return
+			}
+			if v, ok := s.fileDests.Load(m.ID); ok {
+				d := v.(*fileDest)
+				s.fileDests.Store(m.ID, &fileDest{instanceID: d.instanceID, ip: ip, label: d.label, token: d.token})
+			}
+			s.watchFileDest(m.ID, m.LaunchedID, net.JoinHostPort(ip, fmt.Sprintf("%d", destFilePort)), 0, 30*time.Second, 30*time.Second)
+		}(m)
+	}
 }
 
 // destStatusFor computes the console-facing destination status for a migration.
@@ -271,7 +363,9 @@ func (s *Server) destCloudInit(token string) string {
 # vm-replication destination bootstrap: install + run the file receiver so the
 # source agent can copy straight into this instance.
 set -e
-exec >>/var/log/vmrepl-dest.log 2>&1
+# Show progress in the terminal AND keep the log — an operator pasting this in
+# Lish must see what happens (it used to swallow all output into the log only).
+exec > >(tee -a /var/log/vmrepl-dest.log) 2>&1
 echo "vmrepl-dest: bootstrap starting $(date)"
 BIN=/usr/local/bin/vmrepl-receiver
 ETC=/etc/vmrepl
@@ -296,6 +390,7 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now vmrepl-receiver.service
 echo "vmrepl-dest: receiver started on :%d"
+echo "vmrepl-dest: done — the migration console will detect the receiver within ~30 seconds and unlock Start replication."
 `, pin, base, token, pin, base, token, destFilePort, destFilePort)
 	return script
 }

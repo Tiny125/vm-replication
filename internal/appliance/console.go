@@ -757,7 +757,7 @@ function destPanel(v,m){
   const amber='border-color:#f2ddba;background:#fdf6ea;color:#7a4d05';
   const idl=v.dest_linode_id||m.launched_linode_id;
   const lish=idl?(' — <a href="https://cloud.linode.com/linodes/'+idl+'/lish/weblish" target="_blank" rel="noopener">open Lish</a>'):'';
-  const manual=v.dest_manual_cmd?('<div style="margin-top:8px;font-size:12px"><b>Taking too long?</b> Open the instance’s Lish console (log in as root)'+lish+' and paste this to install the receiver now:</div>'+
+  const manual=v.dest_manual_cmd?('<div style="margin-top:8px;font-size:12px"><b>Once the destination is up:</b> open the instance’s Lish console (log in as root with the password you set)'+lish+' and paste this to install the receiver right away — no need to wait for the automatic install:</div>'+
     '<div style="display:flex;gap:8px;align-items:flex-start;margin-top:6px"><pre id="dinstall'+m.id+'" style="flex:1;margin:0">'+esc(v.dest_manual_cmd)+'</pre>'+
     '<button onclick="copyText(document.getElementById(\'dinstall'+m.id+'\').textContent,this)">Copy</button></div>'):'';
   if(st==='none')

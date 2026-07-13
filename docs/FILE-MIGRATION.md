@@ -163,10 +163,12 @@ Earlier a single racy log file failed the whole pass with `content hash mismatch
 - The destination image ideally supports **cloud-init + the Linode Metadata
   service** (Ubuntu/Debian/RHEL-family cloud images do) so the receiver
   auto-installs. If it doesn't, the migration **no longer hangs**: Start stays
-  disabled and the card shows a **manual install command** to paste in the
-  destination's Lish console (you log in with the root password you set when
-  creating the destination). Either way, Start unlocks only once the receiver is
-  actually reachable.
+  disabled and the card shows a **manual install command** — once the
+  destination is up, log into its Lish console (with the root password you set
+  when creating the destination) and paste it; the script prints its progress
+  in the terminal. The appliance **keeps watching the receiver port
+  indefinitely** (and rebuilds the watch after an appliance restart), so a
+  receiver brought up late still unlocks Start replication within ~30 seconds.
 - The **source must reach the destination's public IP** on TCP 5999.
 - A leftover `vmrepl-receiver` systemd service remains on the migrated instance
   (harmless — it just listens); the completion note tells you to

@@ -553,4 +553,8 @@ func (s *Server) StartActiveReceivers() {
 			}
 		}
 	}
+	// File transfer: destination tracking is in-memory, so rebuild the readiness
+	// watches for already-launched destinations (otherwise a restart would leave
+	// Start replication locked forever even with the receiver up).
+	s.resumeFileDestWatches()
 }
