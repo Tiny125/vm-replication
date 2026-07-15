@@ -162,6 +162,15 @@ func TestConsoleBlockCutoverQuiesces(t *testing.T) {
 	if !strings.Contains(js, "read-only") {
 		t.Error("cutover dialog should describe the read-only quiesce for block methods")
 	}
+	// A busy root must not dead-end the cutover: the dialog promises the
+	// automatic fallback to the crash-consistent data (fsck-repaired, validated
+	// before power-off) instead of the old fail-fast-and-retry loop.
+	if !strings.Contains(js, "automatically falls back") {
+		t.Error("cutover dialog must say a busy root automatically falls back to the crash-consistent data")
+	}
+	if strings.Contains(js, "the cutover fails fast and asks you to stop them") {
+		t.Error("the old fail-fast wording must be gone — the cutover no longer aborts on a busy root")
+	}
 }
 
 // File-transfer cutover only reboots the destination that was already created
@@ -257,6 +266,65 @@ func TestConsoleSourceHelperSkipsPseudoDisks(t *testing.T) {
 	for _, pseudo := range []string{"nbd", "loop", "ram", "zram", "sr", "fd"} {
 		if !strings.Contains(cmd, pseudo) {
 			t.Errorf("helper must exclude pseudo device %q from the disk list", pseudo)
+		}
+	}
+}
+
+// The destructive Settings buttons — "Delete audit bucket" and "Remove token"
+// — must give clear live feedback: a spinner on the button for the WHOLE
+// operation (the delete request AND the settings reload that follows), then a
+// top-right toast confirming the removal. The spinner must not drop before the
+// card re-renders, so each handler awaits loadSettings() inside the try before
+// the finally clears busy(). The supporting CSS/DOM (the .busy spinner and the
+// #toasts top-right container) must be present for that feedback to show.
+func TestConsoleDeleteButtonsSpinAndToast(t *testing.T) {
+	// Shared infrastructure: the spinner animation and the top-right toast host.
+	for _, want := range []string{
+		"button.busy::after", // the spinning-circle pseudo-element
+		"@keyframes spin",    // its rotation
+		`id="toasts"`,        // the top-right toast container...
+		".toast-wrap{position:fixed;top:18px;right:18px", // ...pinned top-right
+	} {
+		if !strings.Contains(consoleHTML, want) {
+			t.Errorf("console is missing spinner/toast infrastructure %q", want)
+		}
+	}
+	// The Refresh button re-checks the audit bucket's real existence — the fix
+	// for a console that falsely shows the bucket gone. It spins and toasts like
+	// the others, and awaits the settings reload.
+	refresh := extractJSFunc(t, "async function refreshAuditBucket(")
+	for needle, why := range map[string]string{
+		"busy(btn,true)":                        "refresh must spin its button",
+		"/api/v1/settings/audit-bucket/refresh": "refresh must call the re-check endpoint",
+		"await loadSettings(":                   "refresh must await the settings reload",
+		"busy(btn,false)":                       "refresh must clear the spinner",
+	} {
+		if !strings.Contains(refresh, needle) {
+			t.Errorf("refreshAuditBucket %s (missing %q)", why, needle)
+		}
+	}
+	if !strings.Contains(consoleHTML, `onclick="refreshAuditBucket(this)"`) {
+		t.Error("the Linode automation card must render a Refresh button")
+	}
+
+	for _, fn := range []string{"async function deleteAuditBucket(", "async function removeToken("} {
+		body := extractJSFunc(t, fn)
+		checks := map[string]string{
+			"busy(btn,true)":      "must start the button spinner before the delete request",
+			"await api('DELETE'":  "must await the DELETE call (spinner shows for the whole delete period)",
+			"await loadSettings(": "must await the settings reload so the spinner persists until the card re-renders",
+			",'ok')":              "must raise a success toast (top-right notification) once removed",
+			"busy(btn,false)":     "must clear the spinner in finally",
+		}
+		for needle, why := range checks {
+			if !strings.Contains(body, needle) {
+				t.Errorf("%s %s (missing %q)", fn, why, needle)
+			}
+		}
+		// The toast must fire before the reload so the notification appears the
+		// instant the delete succeeds, not after the extra GET round-trip.
+		if ti, li := strings.Index(body, "toast("), strings.Index(body, "loadSettings("); ti < 0 || li < 0 || ti > li {
+			t.Errorf("%s must toast() before loadSettings()", fn)
 		}
 	}
 }

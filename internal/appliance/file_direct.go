@@ -2,15 +2,18 @@ package appliance
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/tiny125/vm-replication/internal/api"
+	"github.com/tiny125/vm-replication/internal/transport"
 )
 
 // Direct file-transfer: the agent copies the source's files STRAIGHT INTO the
@@ -167,7 +170,8 @@ func (s *Server) launchFileDestination(m api.Migration, label, rootPass string) 
 		_ = s.st.AddEvent(ctx, m.ID, "warn", "could not determine the destination's public IP yet")
 		return
 	}
-	s.fileDests.Store(m.ID, &fileDest{instanceID: inst.ID, ip: ip, label: label, token: tok})
+	d := &fileDest{instanceID: inst.ID, ip: ip, label: label, token: tok}
+	s.fileDests.Store(m.ID, d)
 
 	// Watch the receiver port until it answers. The watch NEVER gives up while
 	// the migration still tracks this destination: after the fast window it warns
@@ -185,6 +189,12 @@ func (s *Server) launchFileDestination(m api.Migration, label, rootPass string) 
 // the migration stops tracking this instance (deleted / relaunched).
 func (s *Server) watchFileDest(migID, instID int64, addr string, fastWindow, fastEvery, slowEvery time.Duration) {
 	ctx := s.ctx
+	// Readiness is proven by a CA-verified TLS handshake, not a bare TCP accept
+	// (see tlsProbeDest). Tests inject destProbe to avoid real network I/O.
+	probe := s.destProbe
+	if probe == nil {
+		probe = s.tlsProbeDest
+	}
 	fastUntil := time.Now().Add(fastWindow)
 	warned := fastWindow <= 0 // a resumed watch (no fast window) needs no stall warning
 	for {
@@ -199,9 +209,7 @@ func (s *Server) watchFileDest(migID, instID int64, addr string, fastWindow, fas
 		if d.instanceID != instID {
 			return // destination was relaunched; a newer watch owns it
 		}
-		c, err := net.DialTimeout("tcp", addr, 5*time.Second)
-		if err == nil {
-			_ = c.Close()
+		if probe(addr) {
 			s.fileDests.Store(migID, &fileDest{instanceID: instID, ip: d.ip, label: d.label, token: d.token, ready: true})
 			_ = s.st.AddEvent(ctx, migID, "info", fmt.Sprintf("destination %s is ready to receive — you can now Start replication", addr))
 			return
@@ -216,6 +224,37 @@ func (s *Server) watchFileDest(migID, instID int64, addr string, fastWindow, fas
 		}
 		time.Sleep(wait)
 	}
+}
+
+// tlsProbeDest reports whether the destination's file RECEIVER answers at addr.
+// A bare TCP accept is not proof — a crash-looping service (or anything else
+// squatting the port) accepts briefly without ever serving, and marking that
+// "ready" would redirect the agent into a dead port. So the probe performs a
+// TLS handshake with the appliance's own data-plane identity: the destination
+// serves the APPLIANCE's receiver certificate, so a handshake verified against
+// our CA — completed, or answered with a TLS alert after our side verified the
+// server — proves the receiver itself is up. Without loadable data-plane certs
+// it falls back to plain TCP reachability.
+func (s *Server) tlsProbeDest(addr string) bool {
+	cfg, err := transport.ClientConfig(s.cfg.TLS, s.cfg.PublicHost)
+	if err != nil {
+		c, derr := net.DialTimeout("tcp", addr, 5*time.Second)
+		if derr != nil {
+			return false
+		}
+		_ = c.Close()
+		return true
+	}
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, cfg)
+	if err == nil {
+		_ = conn.Close()
+		return true
+	}
+	// A "remote error: tls: …" alert arrives AFTER our side verified the server's
+	// certificate chain — the receiver answered, it merely disliked something
+	// about the session. Anything else (refused, timeout, not TLS, a foreign
+	// certificate) is not our receiver.
+	return strings.Contains(err.Error(), "remote error: tls:")
 }
 
 // fileDestsToResume selects the active file migrations whose destination was

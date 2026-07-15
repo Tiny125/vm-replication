@@ -97,7 +97,13 @@ type Server struct {
 	// Token-gated bootstrap for the destination's receiver install (token ->
 	// *destBootstrap); see file_direct.go.
 	destBootstraps sync.Map
-	ctx            context.Context
+	// destProbe is the destination-receiver readiness check (file transfer; see
+	// watchFileDest/tlsProbeDest); tests inject it to avoid real network I/O.
+	destProbe func(addr string) bool
+	// linodeBase overrides the Linode API base URL (tests point it at a fake
+	// server); empty uses the real API.
+	linodeBase string
+	ctx        context.Context
 
 	auditCh chan auditEntry // buffered audit entries -> DB (best-effort)
 }
@@ -196,6 +202,7 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/v1/settings/linode-token", s.auth(s.handleSetLinodeToken))
 	s.mux.Handle("DELETE /api/v1/settings/linode-token", s.auth(s.handleDeleteLinodeToken))
 	s.mux.Handle("POST /api/v1/settings/audit-bucket", s.auth(s.handleProvisionAuditBucket))
+	s.mux.Handle("POST /api/v1/settings/audit-bucket/refresh", s.auth(s.handleRefreshAuditBucket))
 	s.mux.Handle("DELETE /api/v1/settings/audit-bucket", s.auth(s.handleDeleteAuditBucket))
 }
 
@@ -408,7 +415,7 @@ func (s *Server) handleProvisionAuditBucket(w http.ResponseWriter, r *http.Reque
 		writeErr(w, http.StatusBadRequest, "add a Linode API token first")
 		return
 	}
-	cl := linode.New(tok)
+	cl := s.newLinode(tok)
 	if b, ok := s.existingAuditBucket(ctx, cl); ok {
 		s.saveAuditBucket(ctx, b) // make sure our settings point at it
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "already_exists": true, "audit_bucket": b.Label, "audit_region": b.Region})
@@ -423,6 +430,39 @@ func (s *Server) handleProvisionAuditBucket(w http.ResponseWriter, r *http.Reque
 	}
 	b, _ := s.auditBucket(ctx)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "created": true, "audit_bucket": b.Label, "audit_region": b.Region})
+}
+
+// handleRefreshAuditBucket re-checks the audit bucket against the real account
+// and reconciles the console's state with reality. If the bucket exists it
+// restores "ready" (and re-stores the real record with its correct storage
+// cluster) — healing a console that wrongly showed the bucket as gone. If it is
+// genuinely absent, it reports that truthfully without recreating anything. This
+// backs the card's Refresh button.
+func (s *Server) handleRefreshAuditBucket(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	tok, err := s.st.LinodeToken(ctx)
+	if err != nil || tok == "" {
+		writeErr(w, http.StatusBadRequest, "add a Linode API token first")
+		return
+	}
+	cl := s.newLinode(tok)
+	bs, err := cl.ListBuckets(ctx)
+	if err != nil {
+		// Couldn't reach the account — don't change any state on a transient error.
+		writeErr(w, http.StatusBadGateway, "could not reach Object Storage to refresh: "+err.Error())
+		return
+	}
+	want := strings.ToLower(s.auditBucketName())
+	for _, b := range bs {
+		if strings.ToLower(b.Label) == want {
+			s.saveAuditBucket(ctx, b) // restores ready + the real (cluster-correct) record
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "audit_ready": true, "audit_bucket": b.Label, "audit_region": b.Region})
+			return
+		}
+	}
+	// Truly absent: reflect that (the operator can Re-create), but don't invent one.
+	s.setAuditErr("no audit bucket found in the account — use \"Re-create audit bucket\" to make one")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "audit_ready": false})
 }
 
 // handleDeleteAuditBucket empties and deletes the audit-log Object Storage bucket
@@ -458,7 +498,7 @@ func (s *Server) handleDeleteAuditBucket(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusBadRequest, "no Linode API token is configured")
 		return
 	}
-	cl := linode.New(tok)
+	cl := s.newLinode(tok)
 	b, ok := s.auditBucket(ctx)
 	if !ok {
 		// Not tracked locally as ready — it may still exist in the account; find it.
@@ -534,7 +574,15 @@ func (s *Server) linodeClient(ctx context.Context) (*linode.Client, bool) {
 	if err != nil || tok == "" {
 		return nil, false
 	}
-	return linode.New(tok), true
+	return s.newLinode(tok), true
+}
+
+// newLinode builds a Linode client, honoring a test base-URL override.
+func (s *Server) newLinode(token string) *linode.Client {
+	if s.linodeBase != "" {
+		return linode.NewWithBase(token, s.linodeBase)
+	}
+	return linode.New(token)
 }
 
 // StartActiveReceivers (re)starts receivers for all migrations that are mid-

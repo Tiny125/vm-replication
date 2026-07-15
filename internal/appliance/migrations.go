@@ -398,6 +398,10 @@ func (s *Server) clearConsistency(m api.Migration) {
 // back to cloning the current replicated data (with a clear warning).
 const consistencyWait = 6 * time.Minute
 
+// consistencyPollEvery is how often the wait re-checks (a variable so tests can
+// shrink it).
+var consistencyPollEvery = 3 * time.Second
+
 // quiesceForCutover asks every disk's agent for one crash-consistent (point-in-
 // time) snapshot pass and waits for them to land, so the cloned image is a
 // single instant — the key to a clean boot. If no agent is checking in, or the
@@ -430,7 +434,7 @@ func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) bool {
 		// waiting out the timeout when we already know a consistent image won't come.
 		for _, d := range m.Disks {
 			if reason, failed := s.diskQuiesceFailed(d.ID); failed {
-				_ = s.st.AddEvent(s.ctx, m.ID, "warn", "cutover: the source reported it cannot be quiesced for a consistent image ("+reason+"). Stop the source's apps/services so its root can be remounted read-only, then start the cutover again.")
+				_ = s.st.AddEvent(s.ctx, m.ID, "warn", "cutover: the source reported it cannot be quiesced for a consistent image ("+reason+").")
 				return false
 			}
 		}
@@ -452,7 +456,7 @@ func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) bool {
 		select {
 		case <-ctx.Done():
 			return false
-		case <-time.After(3 * time.Second):
+		case <-time.After(consistencyPollEvery):
 		}
 	}
 }
@@ -1300,15 +1304,18 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		return
 	}
 
-	// Guided cutover must NOT proceed on an inconsistent image. If the source was
-	// still running but couldn't be quiesced (apps holding the root, or an outdated
-	// agent), fail fast WITHOUT stopping replication, so the operator can fix it and
-	// retry rather than ending up at a grub> prompt.
+	// Guided cutover with a source that could not be quiesced: do NOT abort. A
+	// running root nearly always has writers holding / (systemd, journald, …), so
+	// the read-only remount fails on virtually every live, non-LVM source — a hard
+	// stop here dead-ended every such cutover and sent the operator hunting for
+	// the "Skip the read-only snapshot" checkbox. Falling back is safe because the
+	// replicated data is still crash-consistent (delta passes apply atomically),
+	// the conversion fsck-repairs it, and — crucially — the guided flow VALIDATES
+	// the boot image below, while the source is still running, so a genuinely bad
+	// image still fails fast before anything is powered off. This is exactly what
+	// ticking "Skip the read-only snapshot" would do, minus the retry loop.
 	if req.GuidedShutdown && !consistent {
-		s.clearConsistency(m)
-		_ = s.st.SetMigrationState(sctx, m.ID, api.MigReplicating, "")
-		_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: could NOT capture a consistent image — the source root could not be remounted read-only (a process is still writing to / ). This is expected on a running root with no LVM. Either retry with \"Skip the read-only snapshot\" ticked (cut over from the current crash-consistent data, repaired with fsck), or power the source off and cut over again. Replication is still running.")
-		return
+		_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: the source could not deliver a read-only/point-in-time final pass (a running root almost always has processes writing to /) — continuing the cutover from the current crash-consistent replicated data instead. It is fsck-repaired during conversion, and the boot image is validated BEFORE you power off the source. For a byte-perfect final image, stop the source's apps (or power the source off) and cut over again.")
 	}
 
 	// Freeze: stop NEW passes and wait for any pass already in flight to finish,
@@ -2465,6 +2472,11 @@ func isNonAgentHandshake(err error) bool {
 		"client didn't provide a certificate",
 		"tls: no certificates configured",
 		"tls: unsupported", // misc unsupported handshake parameters
+		// A bare TCP connect-then-close (port scanner / health check) surfaces as
+		// an EOF at the HELLO stage — before any data. A mid-pass EOF ("read
+		// frame: EOF") is a real failure and deliberately not matched here.
+		"read hello: eof",
+		"read hello: unexpected eof",
 	} {
 		if strings.Contains(s, sig) {
 			return true

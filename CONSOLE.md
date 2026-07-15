@@ -233,6 +233,12 @@ Singapore appliance gets a Singapore bucket). Override with the
 
 **Managing the bucket from the token card:**
 
+- **Refresh** — re-checks the bucket against your Linode account and reconciles
+  the card with reality. Use it if the card shows the audit bucket as **missing
+  but it still exists** in Cloud Manager: Refresh finds it and **restores the
+  status** (re-storing the bucket's real storage endpoint) without recreating
+  anything. If the bucket is genuinely gone, it says so. Every action here shows
+  a spinner while it runs and a top-right notification when it finishes.
 - **Re-create audit bucket** — creates `vmrep-audit-<appliance-id>` if it doesn't
   exist (e.g. after you deleted it, here or in Cloud Manager). If the bucket
   already exists it just tells you so and re-points the console at it — it never
@@ -246,7 +252,9 @@ Singapore appliance gets a Singapore bucket). Override with the
   Cloud Manager, or an earlier session), clicking Delete simply clears the
   console's view of it — it won't error. The console also self-heals within
   ~20s if the bucket disappears out from under it (the button switches back to
-  "Re-create").
+  "Re-create") — but it now **confirms with the account before doing so**, so a
+  transient upload error can no longer make the card wrongly report a bucket that
+  still exists as gone. If it ever does look wrong, click **Refresh**.
 - **Remove token** — deletes the stored Linode API token. Allowed once **no
   migration is active** — **completed** migrations (launched / image ready) don't
   block it, so you can remove the token after your servers are migrated. It's
@@ -313,7 +321,9 @@ receives it as well.
 > and, after creating the migration, use the card's **Create destination instance**
 > step (name it + set a root password) — **Start replication** unlocks only once
 > that destination's file receiver is confirmed ready (with a manual-install
-> fallback if cloud-init can't reach it). See
+> fallback if cloud-init can't reach it; the console **keeps watching
+> indefinitely** and unlocks Start whenever the receiver answers — even from a
+> manual Lish install done much later). See
 > [`docs/FILE-MIGRATION.md`](docs/FILE-MIGRATION.md) for the full file-transfer flow.
 
 For the **block** methods: click **New migration**, enter a **Name** and
@@ -472,19 +482,23 @@ local-disk boot):
    (names are sanitized to Linode's label rules; instances ≤64 chars, volumes
    ≤32, multi-disk volumes get a `-N` suffix). You can also set a **root
    password / SSH key** (so you can log into the launched instance via the
-   Lish console). Then click **Stop replication & continue**. The appliance stops new replication passes, takes
-   **one consistent final pass** with the source root briefly **remounted
+   Lish console). Then click **Stop replication & continue**. The appliance stops new replication passes, **tries
+   one consistent final pass** with the source root briefly **remounted
    read-only** (so the image is a clean point-in-time, not a live "smear" that
    fails `fsck` and boots to `grub>`), and then **converts the boot image and
-   validates it is bootable** — *all while the source is still running*. So if
-   anything is wrong (wrong disk, inconsistent/incomplete copy, a remount the
-   root won't allow because apps are still writing), the cutover **fails fast
-   BEFORE you power anything off** and tells you how to fix it — you lose no
-   uptime. If the source is **already powered off or idle**, tick **"skip the
-   read-only snapshot"** in the dialog. **Delta passes are applied atomically**:
-   an interrupted pass is **discarded whole**, so the image is always the **last
-   complete pass**. Once the image is validated the migration pauses in state
-   `awaiting_cutover`.
+   validates it is bootable** — *all while the source is still running*. A
+   running root usually has writers holding `/` open (systemd, journald, …), so
+   if the read-only remount is refused the cutover **automatically falls back**
+   to the current crash-consistent replicated data (with a clear warning) — it
+   is `fsck`-repaired during conversion and still validated before you power
+   off, so the cutover never dead-ends on a busy root. If anything is genuinely
+   wrong (wrong disk, incomplete copy, an image that fails validation), the
+   cutover **fails fast BEFORE you power anything off** and tells you how to fix
+   it — you lose no uptime. If the source is **already powered off or idle**,
+   tick **"skip the read-only snapshot"** in the dialog to skip the attempt.
+   **Delta passes are applied atomically**: an interrupted pass is **discarded
+   whole**, so the image is always the **last complete pass**. Once the image is
+   validated the migration pauses in state `awaiting_cutover`.
 
    The card guides the timing: while step 1 runs it shows **"Preparing &
    validating the boot image — keep the source server running"** (don't power

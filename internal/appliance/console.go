@@ -484,10 +484,11 @@ async function loadSettings(){
        (st.audit_ready?('<span class="y">✔</span> Audit log bucket <b>'+esc(st.audit_bucket)+'</b>'+(st.audit_region?(' in region <b>'+esc(st.audit_region)+'</b>'):'')+' — console &amp; per-migration logs upload to Object Storage (browse in Cloud Manager).')
         :(st.audit_error?('<span class="x">✘</span> Audit log bucket not created: '+esc(st.audit_error)):'<span class="muted">Audit log bucket: provisioning…</span>'))+'</div>'+
        '<div class="actions">'+
+       '<button onclick="refreshAuditBucket(this)">Refresh</button>'+
        '<button onclick="reprovisionAuditBucket(this)">Re-create audit bucket</button>'+
        (st.audit_ready?'<button class="danger" onclick="deleteAuditBucket(this)">Delete audit bucket</button>':'')+
        '<button class="danger" onclick="removeToken(this)">Remove token</button></div>'+
-       '<div class="muted" style="margin-top:8px;font-size:12px">“Re-create” makes <code style="display:inline;padding:1px 5px">vmrep-audit-'+esc(st.appliance_linode_id||'&lt;id&gt;')+'</code> if it doesn’t exist (and tells you if it already does). “Delete audit bucket” empties and removes it with all logs — only when <b>no migration is active</b> and after you enter the console password. The token can be removed once <b>no migration is active</b> (completed migrations don’t block it).</div>';
+       '<div class="muted" style="margin-top:8px;font-size:12px">“Refresh” re-checks the bucket against your Linode account — use it if the console shows the bucket as missing but it still exists in Cloud Manager (it restores the status without recreating anything). “Re-create” makes <code style="display:inline;padding:1px 5px">vmrep-audit-'+esc(st.appliance_linode_id||'&lt;id&gt;')+'</code> if it doesn’t exist (and tells you if it already does). “Delete audit bucket” empties and removes it with all logs — only when <b>no migration is active</b> and after you enter the console password. The token can be removed once <b>no migration is active</b> (completed migrations don’t block it).</div>';
   }else{
     h+='<details><summary>What is this and how do I get a token?</summary><div class="muted" style="font-size:13px">'+
        'A Linode <b>Personal Access Token</b> lets the appliance create volumes, clone disks and launch instances. Stored <b>encrypted at rest</b>. '+
@@ -511,7 +512,15 @@ async function removeToken(btn){
     html:'<div class="warn">Provisioning, cloning and launching will <b>stop working</b> until you add a valid token again.</div>'+
       '<div class="muted" style="margin-top:8px;font-size:13px">Only allowed when <b>no migration is active</b> (created or running) — a <b>completed</b> migration doesn’t block it. Otherwise removal is refused, because deleting an active migration needs the token to remove its Linode volumes (removing it first would orphan them). This does not delete anything in your Linode account.</div>',
     okText:'Remove token',okDanger:true}))return;
-  busy(btn,true);try{await api('DELETE','/api/v1/settings/linode-token');toast('Linode token removed','ok');loadSettings()}catch(e){alertModal({title:'Error',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
+  busy(btn,true);try{await api('DELETE','/api/v1/settings/linode-token');toast('Linode token removed','ok');await loadSettings()}catch(e){alertModal({title:'Error',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
+async function refreshAuditBucket(btn){
+  busy(btn,true);
+  try{
+    const r=await api('POST','/api/v1/settings/audit-bucket/refresh',{});
+    if(r&&r.audit_ready){toast('Audit bucket found — status refreshed'+(r.audit_bucket?(': '+r.audit_bucket):''),'ok');}
+    else{toast('No audit bucket found in your account — use “Re-create audit bucket” to make one','bad');}
+    await loadSettings();
+  }catch(e){alertModal({title:'Could not refresh audit bucket',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
 async function reprovisionAuditBucket(btn){
   busy(btn,true);
   try{
@@ -531,7 +540,7 @@ async function deleteAuditBucket(btn){
   if(!r)return;
   if(!r.pw){alertModal({title:'Password required',html:'Enter your console password to delete the bucket.',danger:true});return}
   busy(btn,true);
-  try{const d=await api('DELETE','/api/v1/settings/audit-bucket',{password:r.pw});toast(d&&d.already_gone?'The audit bucket was already removed — cleared it here too':'Audit bucket and its logs deleted','ok');loadSettings();}
+  try{const d=await api('DELETE','/api/v1/settings/audit-bucket',{password:r.pw});toast(d&&d.already_gone?'The audit bucket was already removed — cleared it here too':'Audit bucket and its logs deleted','ok');await loadSettings();}
   catch(e){alertModal({title:'Could not delete audit bucket',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
 
 let diskSeq=0;
@@ -699,7 +708,7 @@ async function startMig(id,btn){
     '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> '+(file?'stop replication and hold the copied files for launch.':'stop replication, take a consistent final pass (the source root is briefly remounted read-only), then <b>convert the boot image and validate it is bootable</b> — all while the source is still running, so any problem surfaces before you power off.')+'</div>'+
     '<div style="margin-top:4px"><b>Step 2:</b> '+(file?'power off the source server.':'once step 1 reports the image is validated, power off the source server.')+'</div>'+
     '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(file?('reboots the destination Linode'+planNote+' (already launched at Start, with your files copied straight into it) so it boots into your migrated system — the migration is then complete. No Lish paste needed.'):disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the validated image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('clones the validated image and launches a new Linode'+planNote+'.'):'clones every disk into launchable volumes.'))+'</div></div>';
-  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the '+(file?'copied files are current.':'final pass is current. The final pass remounts the source root <b>read-only</b> for a clean, fsck-passing image — if writers are still holding the root open, the cutover fails fast and asks you to stop them (or tick the box below if the source is already powered off).')+'</div>';
+  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the '+(file?'copied files are current.':'final pass is current. The final pass tries to remount the source root <b>read-only</b> for a perfectly clean image — if writers are still holding the root open (normal on a running system), the cutover <b>automatically falls back</b> to the current crash-consistent data, which is fsck-repaired on convert and validated as bootable before you power anything off. Tick the box below to skip the read-only attempt if the source is already powered off or idle.')+'</div>';
   // Optional names/credentials the cutover applies. These ONLY apply to the
   // block methods, which CREATE the instance (and, for volume boot, the cutover
   // volume) at this step. File transfer created its destination earlier ("Create

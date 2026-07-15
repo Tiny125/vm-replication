@@ -169,6 +169,9 @@ Earlier a single racy log file failed the whole pass with `content hash mismatch
   in the terminal. The appliance **keeps watching the receiver port
   indefinitely** (and rebuilds the watch after an appliance restart), so a
   receiver brought up late still unlocks Start replication within ~30 seconds.
+  The readiness probe completes a **TLS handshake verified against the
+  appliance's own data-plane CA** (not a bare TCP connect), so a crash-looping
+  or foreign service on the port can't be mistaken for the receiver.
 - The **source must reach the destination's public IP** on TCP 5999.
 - A leftover `vmrepl-receiver` systemd service remains on the migrated instance
   (harmless — it just listens); the completion note tells you to

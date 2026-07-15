@@ -25,6 +25,7 @@ const apiBase = "https://api.linode.com/v4"
 // Client talks to the Linode API with a personal access token.
 type Client struct {
 	token string
+	base  string // API base URL (defaults to apiBase; overridable for tests)
 	http  *http.Client
 }
 
@@ -33,7 +34,17 @@ func New(token string) *Client {
 	// Some mutating calls (e.g. creating a full-plan local disk) can be slow to
 	// return headers; give them generous headroom. Long-running operations are
 	// driven by polling helpers, not by holding a single request open.
-	return &Client{token: token, http: &http.Client{Timeout: 180 * time.Second}}
+	return &Client{token: token, base: apiBase, http: &http.Client{Timeout: 180 * time.Second}}
+}
+
+// NewWithBase is New with an alternate API base URL. It exists so tests can
+// point the client at a local fake Linode API; production code uses New.
+func NewWithBase(token, base string) *Client {
+	c := New(token)
+	if base != "" {
+		c.base = base
+	}
+	return c
 }
 
 func (c *Client) do(ctx context.Context, method, path string, in, out any) error {
@@ -45,7 +56,11 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 		}
 		body = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, apiBase+path, body)
+	base := c.base
+	if base == "" {
+		base = apiBase
+	}
+	req, err := http.NewRequestWithContext(ctx, method, base+path, body)
 	if err != nil {
 		return err
 	}

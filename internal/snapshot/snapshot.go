@@ -233,7 +233,7 @@ func prepareRemountRO(o Options) (string, func(), error) {
 	log.Printf("snapshot: remounting %s read-only for a consistent cutover read", mp)
 	if _, rerr := run("mount", "-o", "remount,ro", mp); rerr != nil {
 		_ = runShell(o.PostHook)
-		msg := fmt.Sprintf("could not remount %s read-only — a process is still writing to it; stop the source's apps/services (databases, web servers, etc.) so the root is idle, then cut over again: %v", mp, rerr)
+		msg := fmt.Sprintf("could not remount %s read-only — a process is still writing to it (normal on a running system; the cutover continues from the current crash-consistent data). Stop the source's apps/services (databases, web servers, etc.) if you want a fully idle final pass: %v", mp, rerr)
 		if w := blockingWriters(mp); w != "" {
 			msg += " — processes holding " + mp + ": " + w
 		}
