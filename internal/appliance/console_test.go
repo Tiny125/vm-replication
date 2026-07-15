@@ -289,6 +289,24 @@ func TestConsoleDeleteButtonsSpinAndToast(t *testing.T) {
 			t.Errorf("console is missing spinner/toast infrastructure %q", want)
 		}
 	}
+	// The Refresh button re-checks the audit bucket's real existence — the fix
+	// for a console that falsely shows the bucket gone. It spins and toasts like
+	// the others, and awaits the settings reload.
+	refresh := extractJSFunc(t, "async function refreshAuditBucket(")
+	for needle, why := range map[string]string{
+		"busy(btn,true)":                        "refresh must spin its button",
+		"/api/v1/settings/audit-bucket/refresh": "refresh must call the re-check endpoint",
+		"await loadSettings(":                   "refresh must await the settings reload",
+		"busy(btn,false)":                       "refresh must clear the spinner",
+	} {
+		if !strings.Contains(refresh, needle) {
+			t.Errorf("refreshAuditBucket %s (missing %q)", why, needle)
+		}
+	}
+	if !strings.Contains(consoleHTML, `onclick="refreshAuditBucket(this)"`) {
+		t.Error("the Linode automation card must render a Refresh button")
+	}
+
 	for _, fn := range []string{"async function deleteAuditBucket(", "async function removeToken("} {
 		body := extractJSFunc(t, fn)
 		checks := map[string]string{

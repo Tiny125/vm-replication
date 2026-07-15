@@ -233,6 +233,12 @@ Singapore appliance gets a Singapore bucket). Override with the
 
 **Managing the bucket from the token card:**
 
+- **Refresh** — re-checks the bucket against your Linode account and reconciles
+  the card with reality. Use it if the card shows the audit bucket as **missing
+  but it still exists** in Cloud Manager: Refresh finds it and **restores the
+  status** (re-storing the bucket's real storage endpoint) without recreating
+  anything. If the bucket is genuinely gone, it says so. Every action here shows
+  a spinner while it runs and a top-right notification when it finishes.
 - **Re-create audit bucket** — creates `vmrep-audit-<appliance-id>` if it doesn't
   exist (e.g. after you deleted it, here or in Cloud Manager). If the bucket
   already exists it just tells you so and re-points the console at it — it never
@@ -246,7 +252,9 @@ Singapore appliance gets a Singapore bucket). Override with the
   Cloud Manager, or an earlier session), clicking Delete simply clears the
   console's view of it — it won't error. The console also self-heals within
   ~20s if the bucket disappears out from under it (the button switches back to
-  "Re-create").
+  "Re-create") — but it now **confirms with the account before doing so**, so a
+  transient upload error can no longer make the card wrongly report a bucket that
+  still exists as gone. If it ever does look wrong, click **Refresh**.
 - **Remove token** — deletes the stored Linode API token. Allowed once **no
   migration is active** — **completed** migrations (launched / image ready) don't
   block it, so you can remove the token after your servers are migrated. It's

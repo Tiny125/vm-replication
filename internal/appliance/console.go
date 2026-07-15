@@ -484,10 +484,11 @@ async function loadSettings(){
        (st.audit_ready?('<span class="y">✔</span> Audit log bucket <b>'+esc(st.audit_bucket)+'</b>'+(st.audit_region?(' in region <b>'+esc(st.audit_region)+'</b>'):'')+' — console &amp; per-migration logs upload to Object Storage (browse in Cloud Manager).')
         :(st.audit_error?('<span class="x">✘</span> Audit log bucket not created: '+esc(st.audit_error)):'<span class="muted">Audit log bucket: provisioning…</span>'))+'</div>'+
        '<div class="actions">'+
+       '<button onclick="refreshAuditBucket(this)">Refresh</button>'+
        '<button onclick="reprovisionAuditBucket(this)">Re-create audit bucket</button>'+
        (st.audit_ready?'<button class="danger" onclick="deleteAuditBucket(this)">Delete audit bucket</button>':'')+
        '<button class="danger" onclick="removeToken(this)">Remove token</button></div>'+
-       '<div class="muted" style="margin-top:8px;font-size:12px">“Re-create” makes <code style="display:inline;padding:1px 5px">vmrep-audit-'+esc(st.appliance_linode_id||'&lt;id&gt;')+'</code> if it doesn’t exist (and tells you if it already does). “Delete audit bucket” empties and removes it with all logs — only when <b>no migration is active</b> and after you enter the console password. The token can be removed once <b>no migration is active</b> (completed migrations don’t block it).</div>';
+       '<div class="muted" style="margin-top:8px;font-size:12px">“Refresh” re-checks the bucket against your Linode account — use it if the console shows the bucket as missing but it still exists in Cloud Manager (it restores the status without recreating anything). “Re-create” makes <code style="display:inline;padding:1px 5px">vmrep-audit-'+esc(st.appliance_linode_id||'&lt;id&gt;')+'</code> if it doesn’t exist (and tells you if it already does). “Delete audit bucket” empties and removes it with all logs — only when <b>no migration is active</b> and after you enter the console password. The token can be removed once <b>no migration is active</b> (completed migrations don’t block it).</div>';
   }else{
     h+='<details><summary>What is this and how do I get a token?</summary><div class="muted" style="font-size:13px">'+
        'A Linode <b>Personal Access Token</b> lets the appliance create volumes, clone disks and launch instances. Stored <b>encrypted at rest</b>. '+
@@ -512,6 +513,14 @@ async function removeToken(btn){
       '<div class="muted" style="margin-top:8px;font-size:13px">Only allowed when <b>no migration is active</b> (created or running) — a <b>completed</b> migration doesn’t block it. Otherwise removal is refused, because deleting an active migration needs the token to remove its Linode volumes (removing it first would orphan them). This does not delete anything in your Linode account.</div>',
     okText:'Remove token',okDanger:true}))return;
   busy(btn,true);try{await api('DELETE','/api/v1/settings/linode-token');toast('Linode token removed','ok');await loadSettings()}catch(e){alertModal({title:'Error',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
+async function refreshAuditBucket(btn){
+  busy(btn,true);
+  try{
+    const r=await api('POST','/api/v1/settings/audit-bucket/refresh',{});
+    if(r&&r.audit_ready){toast('Audit bucket found — status refreshed'+(r.audit_bucket?(': '+r.audit_bucket):''),'ok');}
+    else{toast('No audit bucket found in your account — use “Re-create audit bucket” to make one','bad');}
+    await loadSettings();
+  }catch(e){alertModal({title:'Could not refresh audit bucket',html:esc(e.message),danger:true})}finally{busy(btn,false)}}
 async function reprovisionAuditBucket(btn){
   busy(btn,true);
   try{

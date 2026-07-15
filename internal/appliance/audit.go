@@ -91,7 +91,7 @@ func (s *Server) auditAction(level, msg string) { s.recordAudit(0, level, "conso
 // ensureAuditBucket creates (best-effort) the Object Storage bucket for audit
 // logs and records the outcome in settings for the console to show.
 func (s *Server) ensureAuditBucket(ctx context.Context, token string) {
-	cl := linode.New(token)
+	cl := s.newLinode(token)
 	// Region precedence: an explicit -obj-region override, else the appliance's
 	// OWN region (so the bucket sits with the appliance — e.g. a Singapore
 	// appliance gets a Singapore bucket), else the -region default as a last
@@ -122,7 +122,16 @@ func (s *Server) ensureAuditBucket(ctx context.Context, token string) {
 			s.setAuditErr(err.Error())
 			return
 		}
-		b = linode.Bucket{Label: name, Region: region} // already ours — reuse it
+		// Already ours — reuse it, but fetch the REAL record (with its storage
+		// cluster + hostname) from the account. Synthesizing linode.Bucket{Label,
+		// Region} drops the cluster, and for regions where cluster != region (e.g.
+		// SG: region sg-sin-2 but cluster sg-sin-1) object uploads would then target
+		// the region path and 404 — which the uploader misreads as "bucket deleted".
+		if eb, ok := s.existingAuditBucket(ctx, cl); ok {
+			b = eb
+		} else {
+			b = linode.Bucket{Label: name, Region: region}
+		}
 	}
 	_ = s.st.SetSetting(ctx, keyAuditName, name)
 	s.saveAuditBucket(ctx, b)
@@ -240,13 +249,24 @@ func (s *Server) flushAudit(seen map[int64]int64) {
 			continue
 		}
 		if err := cl.PutObject(ctx, b, name, "text/plain; charset=utf-8", []byte(content)); err != nil {
-			// The bucket was deleted out from under us (e.g. removed in Cloud
-			// Manager, or a stale-state re-login). Self-heal: clear the local
-			// "ready" state so the console stops showing it as available (and the
-			// Delete button disappears) instead of retrying a 404 forever.
+			// A not-found on the upload MIGHT mean the bucket was deleted out from
+			// under us (removed in Cloud Manager) — but it can also be a transient
+			// endpoint hiccup or a stored record pointing at the wrong cluster path.
+			// Do NOT nuke the console's "ready" state on the strength of one 404:
+			// confirm with the account first. Only clear ready when ListBuckets
+			// agrees the bucket is truly gone; otherwise treat it as transient and
+			// retry next tick (leaving the watermark unchanged).
 			if linode.IsNotFound(err) {
-				s.setAuditErr("the audit bucket no longer exists (deleted in Cloud Manager or a previous session) — use \"Re-create audit bucket\" to make a new one")
-				return
+				eb, stillThere := s.existingAuditBucket(ctx, cl)
+				if !stillThere {
+					s.setAuditErr("the audit bucket no longer exists (deleted in Cloud Manager or a previous session) — use \"Re-create audit bucket\" to make a new one")
+					return
+				}
+				// Bucket exists — the 404 was transient or the stored record was
+				// stale (wrong cluster path). Re-save the real record so later
+				// uploads target the right endpoint, then retry on the next tick.
+				s.saveAuditBucket(ctx, eb)
+				continue
 			}
 			continue // transient; leave watermark unchanged so we retry next tick
 		}
