@@ -68,13 +68,37 @@ ensure_stage_dir() {
   mkdir -p "$d"
   chmod 700 "$d"
 }
+# dev_on_migrated_disk reports whether $1 is the migrated disk ($DEV) itself or
+# one of its partitions (kernel name or kpartx mapping).
+#
+# This is the difference between "this device exists" and "this device came along
+# with the migration". blkid answers from every block device the CONVERTING HOST
+# can see — including the appliance's own disks — so a successful lookup on its
+# own proves nothing.
+dev_on_migrated_disk() {
+  local d="$1" base
+  [ -n "$d" ] && [ -n "${DEV:-}" ] || return 1
+  [ "$d" = "$DEV" ] && return 0
+  base=$(basename "$DEV")
+  case "$d" in
+    "$DEV"[0-9]*|"$DEV"p[0-9]*) return 0 ;;          # /dev/sdc2, /dev/nvme0n1p2
+    "/dev/mapper/$base"[0-9]*|"/dev/mapper/$base"p[0-9]*) return 0 ;;  # kpartx mapping
+  esac
+  return 1
+}
 # swap_spec_exists reports whether an fstab swap spec resolves to a device that
-# actually made it onto the MIGRATED disk. UUID=/LABEL=/PARTUUID= specs are
-# resolved with blkid (a migrated swap partition on $DEV is visible to it; a
-# separate swap disk that wasn't migrated is not). A raw /dev/... spec is only
-# trusted if the same-numbered partition of the migrated disk ($DEV) is
-# formatted as swap — the literal device name (e.g. Linode's separate-disk
-# /dev/sdb) may coincidentally exist on the APPLIANCE and must not count.
+# actually made it onto the MIGRATED disk ($DEV).
+#
+# Every form is checked against the migrated disk, never merely "does this
+# resolve somewhere". That distinction is not theoretical: EVERY Linode swap
+# image ships the SAME UUID (f1408ea6-59a0-11ed-bc9d-525400000001) and the same
+# "linode-swap" label. Converting on a Linode appliance — which has its own swap
+# disk carrying that identical UUID — a source's stale swap entry resolved
+# happily to the APPLIANCE's /dev/sdb, so the entry was left active and the
+# migrated instance stalled ~90s at every boot waiting for a device that was
+# never migrated. That is exactly the failure disable_stale_swap exists to
+# prevent, and the collision is guaranteed on the most common path of all
+# (Linode to Linode).
 swap_spec_exists() {
   local spec="$1" dev="" pnum cand
   case "$spec" in
@@ -93,7 +117,8 @@ swap_spec_exists() {
       return 1 ;;
     *) return 0 ;; # unknown spec form — leave it alone
   esac
-  [ -n "$dev" ] && [ -b "$dev" ]
+  # Resolving is not enough: it has to be part of the disk we migrated.
+  dev_on_migrated_disk "$dev"
 }
 # disable_stale_swap comments out fstab swap entries whose device did NOT come
 # along with the migration (typically a SEPARATE swap disk — clouds attach one
