@@ -32,6 +32,11 @@ type Stats struct {
 	ChangedBlocks int64
 	BytesOnWire   int64 // bytes applied this session (set by the file path)
 	Duration      time.Duration
+	// Complete is meaningful for a FILE session: the agent reported it walked the
+	// whole source tree (protocol.FileDone.Complete). A pass that ended early is a
+	// valid, successfully-applied session — but it is NOT the baseline, and must
+	// not unlock cutover.
+	Complete bool
 }
 
 // Progress reports live apply progress during a session: written blocks so far
@@ -88,6 +93,17 @@ var errConsistentResync = errors.New("receiver: crash-consistent resync requeste
 // outcome, not a failure.
 var errReplicationHeld = errors.New("receiver: replication not started (connection held)")
 
+// errRedirectedToDest is returned by Handle when a file-transfer session was
+// REDIRECTED to the destination receiver (direct mode): the agent was told where
+// to stream and this receiver applied NOTHING. Like errConsistentResync and
+// errReplicationHeld it is an expected control outcome rather than a failure —
+// and, crucially, it is NOT a completed session. Reporting it as one made the
+// appliance record a baseline (full_sync_done) seconds after Start, so the
+// console told the operator it was safe to power the source off while the copy
+// had not even begun. The agent confirms the pass itself on its next Hello
+// (protocol.Hello LastPass*).
+var errRedirectedToDest = errors.New("receiver: file session redirected to the destination")
+
 // DrainGrace bounds how long an in-flight session may keep running after
 // Serve's context is cancelled (e.g. a cutover freeze stopping this receiver).
 // The session gets this long to finish cleanly — a completed pass ends at one
@@ -137,6 +153,12 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 			// Expected: agent connected, but replication isn't started yet. Connection
 			// recorded by the gate; nothing applied. Not an error.
 			log.Printf("receiver: %s connected; holding (replication not started)", conn.RemoteAddr())
+		case errors.Is(herr, errRedirectedToDest):
+			// Expected: a file session was sent straight to the destination. Nothing
+			// was applied here, so this is neither an error nor a completed pass —
+			// the agent reports the pass itself on its next Hello, which is the only
+			// completion signal direct mode can have.
+			log.Printf("receiver: redirected %s to the destination receiver; nothing applied here", conn.RemoteAddr())
 		case herr != nil:
 			log.Printf("receiver: session from %s ended with error: %v", conn.RemoteAddr(), herr)
 			if onError != nil {
@@ -244,10 +266,11 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress,
 			}
 			if target != "" {
 				// Redirect the agent to stream straight to the destination; we apply
-				// nothing here.
+				// nothing here, so this is NOT a completed session — see
+				// errRedirectedToDest.
 				_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, DataTarget: target, DataServerName: serverName})
 				_ = w.Flush()
-				return Stats{Hello: hello}, nil
+				return Stats{Hello: hello}, errRedirectedToDest
 			}
 		}
 		return handleFileSession(w, r, devicePath, manifestPath, hello, onProgress)

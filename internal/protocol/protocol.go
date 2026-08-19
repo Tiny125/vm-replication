@@ -111,6 +111,26 @@ type Hello struct {
 	// Mode selects the session type: empty (default) is a block session; ModeFile
 	// is a file-transfer session (no block geometry; MsgFileEntry/MsgFileDone).
 	Mode string `json:"mode,omitempty"`
+	// ReportsPasses marks an agent build that CONFIRMS every completed file pass
+	// through the LastPass* fields below. It lets the appliance tell "a new agent
+	// whose first pass is still running" from "an old agent that will never
+	// confirm" — in direct mode (file data goes straight to the destination and
+	// the appliance never sees it) that is the difference between waiting and
+	// telling the operator to re-run the enrollment command. Old agents omit it.
+	ReportsPasses bool `json:"reports_passes,omitempty"`
+	// LastPass* report the agent's PREVIOUS completed file pass. They describe a
+	// pass that has ALREADY finished (the agent persists them next to its file
+	// manifest), never the pass this Hello is opening. In direct mode they are the
+	// only evidence the appliance can have that the destination holds the files:
+	// treating the redirect itself as a completion made the console announce
+	// "file copy complete" — and unlock cutover — while the destination was
+	// still empty.
+	LastPassSeq      int64  `json:"last_pass_seq,omitempty"`      // monotonic per-agent pass counter (dedup key; immune to clock steps)
+	LastPassComplete bool   `json:"last_pass_complete,omitempty"` // the agent walked the WHOLE tree (FileDone.Complete)
+	LastPassEntries  int64  `json:"last_pass_entries,omitempty"`
+	LastPassBytes    int64  `json:"last_pass_bytes,omitempty"`
+	LastPassAt       int64  `json:"last_pass_at,omitempty"`     // unix seconds the pass finished (display only)
+	LastPassTarget   string `json:"last_pass_target,omitempty"` // host:port the pass was streamed to
 }
 
 // FileEntry is the metadata for one filesystem object in a file-transfer

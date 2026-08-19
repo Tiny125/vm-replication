@@ -6,13 +6,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/tiny125/vm-replication/internal/api"
+	"github.com/tiny125/vm-replication/internal/protocol"
 	"github.com/tiny125/vm-replication/internal/transport"
 )
 
@@ -45,6 +48,22 @@ type fileDest struct {
 	token      string // the bootstrap token (also used by the manual-install command)
 	failed     bool   // the launch failed; the operator can retry Create destination
 	errMsg     string // failure reason (never contains the root password)
+}
+
+// directPass is what the appliance knows about a DIRECT file migration's copy
+// passes for one disk. In direct mode the data goes straight from the agent to
+// the destination, so the appliance observes no session completing: everything
+// here comes from the agent's Hello report. Values are stored immutably (a fresh
+// struct per update, like fileDest) because the console reads them from HTTP
+// handlers while the receiver's accept loop writes them.
+type directPass struct {
+	agentReports   bool      // this agent build confirms its passes (Hello.ReportsPasses)
+	streamingSince time.Time // when we first handed this agent a redirect
+	lastSeq        int64     // sequence of the last pass we RECORDED (de-duplication)
+	lastEntries    int64
+	lastBytes      int64
+	lastComplete   bool
+	lastAt         time.Time
 }
 
 // destBootstrap authorizes a destination's one-time download of the receiver
@@ -522,6 +541,147 @@ func (s *Server) dropFileDest(migID int64) {
 		}
 		return true
 	})
+	// Forget this migration's pass reports too: they describe a destination that
+	// no longer exists, and a relaunched one must earn its own baseline.
+	if m, err := s.st.Migration(s.ctx, migID); err == nil {
+		for _, d := range m.Disks {
+			s.directPasses.Delete(d.ID)
+		}
+	}
+}
+
+// directPassFor returns the recorded pass state for a disk (zero value if none).
+func (s *Server) directPassFor(diskID int64) directPass {
+	if v, ok := s.directPasses.Load(diskID); ok {
+		return *(v.(*directPass))
+	}
+	return directPass{}
+}
+
+// diskBaselined reports whether a disk has already recorded its initial full
+// sync. Used to emit the "copy complete" event exactly once.
+func (s *Server) diskBaselined(migID, diskID int64) bool {
+	m, err := s.st.Migration(s.ctx, migID)
+	if err != nil {
+		return false
+	}
+	for _, d := range m.Disks {
+		if d.ID == diskID {
+			return d.FullSyncDone
+		}
+	}
+	return false
+}
+
+// noteDirectStreaming records that we just handed this disk's agent a redirect
+// (so the console can say the first pass is streaming) and announces the direct
+// copy ONCE per destination — the operator must be able to see that the
+// appliance deliberately withholds the "copy complete" verdict until the agent
+// confirms a finished pass.
+func (s *Server) noteDirectStreaming(migID, diskID int64, target string, h protocol.Hello) {
+	p := s.directPassFor(diskID)
+	first := p.streamingSince.IsZero()
+	if first {
+		p.streamingSince = time.Now()
+	}
+	p.agentReports = h.ReportsPasses
+	s.directPasses.Store(diskID, &p)
+	if first {
+		_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf(
+			"the agent is copying files straight to the destination %s — nothing is staged here, so the copy is reported COMPLETE only when the agent confirms a finished pass (checked every ~60s). Do not power off the source until the \"Initial file copy complete\" check is green.", target))
+	}
+}
+
+// fileCopyDetail is the honest status line for a file migration's cutover gate.
+// In DIRECT mode the appliance never sees the data, so "not baselined" has to say
+// what is actually happening — a first pass streaming to the destination (which
+// can take hours on a large source), an agent too old to confirm it, or a walk
+// that ended early — instead of a bare "copying files" that looks like progress.
+func (s *Server) fileCopyDetail(m api.Migration, allFull bool) string {
+	if allFull {
+		return "files copied"
+	}
+	if !s.fileAutomation() {
+		return "copying files" // appliance-staging fallback: wording unchanged
+	}
+	var p directPass
+	for _, d := range m.Disks {
+		if q := s.directPassFor(d.ID); !q.streamingSince.IsZero() {
+			p = q
+		}
+	}
+	switch {
+	case p.streamingSince.IsZero():
+		return "copying files"
+	case !p.agentReports:
+		return "the source agent is an older build that cannot confirm the copy finished — re-run the enrollment command on the source to update it (no re-copy: the delta checkpoint is kept)"
+	case p.lastSeq > 0 && !p.lastComplete:
+		return fmt.Sprintf("the last pass ended early (%d items) — cutover needs ONE complete pass; the agent retries every ~60s", p.lastEntries)
+	default:
+		return fmt.Sprintf("first copy pass streaming to the destination (%s so far) — it must finish before cutover", time.Since(p.streamingSince).Round(time.Minute))
+	}
+}
+
+// recordDirectFilePass records a completed direct-mode copy pass reported by the
+// agent in its Hello. It is the ONLY thing that can baseline a direct file
+// migration: nothing else on the appliance can know the destination has the
+// files, because the data never passes through here.
+//
+// Guards, in order:
+//   - file sessions only (a block Hello never reaches the redirect anyway);
+//   - a destination must exist — in the appliance-staging fallback there is none
+//     and onComplete owns the baseline, so we must not double-count;
+//   - the report must name the destination we are CURRENTLY streaming to. A pass
+//     that landed on a destination since deleted or relaunched says nothing about
+//     the new one;
+//   - only a COMPLETE pass (the agent walked the whole tree) baselines; an
+//     incomplete pass records its stats and warns;
+//   - each pass is credited once: the agent repeats its last pass in EVERY Hello,
+//     so without the sequence guard a string of failures would keep re-stamping
+//     last_sync_at and make the RPO look healthy.
+func (s *Server) recordDirectFilePass(migID, diskID int64, dev0 string, h protocol.Hello) {
+	if h.Mode != protocol.ModeFile {
+		return
+	}
+	v, ok := s.fileDests.Load(migID)
+	if !ok {
+		return // fallback / no destination: onComplete owns the baseline
+	}
+	d := v.(*fileDest)
+	p := s.directPassFor(diskID)
+	p.agentReports = h.ReportsPasses
+	defer func() { s.directPasses.Store(diskID, &p) }()
+
+	// Untrusted counters from an (authenticated) agent: ignore nonsense rather
+	// than writing it to the store.
+	if h.LastPassSeq <= 0 || h.LastPassEntries < 0 || h.LastPassBytes < 0 {
+		return // nothing reported (older agent), or no pass has finished yet
+	}
+	if d.ip == "" || h.LastPassTarget != net.JoinHostPort(d.ip, strconv.Itoa(destFilePort)) {
+		return // the report is about a different receiver; it proves nothing here
+	}
+	if h.LastPassSeq <= p.lastSeq {
+		return // already recorded
+	}
+	wasBaselined := s.diskBaselined(migID, diskID)
+	p.lastSeq, p.lastEntries, p.lastBytes = h.LastPassSeq, h.LastPassEntries, h.LastPassBytes
+	p.lastComplete, p.lastAt = h.LastPassComplete, time.Unix(h.LastPassAt, 0)
+
+	if err := s.st.RecordDiskSync(s.ctx, migID, diskID, h.LastPassComplete,
+		h.LastPassEntries, h.LastPassEntries, h.LastPassBytes); err != nil {
+		log.Printf("appliance: record direct file pass (migration %d disk %d): %v", migID, diskID, err)
+		return
+	}
+	switch {
+	case h.LastPassComplete && !wasBaselined:
+		_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf(
+			"file copy complete: %d items (%s) copied to the destination %s — ready to cut over",
+			h.LastPassEntries, humanBytes(h.LastPassBytes), d.ip))
+	case !h.LastPassComplete:
+		_ = s.st.AddEvent(s.ctx, migID, "warn", fmt.Sprintf(
+			"the file copy pass ended before the whole source tree was walked (%d items, %s) — the copy is NOT complete; the agent retries on its next pass (~60s)",
+			h.LastPassEntries, humanBytes(h.LastPassBytes)))
+	}
 }
 
 // isPrivateIP reports whether a is an RFC1918 / link-local address (so we pick
