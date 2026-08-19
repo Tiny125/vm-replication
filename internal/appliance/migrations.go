@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -137,7 +138,12 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 			if st.Hello.QuiesceError != "" {
 				if s.wantDiskConsistency(diskID) {
 					s.markDiskQuiesceFailed(diskID, st.Hello.QuiesceError)
-					_ = s.st.AddEvent(s.ctx, migID, "warn", fmt.Sprintf("disk %d (%s): the source could not be quiesced for a consistent cutover — %s", diskIdx, dev0, st.Hello.QuiesceError))
+					// Deliberately NOT an activity event: quiesceForCutover reports this
+					// condition once, with the fallback explained. Emitting it here too
+					// gave the operator the same ~1 KB warning twice, for something that
+					// happens on essentially every running source.
+					log.Printf("appliance: migration %d disk %d (%s): source could not be quiesced: %s",
+						migID, diskIdx, dev0, st.Hello.QuiesceError)
 				}
 				return
 			}
@@ -445,7 +451,10 @@ func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) bool {
 		// waiting out the timeout when we already know a consistent image won't come.
 		for _, d := range m.Disks {
 			if reason, failed := s.diskQuiesceFailed(d.ID); failed {
-				_ = s.st.AddEvent(s.ctx, m.ID, "warn", "cutover: the source reported it cannot be quiesced for a consistent image ("+reason+").")
+				// info, not warn: a running root almost never remounts read-only, so
+				// this is the normal path, not a fault. The single warn that follows
+				// explains the fallback and exactly what it costs.
+				_ = s.st.AddEvent(s.ctx, m.ID, "info", "cutover: the source could not be paused for a point-in-time image ("+reason+")")
 				return false
 			}
 		}
@@ -2227,7 +2236,7 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 		}
 		if baselining && sumTotal > 0 {
 			v.Phase = "initial sync"
-			v.PercentDone = float64(sumWritten) / float64(sumTotal) * 100
+			v.PercentDone = roundPercent(float64(sumWritten) / float64(sumTotal) * 100)
 			if !earliest.IsZero() && sumWritten > 0 {
 				elapsed := time.Since(earliest)
 				remain := float64(elapsed) * float64(sumTotal-sumWritten) / float64(sumWritten)
@@ -2236,7 +2245,15 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 			}
 		}
 	case api.MigMigrating:
-		v.Phase = "finalizing (convert + clone)"
+		// Method-aware: the block methods really do convert the boot image and
+		// clone it, but a file migration does neither — it reboots the destination
+		// into the files already copied into it. Saying "convert + clone" there
+		// describes work that is not happening.
+		if isFileMethod(m.BootTarget) {
+			v.Phase = "finalizing (rebooting the destination)"
+		} else {
+			v.Phase = "finalizing (convert + clone)"
+		}
 		if !m.MigrateStarted.IsZero() {
 			v.ElapsedSeconds = int64(time.Since(m.MigrateStarted).Seconds())
 		}
@@ -2389,6 +2406,12 @@ func allOK(checks []api.ValidationCheck) bool {
 // full sync is complete and its storage is provisioned. It is independent of
 // migration state, so a previously-failed migration can be retried, and of the
 // live agent/lag, which stop mattering once the baseline exists.
+// roundPercent trims a progress percentage to one decimal place. The raw
+// division produced values like 2.8146989835809224, which are serialized
+// straight into the API — sixteen significant figures of noise for every
+// consumer, on a number whose inputs are sampled block counts.
+func roundPercent(p float64) float64 { return math.Round(p*10) / 10 }
+
 func cutoverReady(m api.Migration) bool {
 	if len(m.Disks) == 0 {
 		return false
