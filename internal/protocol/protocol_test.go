@@ -3,6 +3,8 @@ package protocol
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -83,5 +85,48 @@ func TestReadFrameRejectsOversize(t *testing.T) {
 	hdr := []byte{byte(MsgBlock), 0xff, 0xff, 0xff, 0xff}
 	if _, _, err := ReadFrame(bytes.NewReader(hdr)); err != ErrFrameTooLarge {
 		t.Errorf("err = %v, want ErrFrameTooLarge", err)
+	}
+}
+
+// The pass-report fields must be omitempty on the wire: an agent that predates
+// them talks to a new appliance (and vice versa) without either side seeing
+// unexpected keys, and an old-format Hello decodes to zero values.
+func TestHelloPassReportOmitEmpty(t *testing.T) {
+	b, err := json.Marshal(Hello{ProtocolVersion: 1, Mode: ModeFile})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{"reports_passes", "last_pass_seq", "last_pass_complete",
+		"last_pass_entries", "last_pass_bytes", "last_pass_at", "last_pass_target"} {
+		if strings.Contains(string(b), key) {
+			t.Errorf("an unreported pass must not put %q on the wire: %s", key, b)
+		}
+	}
+
+	// A populated report round-trips intact.
+	want := Hello{
+		ProtocolVersion: 1, Mode: ModeFile, ReportsPasses: true,
+		LastPassSeq: 7, LastPassComplete: true, LastPassEntries: 99030,
+		LastPassBytes: 2 << 30, LastPassAt: 1755600000, LastPassTarget: "192.0.2.9:5999",
+	}
+	b, err = json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got Hello
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got != want {
+		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", got, want)
+	}
+
+	// An old agent's Hello (no pass fields at all) decodes to zero values.
+	var old Hello
+	if err := json.Unmarshal([]byte(`{"protocol_version":1,"mode":"file"}`), &old); err != nil {
+		t.Fatalf("unmarshal old: %v", err)
+	}
+	if old.ReportsPasses || old.LastPassSeq != 0 || old.LastPassComplete {
+		t.Fatalf("an old Hello must decode to zero pass fields, got %+v", old)
 	}
 }

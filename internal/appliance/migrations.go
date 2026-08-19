@@ -143,35 +143,27 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 			}
 			lastErrEvt = "" // a pass landed; log the next failure even if it repeats
 			// File-transfer session: no block geometry (BlockSize/DeviceSize are 0,
-			// so NumBlocks would divide by zero). A completed file pass IS the
-			// baseline — record entries as the sync with the bytes it applied.
+			// so NumBlocks would divide by zero). Only a pass that walked the WHOLE
+			// tree is the baseline — a walk that ended early applied real data but
+			// must not unlock cutover. This is the appliance-STAGING path; a direct
+			// (redirected) migration never reaches it and baselines from the agent's
+			// pass report instead — see recordDirectFilePass.
 			if st.Hello.Mode == protocol.ModeFile {
-				wasBaselined := false
-				if d0, derr := s.st.Migration(s.ctx, migID); derr == nil {
-					for _, dk := range d0.Disks {
-						if dk.ID == diskID {
-							wasBaselined = dk.FullSyncDone
-						}
-					}
-				}
-				if err := s.st.RecordDiskSync(s.ctx, migID, diskID, true, st.BlocksWritten, st.ChangedBlocks, st.BytesOnWire); err != nil {
+				wasBaselined := s.diskBaselined(migID, diskID)
+				if err := s.st.RecordDiskSync(s.ctx, migID, diskID, st.Complete, st.BlocksWritten, st.ChangedBlocks, st.BytesOnWire); err != nil {
 					log.Printf("appliance: record file sync (migration %d disk %d): %v", migID, diskID, err)
 				}
-				if !wasBaselined {
+				switch {
+				case st.Complete && !wasBaselined:
 					_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("file copy complete: %d items (%s) staged for %s — ready to cut over", st.BlocksWritten, humanBytes(st.BytesOnWire), dev0))
+				case !st.Complete:
+					_ = s.st.AddEvent(s.ctx, migID, "warn", fmt.Sprintf("the file copy pass ended before the whole source tree was walked (%d items, %s) — the copy is NOT complete; the agent retries on its next pass (~60s)", st.BlocksWritten, humanBytes(st.BytesOnWire)))
 				}
 				return
 			}
 			total := blockdiff.NumBlocks(st.Hello.DeviceSize, st.Hello.BlockSize)
 			bytes := st.BlocksWritten * int64(st.Hello.BlockSize)
-			wasBaselined := false
-			if d0, derr := s.st.Migration(s.ctx, migID); derr == nil {
-				for _, dk := range d0.Disks {
-					if dk.ID == diskID {
-						wasBaselined = dk.FullSyncDone
-					}
-				}
-			}
+			wasBaselined := s.diskBaselined(migID, diskID)
 			if err := s.st.RecordDiskSync(s.ctx, migID, diskID, st.Hello.FullSync, total, st.ChangedBlocks, bytes); err != nil {
 				log.Printf("appliance: record sync (migration %d disk %d): %v", migID, diskID, err)
 			}
@@ -235,7 +227,26 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 			// hold=true while the destination is still launching/booting, the
 			// destination target once its receiver is up, or ("","",false) when
 			// there is no automation (appliance-staging fallback).
-			return s.fileDataTarget(migID)
+			//
+			// It is ALSO where a DIRECT migration learns that a copy pass finished:
+			// the file data never touches this appliance, so the agent reports its
+			// last completed pass in this Hello (like the replication gate above,
+			// this hook doubles as a reporting channel). Recorded BEFORE the
+			// hold/redirect decision, so a finished pass is still credited if the
+			// destination momentarily probes not-ready.
+			s.recordDirectFilePass(migID, diskID, dev0, h)
+			target, sni, hold := s.fileDataTarget(migID)
+			if target != "" {
+				// Data is about to flow straight to the destination. Advance the
+				// console to "replicating": the block path does this from onProgress,
+				// which a redirected session never reaches — without this the card
+				// would sit on "waiting for agent" for the whole first pass.
+				if err := s.st.MarkReplicating(s.ctx, migID); err != nil {
+					log.Printf("appliance: mark replicating (migration %d): %v", migID, err)
+				}
+				s.noteDirectStreaming(migID, diskID, target, h)
+			}
+			return target, sni, hold
 		})
 		if err != nil && ctx.Err() == nil {
 			log.Printf("appliance: receiver (migration %d disk %d) stopped: %v", migID, diskID, err)
@@ -2320,7 +2331,7 @@ func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCh
 	fullDetail := diskWord(fullDone) + " baselined"
 	fullName := "Initial full sync complete"
 	if isFileMethod(m.BootTarget) {
-		fullDetail = map[bool]string{true: "files copied", false: "copying files"}[allFull]
+		fullDetail = s.fileCopyDetail(m, allFull)
 		fullName = "Initial file copy complete"
 	}
 	return []api.ValidationCheck{

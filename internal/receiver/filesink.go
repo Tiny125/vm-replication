@@ -96,7 +96,11 @@ func handleFileSession(w *bufio.Writer, r *bufio.Reader, root, manifestPath stri
 			if onProgress != nil {
 				onProgress(entries, entries, false)
 			}
-			return Stats{Hello: hello, BlocksWritten: entries, ChangedBlocks: entries, BytesOnWire: bytesApplied, Duration: time.Since(start)}, nil
+			// Complete carries the agent's own verdict on whether it walked the
+			// WHOLE tree. A pass that ended early applied real data and is not an
+			// error, but it must not be recorded as the baseline that unlocks
+			// cutover.
+			return Stats{Hello: hello, BlocksWritten: entries, ChangedBlocks: entries, BytesOnWire: bytesApplied, Duration: time.Since(start), Complete: done.Complete}, nil
 		default:
 			return Stats{Hello: hello}, fmt.Errorf("unexpected frame type %d in file session", t)
 		}

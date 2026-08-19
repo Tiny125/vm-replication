@@ -51,6 +51,75 @@ func (m fileManifest) save(path string) error {
 	return os.Rename(tmp, path)
 }
 
+// filePassState is the agent's record of its LAST COMPLETED file pass. Each
+// agent run is a ONE-SHOT process (systemd timer, every 60s), so this has to
+// live on disk to survive to the next run. In direct mode the appliance never
+// sees the file data, so this record — replayed in the next Hello — is the only
+// way the console can honestly report that the copy finished. It sits next to
+// the file manifest under /var/lib/vmrepl-source-*, which excludedFromFileCopy
+// already skips, so it is never copied to the destination.
+type filePassState struct {
+	Seq      int64  `json:"seq"`      // monotonic; the appliance de-duplicates on it
+	Complete bool   `json:"complete"` // the whole tree was walked
+	Entries  int64  `json:"entries"`
+	Bytes    int64  `json:"bytes"`
+	At       int64  `json:"at"`     // unix seconds the pass finished
+	Target   string `json:"target"` // host:port this pass was streamed to
+}
+
+// filePassPath is the sidecar path for the pass record, derived from the
+// manifest path so both share the migration's token-scoped name.
+func filePassPath(manifest string) string { return manifest + ".pass" }
+
+// loadFilePass returns the last recorded pass, or the zero value when there is
+// none or it is unreadable — a missing or corrupt record must never fail a pass,
+// it just means the appliance has nothing to credit yet.
+func loadFilePass(manifest string) filePassState {
+	var p filePassState
+	b, err := os.ReadFile(filePassPath(manifest))
+	if err != nil {
+		return filePassState{}
+	}
+	if err := json.Unmarshal(b, &p); err != nil {
+		return filePassState{}
+	}
+	return p
+}
+
+// save writes the pass record atomically (tmp + rename), the same idiom the
+// manifest uses, so a crash mid-write cannot leave a torn record.
+func (p filePassState) save(manifest string) error {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	path := filePassPath(manifest)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// fileHello builds the file-mode Hello, carrying the last completed pass so the
+// appliance can record an honest baseline in direct mode (where it never sees
+// the data itself). Pass the zero filePassState for the destination hop — the
+// destination has no use for the report.
+func fileHello(c cfg, last filePassState) protocol.Hello {
+	host, _ := os.Hostname()
+	return protocol.Hello{
+		ProtocolVersion: 1, JobID: c.jobID, SourceHostname: host,
+		DevicePath: c.root, Mode: protocol.ModeFile,
+		ReportsPasses:    true,
+		LastPassSeq:      last.Seq,
+		LastPassComplete: last.Complete,
+		LastPassEntries:  last.Entries,
+		LastPassBytes:    last.Bytes,
+		LastPassAt:       last.At,
+		LastPassTarget:   last.Target,
+	}
+}
+
 // excludedFromFileCopy reports whether a source-relative path must NOT be
 // copied: virtual/pseudo filesystems, transient dirs, the destination's own
 // boot/kernel/network plumbing (it keeps booting on its native OS), and the
@@ -82,9 +151,11 @@ func excludedFromFileCopy(rel string) bool {
 }
 
 // dialFileSession opens an mTLS connection to target (verifying it against
-// serverName), sends a file-mode Hello, and returns the connection, buffered
-// reader/writer, and the receiver's HelloAck.
-func dialFileSession(c cfg, target, serverName string) (*tls.Conn, *bufio.Writer, *bufio.Reader, protocol.HelloAck, error) {
+// serverName), sends the given file-mode Hello, and returns the connection,
+// buffered reader/writer, and the receiver's HelloAck. The Hello is a parameter
+// because the control hop carries the last-pass report while the destination
+// hop does not.
+func dialFileSession(c cfg, target, serverName string, hello protocol.Hello) (*tls.Conn, *bufio.Writer, *bufio.Reader, protocol.HelloAck, error) {
 	tlsCfg, err := transport.ClientConfig(c.tls, serverName)
 	if err != nil {
 		return nil, nil, nil, protocol.HelloAck{}, err
@@ -95,11 +166,7 @@ func dialFileSession(c cfg, target, serverName string) (*tls.Conn, *bufio.Writer
 	}
 	w := bufio.NewWriterSize(conn, 1<<20)
 	r := bufio.NewReaderSize(conn, 1<<16)
-	host, _ := os.Hostname()
-	if err := protocol.WriteJSON(w, protocol.MsgHello, protocol.Hello{
-		ProtocolVersion: 1, JobID: c.jobID, SourceHostname: host,
-		DevicePath: c.root, Mode: protocol.ModeFile,
-	}); err != nil {
+	if err := protocol.WriteJSON(w, protocol.MsgHello, hello); err != nil {
 		conn.Close()
 		return nil, nil, nil, protocol.HelloAck{}, fmt.Errorf("send hello: %w", err)
 	}
@@ -123,11 +190,16 @@ func replicateFiles(c cfg) (syncResult, error) {
 	res := syncResult{mode: api.SyncFull, startedAt: time.Now()}
 	prev := loadFileManifest(c.manifest)
 	next := fileManifest{}
+	// The pass we last completed. It rides the CONTROL Hello so the appliance can
+	// baseline a direct migration, where it never sees the file data itself.
+	last := loadFilePass(c.manifest)
+	// Where this pass's data actually goes; overwritten if we get redirected.
+	dataTarget := c.target
 
 	// Connect to the CONTROL receiver (the appliance). It either holds (not
 	// started), accepts directly (appliance-staging fallback), or REDIRECTS us to
 	// the launched destination Linode to stream straight into it.
-	conn, w, r, ack, err := dialFileSession(c, c.target, c.serverName)
+	conn, w, r, ack, err := dialFileSession(c, c.target, c.serverName, fileHello(c, last))
 	if err != nil {
 		return res, err
 	}
@@ -147,7 +219,10 @@ func replicateFiles(c cfg) (syncResult, error) {
 			sni = c.serverName
 		}
 		log.Printf("agent: streaming files directly to the destination %s", ack.DataTarget)
-		conn, w, r, ack, err = dialFileSession(c, ack.DataTarget, sni)
+		dataTarget = ack.DataTarget
+		// The destination has no use for the pass report — only the appliance
+		// records baselines — so the destination hop carries a bare Hello.
+		conn, w, r, ack, err = dialFileSession(c, ack.DataTarget, sni, fileHello(c, filePassState{}))
 		if err != nil {
 			return res, fmt.Errorf("dial destination %s: %w", ack.DataTarget, err)
 		}
@@ -250,6 +325,19 @@ func replicateFiles(c cfg) (syncResult, error) {
 		if err := next.save(c.manifest); err != nil {
 			log.Printf("agent: warning: could not save file manifest: %v", err)
 		}
+	}
+	// Record what this pass delivered so the NEXT Hello can tell the appliance.
+	// In direct mode nothing else can: the file data never touches it. Written
+	// only after the receiver confirmed the pass (DoneAck OK), and it records the
+	// TARGET so the appliance can refuse to credit a pass that landed on a
+	// destination it no longer streams to. An INCOMPLETE pass is recorded too —
+	// honestly, with Complete=false — so the console can say the walk ended early
+	// instead of silently waiting.
+	if err := (filePassState{
+		Seq: last.Seq + 1, Complete: complete, Entries: entries,
+		Bytes: bytesWire, At: time.Now().Unix(), Target: dataTarget,
+	}).save(c.manifest); err != nil {
+		log.Printf("agent: warning: could not save the file pass record: %v", err)
 	}
 	res.finishedAt = time.Now()
 	res.total, res.changed, res.bytes = entries, entries, bytesWire

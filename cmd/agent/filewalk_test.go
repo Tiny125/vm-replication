@@ -128,3 +128,56 @@ func decodeFileData(t *testing.T, buf []byte) []byte {
 	}
 	return out
 }
+
+// The pass record has to survive between agent runs (each run is a one-shot
+// process), and a missing or corrupt record must degrade to "no pass reported"
+// rather than failing the pass that is about to run.
+func TestFilePassStateRoundTrip(t *testing.T) {
+	manifest := filepath.Join(t.TempDir(), "disk0.cbt")
+
+	// Nothing saved yet.
+	if got := loadFilePass(manifest); got != (filePassState{}) {
+		t.Fatalf("a missing record must load as the zero value, got %+v", got)
+	}
+
+	want := filePassState{Seq: 3, Complete: true, Entries: 99030, Bytes: 2 << 30, At: 1755600000, Target: "192.0.2.9:5999"}
+	if err := want.save(manifest); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if got := loadFilePass(manifest); got != want {
+		t.Fatalf("round trip:\n got %+v\nwant %+v", got, want)
+	}
+
+	// A corrupt record must not error out either.
+	if err := os.WriteFile(filePassPath(manifest), []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("write corrupt: %v", err)
+	}
+	if got := loadFilePass(manifest); got != (filePassState{}) {
+		t.Fatalf("a corrupt record must load as the zero value, got %+v", got)
+	}
+}
+
+// The control hop carries the pass report; the destination hop must not (the
+// destination records no baselines, and the report is not its business).
+func TestFileHelloCarriesLastPassOnlyForControlHop(t *testing.T) {
+	c := cfg{jobID: "job-1", root: "/"}
+	last := filePassState{Seq: 4, Complete: true, Entries: 10, Bytes: 1 << 20, At: 99, Target: "192.0.2.9:5999"}
+
+	ctl := fileHello(c, last)
+	if !ctl.ReportsPasses {
+		t.Fatal("a current agent must advertise ReportsPasses so the appliance can tell it apart from an old build")
+	}
+	if ctl.LastPassSeq != last.Seq || !ctl.LastPassComplete ||
+		ctl.LastPassEntries != last.Entries || ctl.LastPassBytes != last.Bytes ||
+		ctl.LastPassTarget != last.Target {
+		t.Fatalf("control Hello lost the pass report: %+v", ctl)
+	}
+	if ctl.Mode != protocol.ModeFile {
+		t.Fatalf("file Hello must set Mode=file, got %q", ctl.Mode)
+	}
+
+	dst := fileHello(c, filePassState{})
+	if dst.LastPassSeq != 0 || dst.LastPassComplete || dst.LastPassTarget != "" {
+		t.Fatalf("the destination hop must not carry a pass report: %+v", dst)
+	}
+}

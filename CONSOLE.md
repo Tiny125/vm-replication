@@ -409,6 +409,20 @@ retry with:
 sudo systemctl start vmrepl-agent.service
 ```
 
+**File transfer: "the copy seems to be running but *Initial file copy complete*
+never turns green."** That check is driven by the source agent's report of a
+finished pass, so work back along that chain:
+
+1. On the **source**, `journalctl -u vmrepl-agent -f` — you want a
+   `file pass complete: N entries, … on wire` line. If you only ever see
+   `streaming files directly to the destination`, the pass has not finished yet
+   (large sources take a while); if it errors, fix that first.
+2. On the **destination**, `systemctl status vmrepl-receiver` must be
+   `active (running)` and `ss -lntp | grep 5999` must show it listening.
+3. If the card says the agent is an **older build that cannot confirm the copy**,
+   re-run the enrollment one-liner on the source (no re-copy — the delta
+   checkpoint is kept).
+
 Re-running the enrollment one-liner is also safe at any time — it stops the
 previous agent and replaces it atomically.
 
@@ -460,16 +474,50 @@ right after the appliance was updated/restarted).
 Each migration shows aggregate progress and a **per-disk table** (expand
 **Disks**), plus a checklist that requires **all disks**:
 - ✔ Agent connected — _N/N disks checked in_
-- ✔ Initial full sync complete — _N/N disks baselined_
+- ✔ Initial full sync complete — _N/N disks baselined_ (block methods)
+- ✔ **Initial file copy complete** — _files copied_ (file transfer)
 - ✔ Replication lag within target — _worst lag across disks_
-- ✔ Storage provisioned — _N/N volumes ready_
+- ✔ Storage provisioned — _N/N volumes ready_ (block methods) / ✔ Destination ready (file transfer)
 
 When all checks pass, run **Pre-migration assessment**; on success the **Cutover
 instance** button enables.
 
+### File transfer: the copy is complete when the AGENT says so
+
+In file transfer the agent streams your files **straight into the destination
+Linode** — the data never passes through the replication server. So the console
+cannot see the copy finish by watching its own receiver; it learns that a pass
+finished from the **source agent**, which reports each completed pass on its
+next check-in.
+
+Two consequences worth knowing:
+
+- **"Initial file copy complete" turns green up to ~60 s after the copy actually
+  ends** — the agent reports on its next tick. It is deliberately late rather
+  than early: the check going green means a pass that walked your **whole**
+  source tree has been confirmed delivered.
+- **While the first pass is still running** the check stays amber and says
+  _"first copy pass streaming to the destination (N min so far) — it must finish
+  before cutover"_. On a large source that can be hours. That is the copy
+  working, not a stall — watch **transferred / speed** on the card, and
+  `journalctl -u vmrepl-agent -f` on the source for `file pass complete` lines.
+
+If the check instead says **"the source agent is an older build that cannot
+confirm the copy finished"**, re-run the enrollment one-liner on the source. It
+updates the agent in place — **nothing is re-copied**, the delta checkpoint is
+kept. If it says **"the last pass ended early"**, the agent hit an error partway
+through the walk; it retries automatically every ~60 s, and cutover needs one
+complete pass.
+
 ---
 
 ## 7. Cut over the instance
+
+> **File transfer — never power the source off before the check is green.** The
+> **Initial file copy complete** check is the *only* signal that your files
+> actually reached the destination; the copy runs source→destination, so the
+> card cannot infer it any other way. **Cutover instance** stays disabled until a
+> complete pass is confirmed. Wait for the green tick, then follow the steps.
 
 Cutover is **three steps: freeze the image, power off the source, launch** (the same for volume-boot and
 local-disk boot):

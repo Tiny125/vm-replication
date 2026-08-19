@@ -94,6 +94,11 @@ type Server struct {
 	// Direct file transfer: migrationID -> *fileDest (the launched destination the
 	// agent streams straight into); see file_direct.go.
 	fileDests sync.Map
+	// Direct file transfer: diskID -> *directPass, the agent-reported copy passes
+	// that are the ONLY completion signal in direct mode; see file_direct.go.
+	// In-memory by design: full_sync_done is monotonic in the store, so a restart
+	// can at worst re-credit one already-recorded pass.
+	directPasses sync.Map
 	// Token-gated bootstrap for the destination's receiver install (token ->
 	// *destBootstrap); see file_direct.go.
 	destBootstraps sync.Map
