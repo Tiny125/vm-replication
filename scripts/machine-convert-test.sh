@@ -78,6 +78,24 @@ ensure_stage_dir "$WORK/img3" >/dev/null
 #    migrated (a separate swap disk — Linode's /dev/sdb, or a UUID that no
 #    longer resolves) must be commented out, or the migrated instance stalls
 #    ~90s at boot waiting for a ghost device. Root and comment lines untouched.
+#
+#    blkid is STUBBED here. These are host-independent unit tests, and the real
+#    blkid would answer from the machine running the tests — which is exactly the
+#    bug this covers: every Linode's swap image carries the SAME UUID
+#    (f1408ea6-…), so on a Linode appliance the real blkid resolves the source's
+#    stale swap UUID to the APPLIANCE's own /dev/sdb and the entry looks alive.
+#    The stub models a converting host that has its own swap disk at /dev/sdb
+#    with that shared UUID, while the migrated disk is /dev/sdc.
+DEV=/dev/sdc
+blkid() {
+  case "$*" in
+    "-U f1408ea6-59a0-11ed-bc9d-525400000001") echo /dev/sdb; return 0 ;;  # the HOST's swap — not migrated
+    "-U 5ea51b1e-0000-4000-8000-000000000001") echo /dev/sdc2; return 0 ;; # swap ON the migrated disk
+    "-L linode-swap") echo /dev/sdb; return 0 ;;                            # same collision by label
+    *) return 2 ;;                                                          # unknown: resolves nowhere
+  esac
+}
+
 FSTAB="$WORK/fstab"
 cat > "$FSTAB" <<'EOF'
 # /etc/fstab: static file system information.
@@ -98,6 +116,30 @@ printf 'UUID=abc / ext4 defaults 0 1\n' > "$FSTAB2"
 cp "$FSTAB2" "$FSTAB2.orig"
 disable_stale_swap "$FSTAB2" >/dev/null
 cmp -s "$FSTAB2" "$FSTAB2.orig" || fail "a swap-free fstab must be untouched"
+
+# 8c) Swap that lives ON the migrated disk must be KEPT — it comes along with the
+#     migration, so disabling it would cost the migrated system its swap.
+FSTAB3="$WORK/fstab3"
+cat > "$FSTAB3" <<'EOF'
+UUID=5ea51b1e-0000-4000-8000-000000000001 none swap sw 0 0
+EOF
+disable_stale_swap "$FSTAB3" >/dev/null
+grep -q '^UUID=5ea51b1e.* swap' "$FSTAB3" || fail "swap on the MIGRATED disk must stay enabled"
+
+# 8d) The shared-UUID trap, stated directly: a swap UUID that resolves on the
+#     CONVERTING HOST but is not part of the migrated disk must still be
+#     disabled. Resolving somewhere is not evidence it was migrated.
+swap_spec_exists "UUID=f1408ea6-59a0-11ed-bc9d-525400000001" &&
+  fail "a swap UUID resolving to the converting host's own disk must NOT count as migrated"
+swap_spec_exists "UUID=5ea51b1e-0000-4000-8000-000000000001" ||
+  fail "a swap UUID resolving to a partition of the migrated disk must count as migrated"
+swap_spec_exists "LABEL=linode-swap" &&
+  fail "a swap LABEL resolving to the converting host's own disk must NOT count as migrated"
+swap_spec_exists "UUID=00000000-0000-0000-0000-000000000000" &&
+  fail "a swap UUID that resolves nowhere must NOT count as migrated"
+
+unset -f blkid
+unset DEV
 
 # 10) filter_vgs_on_disk: only volume groups whose PVs live on the MIGRATED
 #     disk (kernel partitions or kpartx mappings) may be activated — the
