@@ -2,6 +2,7 @@ package appliance
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 
@@ -192,5 +193,65 @@ func TestFileCopyDetailIsHonestWhileStreaming(t *testing.T) {
 	// Baselined: the original wording.
 	if d := s.fileCopyDetail(got, true); d != "files copied" {
 		t.Fatalf("baselined detail = %q, want %q", d, "files copied")
+	}
+}
+
+// The cutover phase label is shown verbatim on the card. "finalizing (convert +
+// clone)" is accurate for the block methods, but a FILE migration converts
+// nothing and clones nothing — it reboots the destination into the files that
+// were already copied into it. Telling the operator the tool is doing work it
+// is not doing is a small lie that makes the progress display untrustworthy.
+func TestMigratingPhaseIsMethodAware(t *testing.T) {
+	s := automationServer(t)
+	ctx := context.Background()
+
+	mk := func(name string, bt string) api.Migration {
+		req := api.CreateMigrationRequest{
+			Name: name, SourceHostname: "app", BootTarget: bt,
+			Devices:    []api.DeviceSpec{{Device: "/dev/sda", SizeBytes: 1 << 30}},
+			LinodeType: "g6-standard-1",
+		}
+		if bt == api.BootTargetFile {
+			req.Devices = []api.DeviceSpec{{Device: "/", SizeBytes: 1 << 30}}
+			req.OSImage = "linode/ubuntu24.04"
+		}
+		m, _, err := s.st.CreateMigration(ctx, req)
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		if err := s.st.SetMigrationState(ctx, m.ID, api.MigMigrating, ""); err != nil {
+			t.Fatalf("set state: %v", err)
+		}
+		got, err := s.st.Migration(ctx, m.ID)
+		if err != nil {
+			t.Fatalf("reload: %v", err)
+		}
+		return got
+	}
+
+	fileView := s.view(ctx, mk("f", api.BootTargetFile), "")
+	if strings.Contains(fileView.Phase, "convert") || strings.Contains(fileView.Phase, "clone") {
+		t.Errorf("a file migration converts and clones nothing; phase was %q", fileView.Phase)
+	}
+	if fileView.Phase == "" {
+		t.Error("a migrating file migration still needs a phase label")
+	}
+
+	volView := s.view(ctx, mk("v", api.BootTargetVolume), "")
+	if !strings.Contains(volView.Phase, "convert") {
+		t.Errorf("a volume migration does convert the boot image; phase was %q", volView.Phase)
+	}
+}
+
+// percent_done is serialized straight into the API. Emitting 16 significant
+// figures (2.8146989835809224) is noise for every consumer.
+func TestPercentDoneIsRounded(t *testing.T) {
+	for _, tc := range []struct{ written, total int64 }{
+		{3, 7}, {1, 3}, {99999, 314159},
+	} {
+		got := roundPercent(float64(tc.written) / float64(tc.total) * 100)
+		if got != math.Round(got*10)/10 {
+			t.Errorf("percent %v should be rounded to one decimal", got)
+		}
 	}
 }

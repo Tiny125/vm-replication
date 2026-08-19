@@ -29,7 +29,9 @@ package snapshot
 import (
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -111,14 +113,88 @@ func blockingWriters(mp string) string {
 	// fuser -m lists processes using the filesystem; -v prints a readable table
 	// (mostly on stderr, which CombinedOutput captures).
 	out, _ := run("fuser", "-vm", mp)
-	s := strings.TrimSpace(out)
-	if s == "" {
+	return summarizeWriters(out, kernelThread)
+}
+
+// kernelThread reports whether pid is a kernel thread. Kernel threads have no
+// executable image, so /proc/<pid>/exe never resolves for them. Treating an
+// unreadable link as "kernel" errs toward saying less, which is the right
+// direction for a message whose whole purpose is to be actionable.
+func kernelThread(pid int) bool {
+	_, err := os.Readlink("/proc/" + strconv.Itoa(pid) + "/exe")
+	return err != nil
+}
+
+// summarizeWriters turns a `fuser -vm <mp>` table into a short, actionable list
+// of the processes an operator could actually stop.
+//
+// This message is shown when the source's root could not be remounted read-only
+// for a consistent final pass, alongside advice to "stop the source's apps".
+// It used to be produced by flattening the entire table with strings.Fields and
+// truncating at 500 characters, which was wrong in three compounding ways: the
+// table scaffolding (USER/PID/ACCESS/COMMAND headers, the "kernel mount" row)
+// came through as gibberish; kernel threads — which no operator can stop, and
+// which no advice applies to — dominated the output; and because fuser lists in
+// pid order and kernel threads hold the low pids, the truncation kept exactly
+// the useless entries and discarded the userspace processes that are the point.
+//
+// isKernel is injected so the parsing can be tested without a live /proc.
+func summarizeWriters(fuserOut string, isKernel func(pid int) bool) string {
+	type entry struct {
+		name string
+		pids []string
+	}
+	var order []*entry
+	byName := map[string]*entry{}
+
+	for _, line := range strings.Split(fuserOut, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		// The pid is the one all-numeric field. Lines without one are the header
+		// and the "<mp>: root kernel mount /" pseudo-row — both scaffolding.
+		pid, pidStr := 0, ""
+		for _, tok := range f {
+			if n, err := strconv.Atoi(tok); err == nil {
+				pid, pidStr = n, tok
+				break
+			}
+		}
+		if pidStr == "" || pid <= 0 {
+			continue
+		}
+		if isKernel(pid) {
+			continue
+		}
+		name := f[len(f)-1] // COMMAND is the last column
+		if name == "" {
+			continue
+		}
+		e, ok := byName[name]
+		if !ok {
+			e = &entry{name: name}
+			byName[name] = e
+			order = append(order, e)
+		}
+		e.pids = append(e.pids, pidStr)
+	}
+	if len(order) == 0 {
 		return ""
 	}
-	s = strings.Join(strings.Fields(s), " ") // collapse the table to one tidy line
-	const max = 500
-	if len(s) > max {
-		s = s[:max] + "…"
+
+	// Keep it to one readable log line: name the first few, count the rest.
+	const maxNamed = 6
+	parts := make([]string, 0, maxNamed)
+	for i, e := range order {
+		if i == maxNamed {
+			break
+		}
+		parts = append(parts, e.name+" ("+strings.Join(e.pids, ",")+")")
+	}
+	s := strings.Join(parts, ", ")
+	if extra := len(order) - maxNamed; extra > 0 {
+		s += fmt.Sprintf(" and %d more", extra)
 	}
 	return s
 }
