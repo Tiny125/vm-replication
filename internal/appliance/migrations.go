@@ -667,7 +667,16 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if int64(chosen.DiskMB)*1024*1024 < total {
-				writeErr(w, http.StatusBadRequest, fmt.Sprintf("the selected plan's %d GB disk is too small for %s of data — pick a larger plan", chosen.DiskMB/1024, humanBytes(total)))
+				// Name a plan that WOULD fit, and point at the volume method — for a
+				// disk this size the extra Block Storage is usually cheaper than the
+				// jump to the next plan, and the old message never mentioned it.
+				alt := ""
+				if bigger, ok := linode.ClosestType(types, req.PlanClass, total); ok && bigger.ID != chosen.ID {
+					alt = fmt.Sprintf(" The smallest %s plan that fits is %s (%d GB disk).", req.PlanClass, bigger.ID, bigger.DiskMB/1024)
+				}
+				writeErr(w, http.StatusBadRequest, fmt.Sprintf(
+					"the selected plan %s has a %d GB local disk, which cannot hold %s of source data.%s If that is more than you want to pay, use Separate-volume boot instead — it sizes Block Storage to your data and is not limited by the plan's disk.",
+					chosen.ID, chosen.DiskMB/1024, humanBytes(total), alt))
 				return
 			}
 		} else {
@@ -1773,9 +1782,16 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	}
 
 	// 2) Create a blank raw local disk sized to the plan's full storage, then read
-	//    back its ACTUAL size: Linode reserves a sliver, so the real disk is a little
-	//    smaller than the nominal plan disk, and that real size is what the image
-	//    must be shrunk to fit.
+	//    back its ACTUAL size, which is what the image must be shrunk to fit.
+	//
+	//    This used to say Linode reserves a sliver so the real disk is smaller than
+	//    the nominal plan disk. Measured on a live cutover, it does not: a bare
+	//    instance created with no image and one raw disk gets the plan's disk in
+	//    full (g6-standard-1: nominal 51200 MiB, created 51200 MiB). What is true
+	//    is that a normal image-built instance splits its plan storage across root
+	//    + swap, which is where that belief probably came from. We still read the
+	//    size back rather than assume it — the event logged below records nominal
+	//    vs actual on every run, so the question stays answered by data.
 	diskMB := 0
 	if types, terr := cl.ListTypes(ctx); terr == nil {
 		diskMB = linode.TypeDiskMB(types, m.LinodeType)
@@ -1807,6 +1823,11 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	if actualMB <= 0 {
 		actualMB = diskMB
 	}
+	// Record nominal vs actual so the "does the platform reserve anything?"
+	// question is answered by data on every run instead of by a comment.
+	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf(
+		"cutover: local disk created — plan %s nominal %d MiB, actual %d MiB (delta %d MiB)",
+		m.LinodeType, diskMB, actualMB, diskMB-actualMB))
 
 	// 3) Shrink the whole-disk ext filesystem on the source boot device to fit the
 	//    ACTUAL local disk before cloning it. Sizing to the real disk (minus a small

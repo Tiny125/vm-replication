@@ -162,3 +162,39 @@ grep -q '/.autorelabel' "$HERE/machine-convert.sh" || fail "convert should sched
 bash -n "$HERE/machine-convert.sh" || fail "machine-convert.sh has a syntax error"
 
 echo "ok  machine-convert.sh helpers (ensure_dir_mount, ensure_stage_dir)"
+
+# 11) shrink_decision: the disk-boot cutover shrinks the replicated filesystem to
+#     fit the destination's local disk. The guard used to compare the target only
+#     against the DEVICE size, never the FILESYSTEM size — so when the filesystem
+#     was smaller than the target (the normal case: a 50688 MiB source disk
+#     replicated onto a 51200 MiB volume, target 51184), it fell through to
+#     `resize2fs DEV 51184M`, which GREW the filesystem by ~496 MiB. The step
+#     named "shrink" inflated the image, streamed the extra bytes over the rescue
+#     console, and consumed the entire remaining margin — for nothing, since the
+#     first boot grows the root to fill the disk anyway.
+#     fs, target, dev (all MiB) -> "shrink" | "skip"
+
+# The real-world default: filesystem already smaller than the target.
+[ "$(shrink_decision 50688 51184 51200)" = "skip" ] \
+  || fail "a filesystem already smaller than the target must NOT be resized (it would grow)"
+
+# Genuinely too big: must still shrink.
+[ "$(shrink_decision 51200 51184 51200)" = "shrink" ] \
+  || fail "a filesystem larger than the target must still be shrunk"
+
+# Exactly at the target: nothing to do.
+[ "$(shrink_decision 51184 51184 51200)" = "skip" ] \
+  || fail "a filesystem exactly at the target needs no resize"
+
+# Pre-existing guard: target not smaller than the device.
+[ "$(shrink_decision 20480 51184 20480)" = "skip" ] \
+  || fail "a target no smaller than the device must skip (pre-existing guard)"
+
+# Nonsense target.
+[ "$(shrink_decision 50688 0 51200)" = "skip" ] \
+  || fail "a zero target must skip"
+
+# Unreadable superblock: we cannot prove the filesystem already fits, so attempt
+# the shrink rather than silently skipping and failing the copy later.
+[ "$(shrink_decision 0 51184 51200)" = "shrink" ] \
+  || fail "an unknown filesystem size must attempt the shrink, not skip"
