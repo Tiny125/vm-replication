@@ -7,29 +7,149 @@
 # Run it on the replication server (a Linode), as root, from a checkout of this
 # repo:
 #
-#   sudo scripts/install-replication-server.sh [--public-host IP] [--region us-ord] [--port 8080]
+#   sudo scripts/install-replication-server.sh [--public-host IP] [--region REGION] [--port PORT]
 #
 # It installs everything it needs (git, make, gcc, curl, openssl, jq, tar and a
 # recent Go) using the system package manager (apt/dnf/yum/zypper), builds the
 # binaries, and sets up the service. Requires: bash, root, and internet access.
+#
+# The region is detected from the Linode Metadata service, so --region is only
+# needed to override it (or when metadata is unavailable). Region and port are
+# stored in /etc/vm-repl/applianced.env, which is written once and NEVER
+# overwritten — re-run this script to upgrade and your settings survive.
 set -euo pipefail
 
-PUBLIC_HOST=""; REGION="us-ord"; PORT="8080"
+# Flags are recorded separately from the resolved values: an explicit flag has to
+# outrank a stored setting, and "" has to mean "not given" rather than "empty".
+PUBLIC_HOST=""; REGION_FLAG=""; PORT_FLAG=""
+REGION=""; PORT=""
+REGION_DEFAULT="us-ord"; PORT_DEFAULT="8080"
+# The region this installer shipped as a hardcoded default before it learned to
+# detect one. A unit still carrying it was never an operator's choice, so it must
+# not outrank detection — see resolve_region.
+REGION_LEGACY_DEFAULT="us-ord"
 while [ $# -gt 0 ]; do
   case "$1" in
     --public-host) PUBLIC_HOST="$2"; shift 2;;
-    --region)      REGION="$2"; shift 2;;
-    --port)        PORT="$2"; shift 2;;
-    -h|--help)     sed -n '2,18p' "$0"; exit 0;;
+    --region)      REGION_FLAG="$2"; shift 2;;
+    --port)        PORT_FLAG="$2"; shift 2;;
+    -h|--help)     sed -n '2,20p' "$0"; exit 0;;
     *) echo "unknown arg: $1"; exit 1;;
   esac
 done
 
-[ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)"; exit 1; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ETC=/etc/vm-repl
 LIB=/var/lib/vm-repl
 OPT=/opt/vm-repl
+UNIT_PATH=/etc/systemd/system/applianced.service
+ENVFILE="$ETC/applianced.env"
+
+# ---------------------------------------------------------------------------
+# Settings that belong to the OPERATOR, not to the build.
+#
+# These used to be baked straight into the systemd unit, which this script
+# rewrites wholesale on every run — so upgrading silently reset a corrected
+# region (and port) back to the built-in default. They now live in an
+# EnvironmentFile that is seeded once and never overwritten, so re-running the
+# installer refreshes the unit (new flags, new binary paths) without touching
+# anything the operator chose.
+# ---------------------------------------------------------------------------
+
+# env_file_get KEY — the stored value, or empty.
+env_file_get() {
+  [ -f "$ENVFILE" ] || return 0
+  sed -n "s/^$1=//p" "$ENVFILE" | tail -1
+}
+
+# unit_get FLAG [PATH] — the value of a flag in an already-installed unit, so an
+# install predating the env file can have its settings adopted rather than lost.
+unit_get() {
+  local flag="$1" unit="${2:-$UNIT_PATH}"
+  [ -f "$unit" ] || return 0
+  sed -n "s/.*-$flag[[:space:]]\{1,\}\([^[:space:]\\\\]*\).*/\1/p" "$unit" | tail -1
+}
+
+# detect_region — ask the Linode Metadata service which region we are in. The
+# appliance already reads this endpoint to learn its own instance id, so the
+# region comes from the same place rather than being guessed. Prints nothing and
+# never fails when metadata is unavailable (not every image/region provides it).
+detect_region() {
+  local tok region
+  tok="$(curl -sX PUT -H "Metadata-Token-Expiry-Seconds: 60" --max-time 5 \
+        http://169.254.169.254/v1/token 2>/dev/null || true)"
+  [ -n "$tok" ] || return 0
+  region="$(curl -s -H "Metadata-Token: $tok" -H "Accept: application/json" --max-time 5 \
+           http://169.254.169.254/v1/instance 2>/dev/null | jq -r '.region // empty' 2>/dev/null || true)"
+  [ -n "$region" ] && printf '%s' "$region"
+  return 0
+}
+
+# resolve_region [UNIT_PATH] — highest precedence first:
+#   1. --region on this invocation
+#   2. the stored value (an operator's earlier choice must survive upgrades)
+#   3. a value already in the unit, unless it is the legacy hardcoded default
+#   4. the Linode Metadata service
+#   5. the value in the unit even if it is the legacy default
+#   6. the built-in default
+resolve_region() {
+  local unit="${1:-$UNIT_PATH}" stored detected in_unit
+  REGION_SRC=""
+  if [ -n "$REGION_FLAG" ]; then REGION="$REGION_FLAG"; REGION_SRC="the --region flag"; return 0; fi
+  stored="$(env_file_get REGION)"
+  if [ -n "$stored" ]; then REGION="$stored"; REGION_SRC="$ENVFILE"; return 0; fi
+  in_unit="$(unit_get region "$unit")"
+  if [ -n "$in_unit" ] && [ "$in_unit" != "$REGION_LEGACY_DEFAULT" ]; then
+    REGION="$in_unit"; REGION_SRC="the existing service unit"; return 0
+  fi
+  detected="$(detect_region)"
+  if [ -n "$detected" ]; then REGION="$detected"; REGION_SRC="the Linode Metadata service"; return 0; fi
+  if [ -n "$in_unit" ]; then REGION="$in_unit"; REGION_SRC="the existing service unit"; return 0; fi
+  REGION="$REGION_DEFAULT"; REGION_SRC="the built-in default"
+  return 0
+}
+
+# resolve_port [UNIT_PATH] — flag, then stored, then the installed unit, then the
+# default. No legacy-default exception: 8080 is a real default, not a mistake.
+resolve_port() {
+  local unit="${1:-$UNIT_PATH}" stored in_unit
+  PORT_SRC=""
+  if [ -n "$PORT_FLAG" ]; then PORT="$PORT_FLAG"; PORT_SRC="the --port flag"; return 0; fi
+  stored="$(env_file_get PORT)"
+  if [ -n "$stored" ]; then PORT="$stored"; PORT_SRC="$ENVFILE"; return 0; fi
+  # -listen carries a ":PORT" form, so it needs its own pattern rather than
+  # unit_get. Guard the file first: under `set -e` a failing sed inside a command
+  # substitution aborts the whole install.
+  in_unit=""
+  if [ -f "$unit" ]; then
+    in_unit="$(sed -n 's/.*-listen[[:space:]]\{1,\}:\([0-9]\{1,\}\).*/\1/p' "$unit" 2>/dev/null | tail -1 || true)"
+  fi
+  if [ -n "$in_unit" ]; then PORT="$in_unit"; PORT_SRC="the existing service unit"; return 0; fi
+  PORT="$PORT_DEFAULT"; PORT_SRC="the built-in default"
+  return 0
+}
+
+# seed_env_file — write the operator settings ONCE. Never overwrites: that is the
+# whole point. systemd does not shell-expand these, so no quoting.
+seed_env_file() {
+  [ -f "$ENVFILE" ] && return 0
+  cat > "$ENVFILE" <<ENV
+# vm-replication appliance settings. Edit here, then: systemctl restart applianced
+# The installer seeds this file once and never overwrites it, so your changes
+# survive upgrades.
+REGION=$REGION
+PORT=$PORT
+ENV
+  chmod 600 "$ENVFILE"
+  return 0
+}
+
+# Test hook: sourcing with VMREPL_INSTALL_LIB=1 loads the helpers above and
+# returns before the root check and any real work, so the resolution logic can be
+# unit-tested without root or a live metadata service.
+if [ -n "${VMREPL_INSTALL_LIB:-}" ]; then return 0 2>/dev/null || exit 0; fi
+
+[ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Dependency bootstrap: make the one-liner work on a bare server.
@@ -142,6 +262,19 @@ fi
 
 # --- layout ---
 install -d -m 700 "$ETC" "$LIB" "$OPT"
+
+# --- resolve operator settings, then persist them once ---
+# Done after $ETC exists (the settings file lives there) and before the unit is
+# written. Re-running the installer re-reads the stored values, so an upgrade
+# refreshes the unit without discarding anything the operator chose.
+resolve_region
+resolve_port
+echo ">> Region: $REGION (from $REGION_SRC)"
+echo ">> Console port: $PORT (from $PORT_SRC)"
+if [ ! -f "$ENVFILE" ]; then
+  seed_env_file
+  echo ">> Saved these to $ENVFILE — edit there and restart to change them; upgrades will not overwrite it"
+fi
 install -m 0755 "$ROOT/bin/applianced" /usr/local/bin/applianced
 install -m 0755 "$ROOT/bin/agent" "$OPT/agent"                  # served to sources
 install -m 0755 "$ROOT/bin/receiver" "$OPT/receiver"            # served to file-transfer destinations
@@ -164,11 +297,15 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# REGION and PORT come from the EnvironmentFile, NOT from this unit: the
+# installer rewrites this file on every upgrade, so anything baked in here would
+# silently discard the operator's choice. Change them in $ENVFILE and restart.
+EnvironmentFile=$ENVFILE
 ExecStart=/usr/local/bin/applianced \\
-  -listen :$PORT \\
+  -listen :\${PORT} \\
   -data-dir $LIB \\
   -public-host $PUBLIC_HOST \\
-  -region $REGION \\
+  -region \${REGION} \\
   -cert $ETC/receiver.crt -key $ETC/receiver.key -ca $ETC/ca.crt \\
   -agent-cert $ETC/agent.crt -agent-key $ETC/agent.key \\
   -agent-binary $OPT/agent \\
