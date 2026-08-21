@@ -174,9 +174,34 @@ cleanup() {
   done
   [ "$KPARTX_USED" = 1 ] && kpartx -d "$DEV" 2>/dev/null || true
 }
+# shrink_decision FS_MIB TARGET_MIB DEV_MIB -> "shrink" | "skip"
+#
+# Decides whether the disk-boot cutover needs to resize the replicated
+# filesystem to fit the destination's local disk.
+#
+# The filesystem size is the point. The guard here used to compare the target
+# only against the DEVICE size, so when the filesystem was SMALLER than the
+# target — the normal case, because a source disk is replicated onto a volume
+# rounded UP to whole GiB — it fell through to `resize2fs DEV <target>M`, which
+# GREW the filesystem to the target. A 50688 MiB source on a 51200 MiB volume
+# with a 51184 MiB target was inflated by ~496 MiB: the step named "shrink" made
+# the image bigger, streamed the extra bytes over the rescue console, and used up
+# the margin it was supposed to protect — all for nothing, since the first normal
+# boot grows the root to fill the disk anyway.
+#
+# An unknown filesystem size (0 — unreadable superblock) attempts the shrink: we
+# cannot prove it already fits, and skipping would fail the copy later instead.
+shrink_decision() {
+  local fs="${1:-0}" target="${2:-0}" dev="${3:-0}"
+  [ "$target" -le 0 ] && { echo skip; return 0; }
+  [ "$dev" -gt 0 ] && [ "$target" -ge "$dev" ] && { echo skip; return 0; }
+  [ "$fs" -gt 0 ] && [ "$fs" -le "$target" ] && { echo skip; return 0; }
+  echo shrink
+}
+
 # Test hook: sourcing with VMREPL_CONVERT_LIB=1 loads the helper functions above
 # without running the conversion (no root, block device, traps or mounts), so
-# scripts/machine-convert-test.sh can exercise ensure_dir_mount in isolation.
+# scripts/machine-convert-test.sh can exercise them in isolation.
 if [ -n "${VMREPL_CONVERT_LIB:-}" ]; then return 0 2>/dev/null || exit 0; fi
 trap cleanup EXIT
 
@@ -217,9 +242,13 @@ if [ -n "${VMREPL_SHRINK_ONLY:-}" ]; then
   fstype="$(blkid -s TYPE -o value "$DEV" 2>/dev/null || true)"
   case "$fstype" in
     ext2|ext3|ext4)
-      if [ "$target" -le 0 ] || [ "$target" -ge "$devmib" ]; then
-        log "shrink target ${target}MiB is not smaller than $DEV (${devmib}MiB); nothing to shrink"
-        echo "vmrepl-shrink: ok ${devmib}M"
+      fsnow="$(fsmib)"
+      if [ "$(shrink_decision "${fsnow:-0}" "$target" "$devmib")" = "skip" ]; then
+        # Report the FILESYSTEM size, not the device size: it is what gets copied
+        # onto the local disk, and what the caller sizes the stream from.
+        fit="${fsnow:-0}"; [ "$fit" -gt 0 ] || fit="$devmib"
+        log "filesystem on $DEV is ${fsnow:-?}MiB and the target is ${target}MiB (device ${devmib}MiB); nothing to shrink"
+        echo "vmrepl-shrink: ok ${fit}M"
         exit 0
       fi
       log "Shrinking $fstype on $DEV to fit the local disk (target ${target}MiB)"

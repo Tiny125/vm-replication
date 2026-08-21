@@ -362,6 +362,21 @@ Storage cost (≈ $0.10/GB) and an estimated total. For local-disk boot only
 plans whose disk fits your data are offered (single-disk migrations only). The
 launched instance uses this plan at cutover.
 
+> **Sizing local-disk boot.** The whole source disk is copied, so the plan's
+> local disk has to hold all of it — not just the used part. A stock 50 GB
+> Linode source is a tight fit on a 50 GB plan: its root disk is 49.5 GiB, which
+> rounds up to exactly the plan's disk. It does fit, but with nothing to spare.
+> If the plan you want is too small the console names one that fits — and if that
+> is a bigger jump than you want to pay for, **volume boot** is usually the
+> cheaper answer, because Block Storage is sized to your data (≈ $0.10/GB-month)
+> rather than to a plan tier.
+>
+> At cutover the image is resized to fit the destination's local disk — but only
+> when it is actually too big. An image that already fits is left alone (earlier
+> builds resized it *up* to just under the disk, which copied hundreds of extra
+> MiB over the rescue console for nothing). Either way the first normal boot
+> grows the root to fill the disk.
+
 > **Local-disk cutover — one manual step.** A Linode local disk can only be
 > written from *inside* the instance, so the disk-boot cutover boots the new
 > Linode into **Rescue Mode** (Finnix) with the blank local disk as `/dev/sda`,
