@@ -157,6 +157,17 @@ entering the password, open the browser's **certificate dialog** and confirm the
 `journalctl -u applianced`). Then sign in with the generated password (also saved
 at `/var/lib/vm-repl/initial-admin-password.txt`).
 
+### Appearance
+
+The console and the documentation site follow your operating system's light or
+dark setting. The **Auto / Light / Dark** button in the page header overrides
+that: click it to cycle. "Auto" means follow the system again.
+
+The choice is remembered in your browser and applies to both the console and
+`/documentation` — it is per-browser, not per-appliance, so it never affects
+anyone else signing in to the same replication server. The button sits in the
+page header rather than the tab bar, so it works on the sign-in screen too.
+
 ---
 
 ## 3. (Optional but recommended) Add your Linode API token
