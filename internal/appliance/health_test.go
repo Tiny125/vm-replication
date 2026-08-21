@@ -1,0 +1,166 @@
+package appliance
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/tiny125/vm-replication/internal/api"
+)
+
+func TestApplianceDiskFree(t *testing.T) {
+	free, total, ok := applianceDiskFree(t.TempDir())
+	if !ok {
+		t.Skip("statfs unavailable on this platform")
+	}
+	if total <= 0 {
+		t.Errorf("total = %d, want > 0", total)
+	}
+	if free < 0 || free > total {
+		t.Errorf("free = %d, want 0 <= free <= total (%d)", free, total)
+	}
+	// A path that does not exist must report "unknown", never a zero that the
+	// console would render as "0 bytes free".
+	if _, _, ok := applianceDiskFree("/nonexistent/vmrepl-does-not-exist"); ok {
+		t.Error("a missing path must report ok=false, not zero bytes")
+	}
+	if _, _, ok := applianceDiskFree(""); ok {
+		t.Error("an empty path must report ok=false")
+	}
+}
+
+func TestLowDiskThreshold(t *testing.T) {
+	// Small filesystem: the absolute floor wins, because one delta pass needs
+	// roughly the same room regardless of how big the boot disk is.
+	if got := lowDiskThreshold(20 << 30); got != lowDiskFloor {
+		t.Errorf("20 GiB disk: threshold = %d, want the %d floor", got, int64(lowDiskFloor))
+	}
+	// Large filesystem: 5% wins.
+	if got := lowDiskThreshold(500 << 30); got != (500<<30)/20 {
+		t.Errorf("500 GiB disk: threshold = %d, want 5%% (%d)", got, (500<<30)/20)
+	}
+}
+
+func TestApplianceUndersized(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		vcpus int
+		mem   int64
+		want  bool
+	}{
+		{"the appliance I tested on: 1 vCPU / 2 GB", 1, 2 << 30, true},
+		{"exactly the recommendation", 2, 4 << 30, false},
+		{"comfortably above", 4, 8 << 30, false},
+		{"enough RAM but one core", 1, 8 << 30, true},
+		{"enough cores but little RAM", 4, 2 << 30, true},
+		{"unknown RAM must not be treated as low", 2, 0, false},
+	} {
+		if got := applianceUndersized(tc.vcpus, tc.mem); got != tc.want {
+			t.Errorf("%s: undersized = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The warning must fire once and then stay quiet. A low-disk condition is global
+// but is reported on every active migration, so an un-latched warning would spam
+// the log of every migration on every 5-second poll.
+func TestDiskHeadroomWarnsOnceAndRearms(t *testing.T) {
+	s := automationServer(t)
+	ctx := context.Background()
+	m, _, err := s.st.CreateMigration(ctx, api.CreateMigrationRequest{
+		Name: "app", SourceHostname: "app", BootTarget: api.BootTargetVolume,
+		LinodeType: "g6-standard-1",
+		Devices:    []api.DeviceSpec{{Device: "/dev/sda", SizeBytes: 1 << 30}},
+	})
+	if err != nil {
+		t.Fatalf("create migration: %v", err)
+	}
+
+	count := func() int {
+		evs, err := s.st.Events(ctx, m.ID, 0)
+		if err != nil {
+			t.Fatalf("events: %v", err)
+		}
+		n := 0
+		for _, e := range evs {
+			if strings.Contains(e.Message, "low on disk") {
+				n++
+			}
+		}
+		return n
+	}
+
+	// The latch is what we are testing, so drive it directly rather than trying
+	// to fill a real filesystem.
+	_ = s.st.SetSetting(ctx, keyLowDisk, "1")
+	for i := 0; i < 5; i++ {
+		s.checkDiskHeadroom(ctx)
+	}
+	if n := count(); n != 0 {
+		t.Errorf("an already-latched warning must not repeat, got %d events", n)
+	}
+
+	// With plenty of space the latch clears and nothing is announced.
+	_ = s.st.SetSetting(ctx, keyLowDisk, "")
+	s.checkDiskHeadroom(ctx)
+	if n := count(); n != 0 {
+		t.Errorf("a healthy appliance must announce nothing, got %d events", n)
+	}
+}
+
+// Guard the boundary I most want to hold: appliance health must never become a
+// cutover gate. A red disk check would strand an operator whose appliance is
+// full, because cutting over is how the space gets freed.
+func TestApplianceHealthIsNotACutoverGate(t *testing.T) {
+	s := automationServer(t)
+	ctx := context.Background()
+	m, _, err := s.st.CreateMigration(ctx, api.CreateMigrationRequest{
+		Name: "app", SourceHostname: "app", BootTarget: api.BootTargetVolume,
+		LinodeType: "g6-standard-1",
+		Devices:    []api.DeviceSpec{{Device: "/dev/sda", SizeBytes: 1 << 30}},
+	})
+	if err != nil {
+		t.Fatalf("create migration: %v", err)
+	}
+	got, err := s.st.Migration(ctx, m.ID)
+	if err != nil {
+		t.Fatalf("migration: %v", err)
+	}
+	for _, v := range s.validations(got, 0) {
+		low := strings.ToLower(v.Name + " " + v.Detail)
+		for _, banned := range []string{"disk space", "low on disk", "appliance disk", "headroom"} {
+			if strings.Contains(low, banned) {
+				t.Errorf("validation %q mentions appliance health (%q) — these gate cutover, and blocking cutover on low disk is backwards", v.Name, v.Detail)
+			}
+		}
+	}
+}
+
+// Appliance health is a GLOBAL condition. Rendering it on per-migration cards
+// would paint every card at once for one low-disk state — the same pathology as
+// the duplicated cutover warnings fixed earlier. It belongs in the settings area
+// and nowhere else.
+func TestApplianceHealthStaysOutOfMigrationCards(t *testing.T) {
+	i := strings.Index(consoleHTML, "function migCard")
+	if i < 0 {
+		t.Skip("migCard not found; console structure changed")
+	}
+	rest := consoleHTML[i:]
+	if end := strings.Index(rest, "\nfunction "); end > 0 {
+		rest = rest[:end]
+	}
+	for _, banned := range []string{"appliance_disk", "appliance_vcpus", "appliance_undersized", "This appliance"} {
+		if strings.Contains(rest, banned) {
+			t.Errorf("migCard references %q — appliance health is global and must not render per migration", banned)
+		}
+	}
+}
+
+// The settings area should render it, though.
+func TestApplianceHealthRendersInSettings(t *testing.T) {
+	for _, want := range []string{"This appliance", "appliance_disk_known", "appliance_undersized", "2 vCPU / 4 GB"} {
+		if !strings.Contains(consoleHTML, want) {
+			t.Errorf("settings should surface %q", want)
+		}
+	}
+}
