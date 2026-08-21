@@ -214,6 +214,33 @@ baseline. The console says so explicitly and tells the operator to re-run the
 enrollment one-liner, which updates the agent in place — no re-copy, the delta
 checkpoint is preserved.
 
+### What the destination looks like between the first pass and cutover
+
+The file method makes the destination *become* the source, and that transition is
+visible before cutover. Once the first complete pass lands:
+
+- **The destination carries the source's credentials.** Its `/etc/passwd`,
+  `/etc/shadow`, `/etc/ssh` and `/root/.ssh` are the source's, so the root password
+  set when the destination was created no longer works — log in with the
+  **source's** credentials. This is correct: protecting `/etc/shadow` while copying
+  `/etc/passwd` would leave a machine with the source's users and the destination's
+  passwords, which is worse than either end state.
+- **Its kernel, boot files, network config and machine-id remain its own**, so it
+  keeps booting and stays reachable on its own address.
+- **Its userland is the source's.** If the source's distro or libc differs from the
+  destination image's, binaries on the destination may not run correctly until the
+  cutover reboot. This is inherent to the method.
+
+The delete pass that removes files the source no longer has is scoped by
+`receiver.IsProtectedDestPath`, which is the *same list* the agent excludes from
+the copy. That is deliberate, and the direction matters: excluding a path on the
+agent side does not protect it — an excluded path is never sent, so it is absent
+from the receiver's `seen` set, and the prune deletes whatever it does not
+recognise. Earlier builds kept two hand-maintained lists documented as mirroring
+each other; they drifted, and the prune deleted `/dev/null`, `/run/sshd` and the
+receiver's own binary from the running destination. (`/dev` is devtmpfs and `/run`
+is tmpfs — unlink succeeds on both as root.)
+
 ### Requirements / caveats (direct mode)
 - The destination image ideally supports **cloud-init + the Linode Metadata
   service** (Ubuntu/Debian/RHEL-family cloud images do) so the receiver

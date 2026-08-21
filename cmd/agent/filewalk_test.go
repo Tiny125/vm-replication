@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/tiny125/vm-replication/internal/protocol"
+	"github.com/tiny125/vm-replication/internal/receiver"
 )
 
 // The file walk must never copy the destination's own boot/kernel/network
@@ -179,5 +180,49 @@ func TestFileHelloCarriesLastPassOnlyForControlHop(t *testing.T) {
 	dst := fileHello(c, filePassState{})
 	if dst.LastPassSeq != 0 || dst.LastPassComplete || dst.LastPassTarget != "" {
 		t.Fatalf("the destination hop must not carry a pass report: %+v", dst)
+	}
+}
+
+// The agent's exclusions and the receiver's delete-pass protections must be the
+// SAME list. They were two hand-maintained lists, each documented as mirroring
+// the other, and they had drifted — which is how the prune came to delete
+// /dev/null, /run/sshd and the receiver's own binary from a live destination.
+//
+// The only permitted divergence is the agent's own source-side checkpoints,
+// which exist on the source and never on the destination.
+func TestAgentAndReceiverExclusionsAgree(t *testing.T) {
+	for _, rel := range []string{
+		// runtime plumbing
+		"proc", "sys", "dev", "dev/null", "run", "run/sshd", "tmp", "var/tmp", "var/run", "var/lock",
+		// destination's own boot / identity / network
+		"boot", "boot/grub/grub.cfg", "vmlinuz", "initrd.img", "lib/modules",
+		"etc/fstab", "etc/machine-id", "etc/resolv.conf", "etc/netplan",
+		"etc/systemd/network", "etc/NetworkManager/system-connections", "etc/network/interfaces",
+		// never migrated
+		"mnt", "media", "lost+found",
+		// replication tooling
+		"usr/local/bin/vmrepl-agent", "usr/local/bin/vmrepl-receiver",
+		"etc/vm-repl", "etc/vmrepl",
+		"etc/systemd/system/vmrepl-agent.service", "etc/systemd/system/vmrepl-agent.timer",
+		"etc/systemd/system/vmrepl-receiver.service",
+		// things that MUST migrate
+		"etc/shadow", "etc/passwd", "etc/ssh/sshd_config", "root/.ssh/authorized_keys",
+		"etc/hostname", "etc/systemd/system/app.service", "usr/bin/python3",
+		"var/www/html/index.html", "opt/appdata/x.bin",
+	} {
+		agent := excludedFromFileCopy(rel)
+		recv := receiver.IsProtectedDestPath(rel)
+		if agent != recv {
+			t.Errorf("%s: agent excludes=%v but receiver protects=%v — the lists must agree, or an excluded path gets DELETED on the destination", rel, agent, recv)
+		}
+	}
+
+	// The one permitted divergence.
+	const ckpt = "var/lib/vmrepl-source-abc123.cbt"
+	if !excludedFromFileCopy(ckpt) {
+		t.Errorf("%s must not be copied to the destination", ckpt)
+	}
+	if receiver.IsProtectedDestPath(ckpt) {
+		t.Errorf("%s only exists on the source; the receiver need not protect it", ckpt)
 	}
 }
