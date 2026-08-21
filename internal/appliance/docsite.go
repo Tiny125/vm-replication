@@ -46,16 +46,74 @@ func (s *Server) handleDocsImage(w http.ResponseWriter, r *http.Request) {
 const docsHTML = `<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
 <title>vm-replication documentation</title>
+<script>
+/* Apply the saved theme before first paint (see the console's copy). The key is
+   shared with the console, which is same-origin, so one choice themes both. */
+try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')document.documentElement.dataset.theme=t}catch(e){}
+</script>
 <style>
  :root{
+   color-scheme:light;
    --header:#1a237e; --header-text:#ffffff;
-   --bg:#ffffff; --side:#fafafa; --border:#e0e0e0;
+   --bg:#ffffff; --side:#fafafa; --border:#e0e0e0; --surface:#ffffff;
    --text:#212121; --muted:#616161; --accent:#0b5cd5; --accent-soft:#e8f0fe;
    --code-bg:#f5f5f5; --code-border:#e8e8e8;
    --note:#448aff; --tip:#00897b; --warn:#e65100;
-   /* Console button colours (mirror the real console so demos look identical) */
+   --note-bg:#f2f7ff; --tip-bg:#eef8f6; --warn-bg:#fdf3ec;
+   --nav-hover:#f0f0f0;
+   /* Console control colours (mirror the real console so demos look identical) */
    --btn-blue:#0071e3; --btn-red:#d8302a; --btn-green:#1d9b50;
+   --btn-on:#ffffff; --btn-disabled:#a9cdf5; --btn-danger-line:#f0b9b7; --btn-plain:#f5f5f7;
+   --field-line:#c8dbf8; --field-fg:#153e75;
+   --pill-ok-bg:#e3f4e9; --pill-ok-fg:#136c38;
+   --pill-warn-bg:#fdf1de; --pill-warn-fg:#8a5a06;
+   --pill-bad-bg:#fde7e6; --pill-bad-fg:#a1211c;
+   --shot-mat:#ffffff;
+   --shadow-img:0 2px 10px rgba(0,0,0,.07);
+ }
+ @media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+   color-scheme:dark;
+   --header:#151a3d; --header-text:#f2f2f4;
+   --bg:#0f0f11; --side:#17171a; --border:#38383d; --surface:#1c1c1f;
+   --text:#f2f2f4; --muted:#9a9aa2; --accent:#7fb3ff; --accent-soft:#1d2b47;
+   --code-bg:#26262a; --code-border:#38383d;
+   --note:#7fb3ff; --tip:#4fc3ae; --warn:#f5a45c;
+   --note-bg:#1a2437; --tip-bg:#123330; --warn-bg:#372413;
+   --nav-hover:#232329;
+   --btn-blue:#4da3ff; --btn-red:#ff8079; --btn-green:#5ddb96;
+   --btn-on:#0f0f11; --btn-disabled:#2f4a6b; --btn-danger-line:#7a2e28; --btn-plain:#26262a;
+   --field-line:#33528c; --field-fg:#c8ddff;
+   --pill-ok-bg:#1e4429; --pill-ok-fg:#8fe8b4;
+   --pill-warn-bg:#402f0f; --pill-warn-fg:#f7d488;
+   --pill-bad-bg:#4a1d19; --pill-bad-fg:#ffb3ad;
+   /* Screenshots are light-background PNGs of the console; give them a permanent
+      light mat so they read as framed artifacts instead of glaring rectangles. */
+   --shot-mat:#ffffff;
+   --shadow-img:0 2px 10px rgba(0,0,0,.5);
+  }
+ }
+ :root[data-theme="dark"]{
+   color-scheme:dark;
+   --header:#151a3d; --header-text:#f2f2f4;
+   --bg:#0f0f11; --side:#17171a; --border:#38383d; --surface:#1c1c1f;
+   --text:#f2f2f4; --muted:#9a9aa2; --accent:#7fb3ff; --accent-soft:#1d2b47;
+   --code-bg:#26262a; --code-border:#38383d;
+   --note:#7fb3ff; --tip:#4fc3ae; --warn:#f5a45c;
+   --note-bg:#1a2437; --tip-bg:#123330; --warn-bg:#372413;
+   --nav-hover:#232329;
+   --btn-blue:#4da3ff; --btn-red:#ff8079; --btn-green:#5ddb96;
+   --btn-on:#0f0f11; --btn-disabled:#2f4a6b; --btn-danger-line:#7a2e28; --btn-plain:#26262a;
+   --field-line:#33528c; --field-fg:#c8ddff;
+   --pill-ok-bg:#1e4429; --pill-ok-fg:#8fe8b4;
+   --pill-warn-bg:#402f0f; --pill-warn-fg:#f7d488;
+   --pill-bad-bg:#4a1d19; --pill-bad-fg:#ffb3ad;
+   /* Screenshots are light-background PNGs of the console; give them a permanent
+      light mat so they read as framed artifacts instead of glaring rectangles. */
+   --shot-mat:#ffffff;
+   --shadow-img:0 2px 10px rgba(0,0,0,.5);
  }
  *{margin:0;padding:0;box-sizing:border-box}
  html{scroll-behavior:smooth;scroll-padding-top:72px}
@@ -67,9 +125,12 @@ const docsHTML = `<!DOCTYPE html>
  header .brand{font-size:17px;font-weight:700;letter-spacing:.2px;white-space:nowrap}
  header .brand span{font-weight:400;opacity:.85}
  header .grow{flex:1}
- header a.consolelink{color:#fff;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.35);
+ header a.consolelink{color:var(--header-text);background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.35);
    padding:6px 14px;border-radius:6px;font-size:13.5px;text-decoration:none;white-space:nowrap}
  header a.consolelink:hover{background:rgba(255,255,255,.24)}
+ header button.themebtn{color:var(--header-text);background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.35);
+   padding:6px 14px;border-radius:6px;font-size:13.5px;cursor:pointer;white-space:nowrap;min-width:74px;font-family:inherit}
+ header button.themebtn:hover{background:rgba(255,255,255,.24)}
 
  /* ---- Layout ---- */
  .layout{display:flex;max-width:1400px;margin:0 auto;padding-top:56px}
@@ -79,11 +140,11 @@ const docsHTML = `<!DOCTYPE html>
 
  /* ---- Sidebar ---- */
  .navfilter{margin:0 18px 14px}
- .navfilter input{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:6px;font-size:13.5px;background:#fff}
+ .navfilter input{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:6px;font-size:13.5px;background:var(--surface);color:var(--text)}
  .navgroup{margin-top:16px}
  .navgroup>.gtitle{font-size:11.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:4px 22px}
  nav.sidebar a{display:block;padding:6px 22px;font-size:14px;color:var(--text);text-decoration:none;border-left:3px solid transparent}
- nav.sidebar a:hover{background:#f0f0f0}
+ nav.sidebar a:hover{background:var(--nav-hover)}
  nav.sidebar a.active{color:var(--accent);border-left-color:var(--accent);background:var(--accent-soft);font-weight:600}
  nav.sidebar a.sub{padding-left:38px;font-size:13.5px;color:var(--muted)}
  nav.sidebar a.sub.active{color:var(--accent)}
@@ -108,37 +169,37 @@ const docsHTML = `<!DOCTYPE html>
  .codeblock{position:relative;margin:14px 0}
  .codeblock pre{background:var(--code-bg);border:1px solid var(--code-border);border-radius:8px;padding:14px 88px 14px 16px;
    overflow-x:auto;font:13.5px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
- .codeblock button.copy{position:absolute;top:9px;right:9px;border:1px solid var(--border);background:#fff;border-radius:6px;
+ .codeblock button.copy{position:absolute;top:9px;right:9px;border:1px solid var(--border);background:var(--surface);border-radius:6px;
    padding:4px 12px;font-size:12.5px;cursor:pointer;color:var(--muted)}
  .codeblock button.copy:hover{color:var(--text)}
 
  /* ---- Admonitions (text label, no icons) ---- */
- .adm{border-left:4px solid var(--note);background:#f2f7ff;border-radius:0 8px 8px 0;padding:12px 16px;margin:16px 0;font-size:14.5px}
+ .adm{border-left:4px solid var(--note);background:var(--note-bg);border-radius:0 8px 8px 0;padding:12px 16px;margin:16px 0;font-size:14.5px}
  .adm .t{font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;display:block;margin-bottom:4px;color:var(--note)}
- .adm.tip{border-left-color:var(--tip);background:#eef8f6}.adm.tip .t{color:var(--tip)}
- .adm.warn{border-left-color:var(--warn);background:#fdf3ec}.adm.warn .t{color:var(--warn)}
+ .adm.tip{border-left-color:var(--tip);background:var(--tip-bg)}.adm.tip .t{color:var(--tip)}
+ .adm.warn{border-left-color:var(--warn);background:var(--warn-bg)}.adm.warn .t{color:var(--warn)}
 
  /* ---- Screenshots ---- */
  figure{margin:18px 0}
- figure img{max-width:100%;border:1px solid var(--border);border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,.07)}
+ figure img{max-width:100%;border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow-img);background:var(--shot-mat);padding:8px}
  figcaption{font-size:13px;color:var(--muted);margin-top:7px}
 
  /* ---- Console-button demos: replicas of the real console controls ---- */
  .btn-demo{display:inline-block;padding:5px 16px;border-radius:980px;font-size:13.5px;font-weight:500;vertical-align:middle;
    border:1px solid transparent;white-space:nowrap;line-height:1.5}
- .btn-demo.primary{background:var(--btn-blue);color:#fff}
- .btn-demo.disabled{background:#a9cdf5;color:#fff}
- .btn-demo.danger{background:#fff;color:var(--btn-red);border-color:#f0b9b7}
- .btn-demo.done{background:var(--btn-green);color:#fff}
- .btn-demo.plain{background:#f5f5f7;color:var(--text);border-color:var(--border)}
- .field{background:var(--accent-soft);border:1px solid #c8dbf8;border-radius:5px;padding:1px 7px;font-size:13.5px;color:#153e75;white-space:nowrap}
+ .btn-demo.primary{background:var(--btn-blue);color:var(--btn-on)}
+ .btn-demo.disabled{background:var(--btn-disabled);color:var(--btn-on)}
+ .btn-demo.danger{background:var(--surface);color:var(--btn-red);border-color:var(--btn-danger-line)}
+ .btn-demo.done{background:var(--btn-green);color:var(--btn-on)}
+ .btn-demo.plain{background:var(--btn-plain);color:var(--text);border-color:var(--border)}
+ .field{background:var(--accent-soft);border:1px solid var(--field-line);border-radius:5px;padding:1px 7px;font-size:13.5px;color:var(--field-fg);white-space:nowrap}
  .pill-demo{display:inline-block;padding:2px 11px;border-radius:980px;font-size:12.5px;font-weight:500}
- .pill-demo.ok{background:#e3f4e9;color:#136c38}.pill-demo.warn{background:#fdf1de;color:#8a5a06}.pill-demo.bad{background:#fde7e6;color:#a1211c}
+ .pill-demo.ok{background:var(--pill-ok-bg);color:var(--pill-ok-fg)}.pill-demo.warn{background:var(--pill-warn-bg);color:var(--pill-warn-fg)}.pill-demo.bad{background:var(--pill-bad-bg);color:var(--pill-bad-fg)}
 
  .steps{counter-reset:step;list-style:none;margin-left:0}
  .steps>li{counter-increment:step;position:relative;padding-left:44px;margin:14px 0}
  .steps>li::before{content:counter(step);position:absolute;left:0;top:1px;width:28px;height:28px;border-radius:50%;
-   background:var(--header);color:#fff;font-size:14px;font-weight:700;display:flex;align-items:center;justify-content:center}
+   background:var(--header);color:var(--btn-on);font-size:14px;font-weight:700;display:flex;align-items:center;justify-content:center}
 
  footer.docfoot{margin-top:70px;padding-top:18px;border-top:1px solid var(--border);color:var(--muted);font-size:13.5px}
  @media (max-width: 900px){nav.sidebar{display:none}main{padding:28px 22px 80px}}
@@ -148,6 +209,7 @@ const docsHTML = `<!DOCTYPE html>
 <header>
   <div class="brand">vm-replication <span>documentation</span></div>
   <div class="grow"></div>
+  <button id="themebtn" class="themebtn" onclick="cycleTheme()" title="Switch between automatic, light and dark appearance">Auto</button>
   <a class="consolelink" href="/">Open the console</a>
 </header>
 
@@ -411,6 +473,25 @@ function spy(){
   links.forEach(a=>a.classList.toggle('active',a.getAttribute('href')==='#'+cur));
 }
 document.addEventListener('scroll',spy,{passive:true});spy();
+
+/* Appearance: same three states and the same storage key as the console, so a
+   choice made on either surface applies to both. */
+function themePref(){
+  try{ var t=localStorage.getItem('vmrepl-theme'); return (t==='dark'||t==='light')?t:'auto'; }
+  catch(e){ return 'auto'; }
+}
+function applyTheme(pref){
+  if(pref==='auto') delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme=pref;
+  try{ pref==='auto' ? localStorage.removeItem('vmrepl-theme') : localStorage.setItem('vmrepl-theme',pref); }catch(e){}
+  var b=document.getElementById('themebtn');
+  if(b) b.textContent = pref==='auto' ? 'Auto' : (pref==='light' ? 'Light' : 'Dark');
+}
+function cycleTheme(){
+  var order={auto:'light',light:'dark',dark:'auto'};
+  applyTheme(order[themePref()]||'auto');
+}
+applyTheme(themePref());
 </script>
 </body></html>
 `

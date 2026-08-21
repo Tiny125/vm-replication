@@ -14,13 +14,105 @@ func (s *Server) handleConsole(w http.ResponseWriter, r *http.Request) {
 const consoleHTML = `<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
 <title>vm-replication console</title>
+<script>
+/* Apply the saved theme BEFORE first paint, or the page flashes light on load
+   for a dark-theme user. Must be inline and blocking here in <head>; deferring
+   it or moving it to the bottom reintroduces the flash. localStorage throws in
+   some privacy configurations, so an uncaught error here would kill the rest of
+   this script block. The key is shared with /documentation so one choice themes
+   both surfaces. */
+try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')document.documentElement.dataset.theme=t}catch(e){}
+</script>
 <style>
+ /* Theme tokens. Every colour lives here so both themes stay in step; a literal
+    anywhere below is a bug (see TestNoHardcodedColoursOutsideTokens).
+    The dark block is deliberately duplicated: the media query serves "follow the
+    OS", the attribute selector serves the explicit toggle, and each must win in
+    its own context. Never give a colour its ONLY definition in a dark block. */
  :root{
-   --bg:#fbfbfd; --surface:#ffffff; --surface2:#f5f5f7; --border:#e3e3e6;
-   --text:#1d1d1f; --muted:#6e6e73; --accent:#0071e3; --accent-press:#0060c0;
-   --green:#1d9b50; --amber:#bf6a02; --red:#d8302a;
+   color-scheme:light;
+   --bg:#fbfbfd; --surface:#ffffff; --surface2:#f5f5f7;
+   --border:#e3e3e6; --border-strong:#c9c9ce;
+   --text:#1d1d1f; --muted:#6e6e73;
+   --accent:#0071e3; --accent-press:#0060c0; --on-accent:#ffffff;
+   --btn-hover:#ececef;
+   --green:#1d9b50; --green-deep:#178343; --green-tint:#e6f5ec; --green-line:#cde8d8;
+   --green-bg:#f1faf4; --green-fg:#0f5c30;
+   --amber:#bf6a02; --amber-tint:#fbeedd; --amber-line:#f2ddba;
+   --amber-bg:#fdf6ea; --amber-fg:#7a4d05;
+   --red:#d8302a; --red-tint:#fbe7e6; --red-line:#f0c9c7;
+   --red-bg:#fdeceb; --red-fg:#a3201c;
+   --info:#22408a; --info-tint:#f3f6fc; --info-line:#cdd6e8;
+   --code-fg:#0a4ea0;
+   --tip-bg:#1d1d1f; --tip-fg:#ffffff;
+   --overlay:rgba(20,20,22,.32);
+   --focus-ring:rgba(0,113,227,.15);
+   --flash:rgba(0,113,227,.10);
+   --spin-track:rgba(255,255,255,.5); --spin-head:#ffffff;
+   --spin-track-plain:rgba(0,0,0,.25);
    --shadow:0 1px 3px rgba(0,0,0,.06),0 6px 20px rgba(0,0,0,.04);
+   --shadow-tip:0 8px 24px rgba(0,0,0,.22);
+   --shadow-pop:0 12px 36px rgba(0,0,0,.2);
+   --shadow-modal:0 24px 70px rgba(0,0,0,.28);
+   --shadow-toast:0 12px 36px rgba(0,0,0,.16);
+ }
+ @media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+   color-scheme:dark;
+   --bg:#0f0f11; --surface:#1c1c1f; --surface2:#26262a;
+   --border:#38383d; --border-strong:#6f6f7a;
+   --text:#f2f2f4; --muted:#9a9aa2;
+   --accent:#4da3ff; --accent-press:#7ab8ff; --on-accent:#0f0f11;
+   --btn-hover:#303036;
+   --green:#5ddb96; --green-deep:#3fbf78; --green-tint:#1e4429; --green-line:#2c6b40;
+   --green-bg:#16321f; --green-fg:#8fe8b4;
+   --amber:#f5c352; --amber-tint:#402f0f; --amber-line:#6b5218;
+   --amber-bg:#35270c; --amber-fg:#f7d488;
+   --red:#ff8079; --red-tint:#4a1d19; --red-line:#7a2e28;
+   --red-bg:#3d1815; --red-fg:#ffb3ad;
+   --info:#9dc0ff; --info-tint:#1d2b47; --info-line:#33528c;
+   --code-fg:#7fb3ff;
+   --tip-bg:#3a3a40; --tip-fg:#f2f2f4;
+   --overlay:rgba(0,0,0,.62);
+   --focus-ring:rgba(77,163,255,.28);
+   --flash:rgba(77,163,255,.14);
+   --spin-track:rgba(255,255,255,.35); --spin-head:#ffffff;
+   --spin-track-plain:rgba(255,255,255,.25);
+   --shadow:0 1px 3px rgba(0,0,0,.5),0 6px 20px rgba(0,0,0,.35);
+   --shadow-tip:0 8px 24px rgba(0,0,0,.6);
+   --shadow-pop:0 12px 36px rgba(0,0,0,.55);
+   --shadow-modal:0 24px 70px rgba(0,0,0,.66);
+   --shadow-toast:0 12px 36px rgba(0,0,0,.5);
+  }
+ }
+ :root[data-theme="dark"]{
+   color-scheme:dark;
+   --bg:#0f0f11; --surface:#1c1c1f; --surface2:#26262a;
+   --border:#38383d; --border-strong:#6f6f7a;
+   --text:#f2f2f4; --muted:#9a9aa2;
+   --accent:#4da3ff; --accent-press:#7ab8ff; --on-accent:#0f0f11;
+   --btn-hover:#303036;
+   --green:#5ddb96; --green-deep:#3fbf78; --green-tint:#1e4429; --green-line:#2c6b40;
+   --green-bg:#16321f; --green-fg:#8fe8b4;
+   --amber:#f5c352; --amber-tint:#402f0f; --amber-line:#6b5218;
+   --amber-bg:#35270c; --amber-fg:#f7d488;
+   --red:#ff8079; --red-tint:#4a1d19; --red-line:#7a2e28;
+   --red-bg:#3d1815; --red-fg:#ffb3ad;
+   --info:#9dc0ff; --info-tint:#1d2b47; --info-line:#33528c;
+   --code-fg:#7fb3ff;
+   --tip-bg:#3a3a40; --tip-fg:#f2f2f4;
+   --overlay:rgba(0,0,0,.62);
+   --focus-ring:rgba(77,163,255,.28);
+   --flash:rgba(77,163,255,.14);
+   --spin-track:rgba(255,255,255,.35); --spin-head:#ffffff;
+   --spin-track-plain:rgba(255,255,255,.25);
+   --shadow:0 1px 3px rgba(0,0,0,.5),0 6px 20px rgba(0,0,0,.35);
+   --shadow-tip:0 8px 24px rgba(0,0,0,.6);
+   --shadow-pop:0 12px 36px rgba(0,0,0,.55);
+   --shadow-modal:0 24px 70px rgba(0,0,0,.66);
+   --shadow-toast:0 12px 36px rgba(0,0,0,.5);
  }
  *{margin:0;padding:0;box-sizing:border-box}
  body{background:var(--bg);color:var(--text);
@@ -41,24 +133,24 @@ const consoleHTML = `<!DOCTYPE html>
  label{display:block;font-size:12px;font-weight:500;color:var(--muted);margin:10px 0 5px}
  input,select{font:inherit;font-size:14px;background:var(--surface);color:var(--text);
    border:1px solid var(--border);border-radius:10px;padding:9px 12px;width:100%;transition:border-color .15s,box-shadow .15s}
- input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(0,113,227,.15)}
+ input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--focus-ring)}
  .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
  button{font:inherit;font-size:14px;font-weight:500;background:var(--surface2);color:var(--text);
    border:1px solid var(--border);border-radius:980px;padding:8px 16px;cursor:pointer;
    transition:transform .08s ease,background .15s,box-shadow .15s,opacity .15s}
- button:hover{background:#ececef}
+ button:hover{background:var(--btn-hover)}
  button:active{transform:scale(.96)}
  button:disabled{opacity:.4;cursor:not-allowed;transform:none}
- button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+ button.primary{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
  button.primary:hover{background:var(--accent-press)}
  button.done{background:var(--green);border-color:var(--green)}
- button.done:hover{background:#178343}
- button.danger{color:var(--red);border-color:#f0c9c7;background:#fff}
- button.danger:hover{background:#fdeceb}
+ button.done:hover{background:var(--green-deep)}
+ button.danger{color:var(--red);border-color:var(--red-line);background:var(--surface)}
+ button.danger:hover{background:var(--red-bg)}
  button.busy{position:relative;color:transparent!important}
  button.busy::after{content:"";position:absolute;left:50%;top:50%;width:14px;height:14px;margin:-7px 0 0 -7px;
-   border:2px solid rgba(255,255,255,.5);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}
- button.busy.light::after{border-color:rgba(0,0,0,.25);border-top-color:var(--text)}
+   border:2px solid var(--spin-track);border-top-color:var(--spin-head);border-radius:50%;animation:spin .7s linear infinite}
+ button.busy.light::after{border-color:var(--spin-track-plain);border-top-color:var(--text)}
  @keyframes spin{to{transform:rotate(360deg)}}
  .bar{display:flex;gap:10px;align-items:center;margin-bottom:24px;flex-wrap:wrap}
  button.tab{background:transparent;border-color:transparent;color:var(--muted);font-weight:600}
@@ -72,12 +164,12 @@ const consoleHTML = `<!DOCTYPE html>
  th{color:var(--muted);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
  tr:last-child td{border-bottom:none}
  .pill{display:inline-block;padding:3px 10px;border-radius:980px;font-size:12px;font-weight:500}
- .pill.ok{background:#e6f5ec;color:var(--green)} .pill.warn{background:#fbeedd;color:var(--amber)}
- .pill.bad{background:#fbe7e6;color:var(--red)} .pill.muted{background:var(--surface2);color:var(--muted)}
+ .pill.ok{background:var(--green-tint);color:var(--green)} .pill.warn{background:var(--amber-tint);color:var(--amber)}
+ .pill.bad{background:var(--red-tint);color:var(--red)} .pill.muted{background:var(--surface2);color:var(--muted)}
  .y{color:var(--green)} .x{color:var(--red)}
  code,pre{background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:10px;
    display:block;white-space:pre-wrap;word-break:break-all;font-size:12.5px;
-   font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;color:#0a4ea0}
+   font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;color:var(--code-fg)}
  .prog{height:8px;background:var(--surface2);border-radius:980px;overflow:hidden;margin-top:8px}
  .prog>div{height:100%;background:var(--accent);transition:width .4s ease;border-radius:980px}
  .prog.indet>div{width:35%;animation:slide 1.1s ease-in-out infinite}
@@ -88,12 +180,16 @@ const consoleHTML = `<!DOCTYPE html>
  details>summary::before{content:"›";display:inline-block;margin-right:6px;transition:transform .15s}
  details[open]>summary::before{transform:rotate(90deg)}
  details>div{margin-top:10px}
- .banner{border:1px solid #cde8d8;background:#f1faf4;border-radius:12px;padding:12px 14px;margin:10px 0;font-size:13.5px;color:#0f5c30}
+ .banner{border:1px solid var(--border);background:var(--surface2);border-radius:12px;padding:12px 14px;margin:10px 0;font-size:13.5px;color:var(--text)}
+ .banner.ok{border-color:var(--green-line);background:var(--green-bg);color:var(--green-fg)}
+ .banner.warn{border-color:var(--amber-line);background:var(--amber-bg);color:var(--amber-fg)}
+ .banner.bad{border-color:var(--red-line);background:var(--red-bg);color:var(--red-fg)}
+ .banner.info{border-color:var(--info-line);background:var(--info-tint);color:var(--info)}
  .banner a{color:var(--accent)}
  .actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px}
  .resultbox{margin-top:8px;font-size:13px;border-radius:10px;padding:9px 12px;border:1px solid var(--border);background:var(--surface2)}
- .resultbox.ok{background:#f1faf4;border-color:#cde8d8;color:#0f5c30}
- .resultbox.bad{background:#fdeceb;border-color:#f0c9c7;color:#a3201c}
+ .resultbox.ok{background:var(--green-bg);border-color:var(--green-line);color:var(--green-fg)}
+ .resultbox.bad{background:var(--red-bg);border-color:var(--red-line);color:var(--red-fg)}
  .logpre{margin:0;border:1px solid var(--border);border-radius:10px;background:var(--surface2);
    padding:8px 12px;color:var(--text);white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;
    font-size:12.5px;line-height:1.55;font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace}
@@ -103,18 +199,18 @@ const consoleHTML = `<!DOCTYPE html>
  .info{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
    background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;font-weight:700;
    font-style:normal;cursor:help;position:relative;margin-left:6px;vertical-align:middle;flex:none}
- .info:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+ .info:hover{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
  .info:hover::after{content:attr(data-tip);position:absolute;left:50%;bottom:150%;transform:translateX(-50%);
-   background:#1d1d1f;color:#fff;padding:9px 11px;border-radius:9px;font-size:12px;font-weight:400;white-space:pre-line;
-   width:max-content;max-width:280px;line-height:1.45;text-align:left;z-index:30;box-shadow:0 8px 24px rgba(0,0,0,.22)}
+   background:var(--tip-bg);color:var(--tip-fg);padding:9px 11px;border-radius:9px;font-size:12px;font-weight:400;white-space:pre-line;
+   width:max-content;max-width:280px;line-height:1.45;text-align:left;z-index:30;box-shadow:var(--shadow-tip)}
  .info:hover::before{content:"";position:absolute;left:50%;bottom:150%;transform:translateX(-50%) translateY(100%);
-   border:5px solid transparent;border-top-color:#1d1d1f;z-index:30}
+   border:5px solid transparent;border-top-color:var(--tip-bg);z-index:30}
  .leg{position:relative;display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;
    border-radius:50%;background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;
    font-weight:700;font-style:normal;cursor:help;margin-left:6px;vertical-align:middle;flex:none}
- .leg:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+ .leg:hover{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
  .legbox{display:none;position:absolute;top:150%;left:50%;transform:translateX(-50%);z-index:40;
-   background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.2);
+   background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow-pop);
    padding:12px 14px;width:400px;text-transform:none;letter-spacing:normal;font-weight:400}
  .leg:hover .legbox{display:block}
  .leggrid{display:grid;grid-template-columns:max-content 1fr;gap:8px 12px;align-items:start;font-size:12.5px;color:var(--text)}
@@ -122,17 +218,17 @@ const consoleHTML = `<!DOCTYPE html>
  .leggrid .desc{color:var(--muted);line-height:1.4}
  .modal.wide{max-width:760px}
  .flash{animation:flash .8s ease}
- @keyframes flash{0%{background:rgba(0,113,227,.10)}100%{background:transparent}}
+ @keyframes flash{0%{background:var(--flash)}100%{background:transparent}}
  .center{display:flex;flex-direction:column;align-items:center;gap:14px;padding:36px 0;color:var(--muted)}
  .spinner{width:26px;height:26px;border:3px solid var(--surface2);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
  .login-card{max-width:380px;margin:8vh auto 0}
- .modal-overlay{position:fixed;inset:0;background:rgba(20,20,22,.32);backdrop-filter:saturate(120%) blur(2px);
+ .modal-overlay{position:fixed;inset:0;background:var(--overlay);backdrop-filter:saturate(120%) blur(2px);
    display:flex;align-items:center;justify-content:center;z-index:100;padding:20px;animation:fadein .15s ease}
  .modal-overlay.closing{animation:fadeout .15s ease forwards}
  @keyframes fadein{from{opacity:0}to{opacity:1}}
  @keyframes fadeout{to{opacity:0}}
- .modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:0 24px 70px rgba(0,0,0,.28);
+ .modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow-modal);
    max-width:460px;width:100%;padding:24px 24px 20px;animation:pop .18s cubic-bezier(.2,.8,.3,1)}
  @keyframes pop{from{transform:scale(.94);opacity:.5}to{transform:scale(1);opacity:1}}
  .modal h3{font-size:17px;font-weight:600;letter-spacing:-.01em;margin:0 0 10px}
@@ -145,7 +241,7 @@ const consoleHTML = `<!DOCTYPE html>
  .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
  .toast-wrap{position:fixed;top:18px;right:18px;z-index:200;display:flex;flex-direction:column;gap:10px;max-width:360px}
  .toast{display:flex;align-items:flex-start;gap:9px;background:var(--surface);border:1px solid var(--border);
-   border-left:4px solid var(--muted);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,.16);
+   border-left:4px solid var(--muted);border-radius:12px;box-shadow:var(--shadow-toast);
    padding:12px 14px;font-size:13.5px;color:var(--text);animation:toastin .22s cubic-bezier(.2,.8,.3,1)}
  .toast.ok{border-left-color:var(--green)} .toast.ok .ic{color:var(--green)}
  .toast.bad{border-left-color:var(--red)} .toast.bad .ic{color:var(--red)}
@@ -153,12 +249,26 @@ const consoleHTML = `<!DOCTYPE html>
  .toast.closing{animation:toastout .2s ease forwards}
  @keyframes toastin{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
  @keyframes toastout{to{transform:translateX(20px);opacity:0}}
+ /* ---- Appearance control ---- */
+ .pagehead{display:flex;align-items:flex-start;gap:16px}
+ .pagehead>div:first-child{flex:1;min-width:0}
+ .themebtn{flex:none;margin-top:4px;padding:5px 14px;border-radius:980px;border:1px solid var(--border);
+   background:var(--surface);color:var(--muted);font-size:12.5px;cursor:pointer;min-width:74px}
+ .themebtn:hover{background:var(--btn-hover);color:var(--text)}
 </style></head>
 <body>
 <div id="toasts" class="toast-wrap"></div>
 <div class="wrap">
-  <h1>vm-<span class="dot">replication</span></h1>
-  <div class="sub">Migrate Linux servers to Akamai Cloud (Linode).</div>
+  <!-- The theme control sits in the PAGE header, outside #login and #app, so it
+       is reachable in every state — including the sign-in screen, which is the
+       first thing an operator sees. -->
+  <div class="pagehead">
+    <div>
+      <h1>vm-<span class="dot">replication</span></h1>
+      <div class="sub">Migrate Linux servers to Akamai Cloud (Linode).</div>
+    </div>
+    <button id="themebtn" class="themebtn" onclick="cycleTheme()" title="Switch between automatic, light and dark appearance">Auto</button>
+  </div>
 
   <!-- LOGIN -->
   <div id="login" class="card login-card hide">
@@ -419,7 +529,7 @@ function renderSourceCheck(st){
   $('srcWait').textContent='Report received.';
   const V={ok:['ok','Supported'],warn:['warn','Supported with cautions'],bad:['bad','Not supported'],fail:['bad','Not supported']};
   const MNAME={file:'File transfer',volume:'Volume boot',disk:'Disk boot'};
-  let h='<div class="banner" style="border-color:#cdd6e8;background:#f3f6fc;color:#22408a"><b>'+esc(rep.os_pretty||'Unknown OS')+'</b>'+
+  let h='<div class="banner info"><b>'+esc(rep.os_pretty||'Unknown OS')+'</b>'+
     ' — '+esc(rep.arch||'?')+', kernel '+esc(rep.kernel||'?')+(rep.virt&&rep.virt!=='unknown'?(', virtualization: '+esc(rep.virt)):'')+
     (rep.hostname?(' <span class="muted">('+esc(rep.hostname)+')</span>'):'')+'</div>';
   // General checks.
@@ -763,25 +873,26 @@ function destPanel(v,m){
   const st=v.dest_state;
   if(!st||st==='fallback')return '';
   if(['migrating','awaiting_cutover','image_ready','launched'].includes(m.state))return '';
-  const amber='border-color:#f2ddba;background:#fdf6ea;color:#7a4d05';
+  // Kept as a variable so the two call sites below stay identical.
+  const amber='warn';
   const idl=v.dest_linode_id||m.launched_linode_id;
   const lish=idl?(' — <a href="https://cloud.linode.com/linodes/'+idl+'/lish/weblish" target="_blank" rel="noopener">open Lish</a>'):'';
   const manual=v.dest_manual_cmd?('<div style="margin-top:8px;font-size:12px"><b>Once the destination is up:</b> open the instance’s Lish console (log in as root with the password you set)'+lish+' and paste this to install the receiver right away — no need to wait for the automatic install:</div>'+
     '<div style="display:flex;gap:8px;align-items:flex-start;margin-top:6px"><pre id="dinstall'+m.id+'" style="flex:1;margin:0">'+esc(v.dest_manual_cmd)+'</pre>'+
     '<button onclick="copyText(document.getElementById(\'dinstall'+m.id+'\').textContent,this)">Copy</button></div>'):'';
   if(st==='none')
-    return '<div class="banner" style="'+amber+'"><b>Step 1 — create the destination instance.</b>'+
+    return '<div class="banner '+amber+'"><b>Step 1 — create the destination instance.</b>'+
       '<div style="margin-top:6px">Launches a <b>'+esc(m.linode_type||'plan')+'</b> Linode running <b>'+esc(m.os_image||'your OS image')+'</b> and installs the file receiver on it. <b>Start replication</b> unlocks once it’s ready to receive.</div>'+
       '<div style="margin-top:8px"><button class="primary" onclick="createDest('+m.id+',this)">Create destination instance</button></div></div>';
   if(st==='failed')
-    return '<div class="banner" style="border-color:#e6c0c0;background:#fdeeee;color:#7a1f1f"><b>Destination launch failed.</b>'+
+    return '<div class="banner bad"><b>Destination launch failed.</b>'+
       '<div style="margin-top:6px">'+esc(v.dest_error||'see the activity log')+'</div>'+
       '<div style="margin-top:8px"><button class="primary" onclick="createDest('+m.id+',this)">Retry — create destination instance</button></div></div>';
   if(st==='ready')
     return '<div class="resultbox ok" style="margin-top:10px"><b>✔ Destination ready</b> — Linode '+esc(idl||'')+(v.dest_ip?(' ('+esc(v.dest_ip)+')'):'')+' is ready to receive. Use <b>Start replication</b> to begin copying your files into it.</div>';
   // launching / installing
   const label=(st==='launching')?'Launching the destination Linode…':'Installing the file receiver on the destination…';
-  return '<div class="banner" style="'+amber+'"><b>'+label+'</b>'+
+  return '<div class="banner '+amber+'"><b>'+label+'</b>'+
     '<div style="margin-top:6px">This can take a few minutes.'+(v.dest_ip?(' Destination IP: <b>'+esc(v.dest_ip)+'</b>.'):'')+' <b>Start replication</b> unlocks automatically once its receiver answers.</div>'+manual+'</div>';
 }
 // createDest launches the file-transfer destination instance with an operator
@@ -1087,7 +1198,7 @@ function cleanupCard(id){
   const p=pendingCleanup[id];if(!p)return null;
   const card=document.createElement('div');card.className='mig';card.id='mig'+id;
   card.innerHTML=
-    '<div class="banner" style="border-color:#cdd6e8;background:#f3f6fc;color:#22408a">✔ <b>Migration #'+id+' ('+esc(p.name)+') deleted.</b> The replication volume and data were removed. One last step: remove the replication agent from your source server.</div>'+
+    '<div class="banner info">✔ <b>Migration #'+id+' ('+esc(p.name)+') deleted.</b> The replication volume and data were removed. One last step: remove the replication agent from your source server.</div>'+
     (p.cmd?('<label>Run this on '+esc(p.source||'the source server')+' to remove the agent</label>'+
       '<div style="display:flex;gap:8px;align-items:flex-start"><pre id="uclean'+id+'" style="flex:1;margin:0">'+esc(p.cmd)+'</pre>'+
       '<button onclick="copyText(document.getElementById(\'uclean'+id+'\').textContent,this)">Copy</button></div>')
@@ -1112,16 +1223,16 @@ function migCard(v){
   // Migration-complete header: a prominent green strip at the top of a launched /
   // image-ready card so the finished state is obvious at a glance.
   if(['image_ready','launched'].includes(m.state)){
-    h+='<div class="banner" style="border-color:#bfe3cd;background:#eaf7ef;color:#0f5c30;margin:0 0 10px;font-size:14px;font-weight:600">✓ Migration complete<span style="font-weight:400"> — your server is migrated and running on Linode.</span></div>';
+    h+='<div class="banner ok" style="margin:0 0 10px;font-size:14px;font-weight:600">✓ Migration complete<span style="font-weight:400"> — your server is migrated and running on Linode.</span></div>';
   }
 
   // Method header banner: distinct colours so the method is obvious at a glance
   // (amber = file transfer, green = local disk, blue = separate volume).
   h+=(m.boot_target==='file')
-    ? '<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05;margin:0 0 10px"><b>File transfer</b>'+((m.linode_type)?(' — new '+esc(m.linode_type)+' Linode'+(m.os_image?(' running '+esc(m.os_image)):'')):'')+'</div>'
+    ? '<div class="banner warn" style="margin:0 0 10px"><b>File transfer</b>'+((m.linode_type)?(' — new '+esc(m.linode_type)+' Linode'+(m.os_image?(' running '+esc(m.os_image)):'')):'')+'</div>'
     : (m.boot_target==='disk')
-    ? '<div class="banner" style="border-color:#cde8d8;background:#f1faf4;color:#0f5c30;margin:0 0 10px"><b>Boot: Linode local disk</b>'+((m.linode_type)?(' — '+esc((m.plan_class||'')+' plan '+m.linode_type)):'')+'</div>'
-    : '<div class="banner" style="border-color:#cdd6e8;background:#f3f6fc;color:#22408a;margin:0 0 10px"><b>Boot: separate Block Storage volume</b>'+((m.linode_type)?(' — plan '+esc(m.linode_type)):'')+'</div>';
+    ? '<div class="banner ok" style="margin:0 0 10px"><b>Boot: Linode local disk</b>'+((m.linode_type)?(' — '+esc((m.plan_class||'')+' plan '+m.linode_type)):'')+'</div>'
+    : '<div class="banner info" style="margin:0 0 10px"><b>Boot: separate Block Storage volume</b>'+((m.linode_type)?(' — plan '+esc(m.linode_type)):'')+'</div>';
 
   h+='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+statusLegend()+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
     '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_ip||m.source_hostname||'-')+'</span></td>'+
@@ -1140,16 +1251,16 @@ function migCard(v){
   b+=destPanel(v,m);
 
   if(['image_ready','launched'].includes(m.state) && m.boot_target==='file'){
-    b+='<div class="banner">✔ <b>Migration completed.</b> '+
+    b+='<div class="banner ok">✔ <b>Migration completed.</b> '+
        (m.launched_linode_id?('Your files were copied onto Linode '+esc(m.launched_linode_id)+' ('+esc(m.linode_type||'plan')+'), which rebooted into your migrated system — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a> and connect via Lish. No separate volume is used.')
        :'Your files were copied onto the destination Linode, which is rebooting into your migrated system.')+'</div>';
   } else if(['image_ready','launched'].includes(m.state) && m.boot_target==='disk'){
-    b+='<div class="banner">✔ <b>Migration completed.</b> '+
+    b+='<div class="banner ok">✔ <b>Migration completed.</b> '+
        (m.launched_linode_id?('Launched Linode '+esc(m.launched_linode_id)+' booting from its <b>local disk</b> ('+esc(m.linode_type||'plan')+') — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a> and connect via Lish. No separate volume is kept.')
        :'The image is ready to boot from the instance’s local disk.')+'</div>';
   } else if(['image_ready','launched'].includes(m.state)){
     const arts=disks(m).map(d=>esc(d.artifact_id||('vmrep-'+m.name+'-img'))).join(', ');
-    b+='<div class="banner">✔ <b>Migration completed.</b> '+disks(m).length+' image volume(s) in your Linode account ('+
+    b+='<div class="banner ok">✔ <b>Migration completed.</b> '+disks(m).length+' image volume(s) in your Linode account ('+
        '<a href="https://cloud.linode.com/volumes" target="_blank" rel="noopener">cloud.linode.com/volumes</a>): <code style="display:inline;padding:1px 5px">'+arts+'</code>. '+
        (m.launched_linode_id?('Launched Linode '+esc(m.launched_linode_id)+' — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a>.')
        :'To launch manually: create a Linode (same region), attach these volumes (boot disk = <b>sda</b>, data = sdb…), then add a config. If the boot disk has a <b>partition table + GRUB</b>, use kernel <code style="display:inline;padding:1px 5px">GRUB 2</code>; if it is a <b>partitionless whole-disk filesystem</b>, use a <b>Linode kernel</b> (e.g. “Latest 64-bit”) with root <code style="display:inline;padding:1px 5px">/dev/sda</code>. Then boot. The “Cutover” launch option picks the right kernel for you automatically.')+'</div>';
@@ -1161,7 +1272,7 @@ function migCard(v){
   // instance off; the appliance finishes automatically from there).
   if(m.state==='migrating' && v.cutover_copy_cmd){
     const isFile=m.boot_target==='file';
-    b+='<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05">'+
+    b+='<div class="banner warn">'+
       '<b>Action needed — '+(isFile?'copy your files onto the destination.':'copy the image onto the local disk.')+'</b>'+
       '<div style="margin-top:6px">1. Make sure the <b>source server is powered off</b>.</div>'+
       '<div style="margin-top:4px">2. Open the '+(isFile?'destination':'cutover')+' instance’s <b>Lish console</b>'+(m.launched_linode_id?(' — <a href="https://cloud.linode.com/linodes/'+m.launched_linode_id+'/lish/weblish" target="_blank" rel="noopener">open Weblish</a>'):'')+(isFile?' (log in as root).':' (it is booted in Rescue Mode).')+'</div>'+
@@ -1223,14 +1334,14 @@ function migCard(v){
   // their own aligned line — button positions must never be pushed around by text.
   // Step 1 in progress (drain + freeze): the operator must NOT power off yet.
   if(m.state==='migrating' && v.cutover_freezing){
-    b+='<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05">'+
+    b+='<div class="banner warn">'+
       '<b>'+(file?'Finishing the last file-copy pass':'Preparing &amp; validating the boot image')+' — keep the source server running.</b>'+
       '<div style="margin-top:6px">'+(file?'The appliance is waiting for the file-copy pass currently in flight to finish, so the copied files carry your latest changes':'The appliance is finishing the last replication pass, then converting the boot image and checking it is bootable — all BEFORE you power off, so any problem surfaces while the source is still running')+' (this can take a few minutes on a large '+(file?'filesystem':'disk')+').</div>'+
       '<div style="margin-top:4px">This card will tell you when it is safe to power off the source — <b>do not power it off yet</b>.</div></div>';
   }
   // Step 1 done: NOW the operator powers the source off, then launches.
   if(m.state==='awaiting_cutover'){
-    b+='<div class="banner" style="border-color:#f2ddba;background:#fdf6ea;color:#7a4d05">'+
+    b+='<div class="banner warn">'+
       '<b>Action needed — it is now safe to power off the source server.</b>'+
       '<div style="margin-top:6px">✓ <b>Step 1 done</b> — replication is stopped and '+(file?'the copied files are held for launch':'the boot image has been <b>converted and validated as bootable</b>')+'.</div>'+
       '<div style="margin-top:4px"><b>Step 2 — now:</b> <b>power off the source server</b> (so the old and new machines aren’t both running at once).</div>'+
@@ -1395,5 +1506,30 @@ async function init(){
   catch(e){show('login')}
 }
 init();
+
+/* ---- Appearance -----------------------------------------------------------
+   Three states, cycling auto -> light -> dark. "Auto" follows the operating
+   system; without it, someone who picks Light on a dark-mode machine has no way
+   back to following the system. "auto" is stored as the ABSENCE of the key, so
+   the CSS prefers-color-scheme block applies untouched.
+   The key is shared with /documentation (same origin) so one choice themes both.
+   Every localStorage access is guarded: it throws outright in some privacy
+   configurations, and an uncaught error would break the rest of this script. */
+function themePref(){
+  try{ var t=localStorage.getItem('vmrepl-theme'); return (t==='dark'||t==='light')?t:'auto'; }
+  catch(e){ return 'auto'; }
+}
+function applyTheme(pref){
+  if(pref==='auto') delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme=pref;
+  try{ pref==='auto' ? localStorage.removeItem('vmrepl-theme') : localStorage.setItem('vmrepl-theme',pref); }catch(e){}
+  var b=$('themebtn');
+  if(b) b.textContent = pref==='auto' ? 'Auto' : (pref==='light' ? 'Light' : 'Dark');
+}
+function cycleTheme(){
+  var order={auto:'light',light:'dark',dark:'auto'};
+  applyTheme(order[themePref()]||'auto');
+}
+applyTheme(themePref());
 </script>
 </body></html>`
