@@ -34,9 +34,10 @@ replctl:
 test: test-scripts
 	$(GO) test ./...
 
-# Shell-level unit tests for the conversion helpers (no root / block devices).
+# Shell-level unit tests (no root / block devices / network).
 test-scripts:
 	bash scripts/machine-convert-test.sh
+	bash scripts/install-replication-server-test.sh
 
 vet:
 	$(GO) vet ./...

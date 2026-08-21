@@ -217,7 +217,7 @@ sudo scripts/install-replication-server.sh</pre><button class="copy" onclick="cp
    AB:CD:...:EF</pre></div></li>
 <li>Keep that output — the password is also saved on the server at <code>/var/lib/vm-repl/initial-admin-password.txt</code>.</li>
 </ol>
-<div class="adm"><span class="t">Note</span>Useful installer flags: <code>--public-host &lt;ip&gt;</code> (if auto-detection picks the wrong address), <code>--region us-ord</code>, <code>--port 8080</code>.</div>
+<div class="adm"><span class="t">Note</span>Useful installer flags: <code>--public-host &lt;ip&gt;</code> (if auto-detection picks the wrong address), <code>--region &lt;region&gt;</code> and <code>--port &lt;port&gt;</code> — both are only needed to <i>override</i> the defaults. The region is detected from the Linode Metadata service, and the port defaults to 8080. Once set, region and port are stored in <code>/etc/vm-repl/applianced.env</code>; re-running the installer to upgrade refreshes the service without overwriting them, so edit that file (then <code>systemctl restart applianced</code>) to change them later.</div>
 </section>
 
 <section id="sign-in">
