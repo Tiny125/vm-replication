@@ -161,7 +161,7 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 				}
 				switch {
 				case st.Complete && !wasBaselined:
-					_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("file copy complete: %d items (%s) staged for %s — ready to cut over", st.BlocksWritten, humanBytes(st.BytesOnWire), dev0))
+					_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("file copy complete: %d items (%s) staged for %s — ready to cut over. The destination now carries the source's users, passwords and SSH keys — log in with the SOURCE's credentials from here on, not the root password you set when creating it. Its kernel, boot files and network config stay its own until cutover.", st.BlocksWritten, humanBytes(st.BytesOnWire), dev0))
 				case !st.Complete:
 					_ = s.st.AddEvent(s.ctx, migID, "warn", fmt.Sprintf("the file copy pass ended before the whole source tree was walked (%d items, %s) — the copy is NOT complete; the agent retries on its next pass (~60s)", st.BlocksWritten, humanBytes(st.BytesOnWire)))
 				}

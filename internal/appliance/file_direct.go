@@ -675,7 +675,7 @@ func (s *Server) recordDirectFilePass(migID, diskID int64, dev0 string, h protoc
 	switch {
 	case h.LastPassComplete && !wasBaselined:
 		_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf(
-			"file copy complete: %d items (%s) copied to the destination %s — ready to cut over",
+			"file copy complete: %d items (%s) copied to the destination %s — ready to cut over. The destination now carries the source's users, passwords and SSH keys — log in with the SOURCE's credentials from here on, not the root password you set when creating it. Its kernel, boot files and network config stay its own until cutover.",
 			h.LastPassEntries, humanBytes(h.LastPassBytes), d.ip))
 	case !h.LastPassComplete:
 		_ = s.st.AddEvent(s.ctx, migID, "warn", fmt.Sprintf(

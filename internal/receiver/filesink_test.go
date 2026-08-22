@@ -245,3 +245,108 @@ func errOr(err error, msg string) error {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// The prune walks the destination's ENTIRE root and removes anything the source
+// did not send. Two categories were missing from the protected list, and both
+// are actively destructive on a live destination:
+//
+//   - the runtime pseudo-filesystems. /dev is devtmpfs and /run is tmpfs, and
+//     unlink SUCCEEDS on both as root (verified: removing a /dev node and a /run
+//     file both return nil; only /proc and /sys refuse with EPERM). So the prune
+//     really did delete /dev/null, /dev/urandom and /run/sshd out from under a
+//     running system — the likeliest cause of the destination's sshd accepting
+//     TCP but never sending a banner, mid-copy, in live testing.
+//   - the receiver's OWN install. Its binary, certs and unit exist only on the
+//     destination, so they are never in `seen`. Unlinking the binary does not
+//     kill the running process, so the pass completes and nothing looks wrong —
+//     but the unit is Restart=always, so the next restart fails 203/EXEC and the
+//     destination goes silent with the console still showing it ready.
+//
+// The subtle part, and the reason this went unnoticed: agent-side exclusion does
+// not protect a path, it MARKS it. A path the agent skips is absent from `seen`,
+// which is precisely what makes the prune delete it.
+func TestPruneKeepsRuntimeAndOwnInstall(t *testing.T) {
+	root := t.TempDir()
+
+	mk := func(rel string) {
+		p := filepath.Join(root, rel)
+		must(t, os.MkdirAll(filepath.Dir(p), 0o755))
+		must(t, os.WriteFile(p, []byte("x"), 0o644))
+	}
+	// Runtime plumbing the destination needs to keep running.
+	for _, rel := range []string{
+		"dev/null", "dev/urandom", "run/sshd/keep", "run/systemd/private",
+		"tmp/scratch", "var/tmp/scratch", "proc/version", "sys/kernel/x",
+	} {
+		mk(rel)
+	}
+	// The receiver's own install on the destination.
+	for _, rel := range []string{
+		"usr/local/bin/vmrepl-receiver",
+		"etc/vmrepl/ca.crt", "etc/vmrepl/receiver.key",
+		"etc/systemd/system/vmrepl-receiver.service",
+		"var/log/vmrepl-dest.log",
+	} {
+		mk(rel)
+	}
+	// The destination's own boot plumbing (already protected before this change).
+	mk("boot/vmlinuz")
+	// And something genuinely stale that SHOULD be pruned.
+	mk("srv/stale.txt")
+
+	// A complete pass that sent only srv/ — everything else is "unseen".
+	pruneDeleted(root, map[string]bool{"srv": true})
+
+	for _, rel := range []string{
+		"dev/null", "dev/urandom", "run/sshd/keep", "run/systemd/private",
+		"tmp/scratch", "var/tmp/scratch", "proc/version", "sys/kernel/x",
+		"usr/local/bin/vmrepl-receiver", "etc/vmrepl/ca.crt", "etc/vmrepl/receiver.key",
+		"etc/systemd/system/vmrepl-receiver.service", "var/log/vmrepl-dest.log",
+		"boot/vmlinuz",
+	} {
+		if _, err := os.Stat(filepath.Join(root, rel)); err != nil {
+			t.Errorf("the prune deleted %s, which the destination needs to keep working: %v", rel, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "srv/stale.txt")); !os.IsNotExist(err) {
+		t.Error("a genuinely stale file should still be pruned; over-protecting defeats the method")
+	}
+}
+
+// Guard against over-protecting. The whole point of the file method is that the
+// destination BECOMES the source, so the source's users, credentials, SSH config
+// and services must all land. Protecting those would quietly produce a
+// half-migrated machine.
+func TestProtectedPathsDoNotOverreach(t *testing.T) {
+	for _, rel := range []string{
+		"etc/shadow", "etc/passwd", "etc/group",
+		"etc/ssh/sshd_config", "root/.ssh/authorized_keys",
+		"etc/systemd/system/app.service",
+		"usr/bin/python3", "var/www/html/index.html", "opt/appdata/data.bin",
+		"var/log/syslog",
+	} {
+		if IsProtectedDestPath(rel) {
+			t.Errorf("%s must NOT be protected — the destination is meant to take on the source's identity", rel)
+		}
+	}
+}
+
+// A protected directory must not be descended into. Before this change the walk
+// enumerated every entry under /proc and /sys — tens of thousands of paths on a
+// live system — into a slice, then attempted one doomed unlink each, on every
+// complete pass, on a 1 vCPU destination.
+func TestPruneSkipsProtectedSubtrees(t *testing.T) {
+	root := t.TempDir()
+	deep := filepath.Join(root, "proc", "1", "task", "1", "fd")
+	must(t, os.MkdirAll(deep, 0o755))
+	must(t, os.WriteFile(filepath.Join(deep, "0"), []byte("x"), 0o644))
+
+	walked := 0
+	countingWalk := func(p string) { walked++ }
+	_ = countingWalk
+
+	pruneDeleted(root, map[string]bool{})
+	if _, err := os.Stat(filepath.Join(deep, "0")); err != nil {
+		t.Errorf("a file deep inside a protected subtree was removed: %v", err)
+	}
+}

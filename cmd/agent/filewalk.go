@@ -18,6 +18,7 @@ import (
 
 	"github.com/tiny125/vm-replication/internal/api"
 	"github.com/tiny125/vm-replication/internal/protocol"
+	"github.com/tiny125/vm-replication/internal/receiver"
 	"github.com/tiny125/vm-replication/internal/transport"
 )
 
@@ -121,33 +122,22 @@ func fileHello(c cfg, last filePassState) protocol.Hello {
 }
 
 // excludedFromFileCopy reports whether a source-relative path must NOT be
-// copied: virtual/pseudo filesystems, transient dirs, the destination's own
-// boot/kernel/network plumbing (it keeps booting on its native OS), and the
-// agent's own install. These mirror the receiver's isProtectedDestPath backstop.
+// copied. It delegates to receiver.IsProtectedDestPath so the agent's exclusions
+// and the receiver's delete-pass protections are ONE list.
+//
+// They must be the same list, because excluding a path here does not merely fail
+// to copy it — it marks it for DELETION on the destination. An excluded path is
+// never sent, so it is absent from the receiver's `seen` set, and the prune
+// removes everything it does not recognise. Two hand-maintained lists documented
+// as mirroring each other had already drifted apart, which is how the prune came
+// to delete /dev/null, /run/sshd and the receiver's own binary on a live
+// destination.
 func excludedFromFileCopy(rel string) bool {
-	excluded := []string{
-		// Virtual / transient.
-		"proc", "sys", "dev", "run", "tmp", "mnt", "media", "lost+found",
-		"var/tmp", "var/run", "var/lock",
-		// Destination keeps its own kernel + boot + modules.
-		"boot", "vmlinuz", "vmlinuz.old", "initrd.img", "initrd.img.old", "lib/modules",
-		// Destination keeps its own identity + network config.
-		"etc/fstab", "etc/machine-id", "etc/resolv.conf",
-		"etc/netplan", "etc/systemd/network",
-		"etc/NetworkManager/system-connections", "etc/network/interfaces",
-		// The agent's own install (never copy it to the destination).
-		"usr/local/bin/vmrepl-agent", "etc/vm-repl",
-	}
-	for _, e := range excluded {
-		if rel == e || strings.HasPrefix(rel, e+"/") {
-			return true
-		}
-	}
-	// The agent's checkpoints live in /var/lib.
-	if strings.HasPrefix(rel, "var/lib/vmrepl-source-") {
+	if receiver.IsProtectedDestPath(rel) {
 		return true
 	}
-	return false
+	// The agent's own checkpoints, which are specific to the source side.
+	return strings.HasPrefix(rel, "var/lib/vmrepl-source-")
 }
 
 // dialFileSession opens an mTLS connection to target (verifying it against
