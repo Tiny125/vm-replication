@@ -227,14 +227,27 @@ func replicateFiles(c cfg) (syncResult, error) {
 		return res, fmt.Errorf("receiver rejected file session: %s", ack.Message)
 	}
 
-	// The root's device id, so we stay on the root filesystem (don't descend into
-	// other mounted filesystems — those are separate migrations).
-	var rootDev uint64
-	if fi, err := os.Lstat(c.root); err == nil {
-		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-			rootDev = uint64(st.Dev)
-		}
+	// Which filesystems to copy, decided from the MOUNT TABLE rather than from
+	// device numbers.
+	//
+	// The walk used to compare each entry's st_dev against the root's and skip
+	// anything different. That silently dropped every separately mounted
+	// filesystem — a database on a data volume was never copied and nothing said
+	// so — and it also broke btrfs, which gives every SUBVOLUME its own anonymous
+	// st_dev. On a default SLES/openSUSE/Fedora source (btrfs root with /var,
+	// /home, /srv, /opt as subvolumes) the check treated most of the OS as a
+	// foreign filesystem.
+	//
+	// Skipping at MOUNTPOINTS fixes both: an unmounted subvolume is not a
+	// mountpoint so the walk descends into it, while a genuinely separate
+	// filesystem gets an explicit, reportable include/exclude decision.
+	mounts, mErr := readMounts()
+	if mErr != nil {
+		log.Printf("agent: could not read the mount table (%v); copying the walk root only", mErr)
 	}
+	plan := classifyMounts(mounts, c.root, c.excludeGlobs)
+	_, skipAt := includedMountpoints(plan)
+	res.roots = plan
 
 	var entries, bytesWire int64
 	walkErr := filepath.WalkDir(c.root, func(p string, d fs.DirEntry, err error) error {
@@ -259,8 +272,9 @@ func replicateFiles(c cfg) (syncResult, error) {
 		if ierr != nil {
 			return nil
 		}
-		// Stay on the root filesystem: skip anything on a different device.
-		if st, ok := info.Sys().(*syscall.Stat_t); ok && rootDev != 0 && uint64(st.Dev) != rootDev {
+		// Skip AT the mountpoint of a filesystem we decided not to copy. Device
+		// numbers are deliberately not consulted: btrfs subvolumes have their own.
+		if skipAt[rel] {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}

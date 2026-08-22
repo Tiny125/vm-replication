@@ -133,6 +133,26 @@ type Hello struct {
 	LastPassTarget   string `json:"last_pass_target,omitempty"` // host:port the pass was streamed to
 }
 
+// FileRoot describes one filesystem the agent found beneath the walk root, and
+// what it decided to do about it. The agent reports the full inventory — included
+// AND excluded — so the appliance can tell the operator exactly what is and is not
+// being copied.
+//
+// This exists because the alternative is silence. The walk used to stop at
+// filesystem boundaries with nothing recorded, so a database on a mounted volume
+// was skipped and the console still reported the migration complete.
+type FileRoot struct {
+	Path      string `json:"path"` // walk-root-relative mountpoint; "" is the root filesystem
+	FSType    string `json:"fstype,omitempty"`
+	Source    string `json:"source,omitempty"`    // backing device
+	Options   string `json:"options,omitempty"`   // mount options worth reproducing (noexec, nodev, nosuid, ro)
+	Included  bool   `json:"included"`            // false = present but deliberately not copied
+	Reason    string `json:"reason,omitempty"`    // why it was excluded, in operator language
+	Reproduce string `json:"reproduce,omitempty"` // how the destination should recreate it: "bind" | "tmpfs"
+	UsedBytes int64  `json:"used_bytes,omitempty"`
+	Complete  bool   `json:"complete,omitempty"` // this root was fully walked in the pass being reported
+}
+
 // FileEntry is the metadata for one filesystem object in a file-transfer
 // session — the JSON payload of a MsgFileEntry frame.
 //

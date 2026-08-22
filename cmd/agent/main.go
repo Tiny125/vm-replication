@@ -137,7 +137,11 @@ type cfg struct {
 	snapMode, preHook, postHook, lvSize         string
 	cbtMode                                     string
 	cutoverQuiesce                              string
-	dmera                                       dmeraCfg
+	// excludeGlobs lets an operator drop a filesystem the classifier would
+	// otherwise copy, without needing a code change — any heuristic will be wrong
+	// on somebody's machine.
+	excludeGlobs []string
+	dmera        dmeraCfg
 }
 
 type dmeraCfg struct {
@@ -151,6 +155,10 @@ type syncResult struct {
 	startedAt, finishedAt time.Time
 	total, changed, bytes int64
 	deviceSize            int64
+	// roots is the filesystem inventory for a file pass: every filesystem found
+	// beneath the walk root, included AND excluded, so the appliance can tell the
+	// operator exactly what was and was not copied.
+	roots []protocol.FileRoot
 }
 
 // run performs one replication pass. Normally that is a single attempt using the
