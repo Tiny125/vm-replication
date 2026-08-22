@@ -67,8 +67,15 @@ your Block Storage scales with the sources.
 ### Appliance boot disk
 
 Small — binaries, the SQLite DB, certs. **25–50 GB is plenty.** ⚠️ Only if you
-run *without* a Linode token (file-fallback mode) does data land on the boot
-disk; with a token (the normal path) it goes to the volumes.
+run *without* a Linode token (file-fallback mode) does the full replica land on
+the boot disk; with a token (the normal path) it goes to the volumes.
+
+**It is not completely idle during replication, though.** Each delta pass is
+staged to a file in the data directory (`/var/lib/vm-repl`) and applied
+atomically, so an interrupted pass is discarded whole rather than half-written.
+That staging file needs room for the pass's changed bytes, per disk, at the same
+time. The console shows the appliance's free disk in the **This appliance** line
+and warns once in the activity log if it runs short.
 
 ### Block Storage to provision (this is what scales)
 
@@ -156,6 +163,29 @@ entering the password, open the browser's **certificate dialog** and confirm the
 **SHA-256 fingerprint matches** the one the installer printed (also in
 `journalctl -u applianced`). Then sign in with the generated password (also saved
 at `/var/lib/vm-repl/initial-admin-password.txt`).
+
+### This appliance
+
+Above the Linode settings the console shows the replication server's own vCPU
+count, RAM and free disk — one quiet line of fact. Two things make it speak up:
+
+- **Under-spec.** Below the 2 vCPU / 4 GB recommendation above, it says so once.
+  A smaller appliance works, it is just slower, because each in-flight copy does
+  SHA-256 verification at line rate.
+- **Low disk.** If the data directory runs short, the activity log of each active
+  migration gets one warning. It appears once, not on every poll, and clears only
+  when free space is comfortably back.
+
+It is deliberately not a health dashboard. There is no CPU or memory gauge —
+sustained 100% CPU during hashing is the tool working correctly, and there is no
+action to take mid-migration. And it is **not** a validation check: those gate
+cutover, and blocking cutover on low disk would be backwards, since cutting over
+and closing finished migrations is how the space gets freed.
+
+The replication volumes are not metered either, and cannot be: they are attached
+as raw block devices with no filesystem, written at fixed offsets. A volume too
+small for its source is rejected at the first agent handshake, before any data
+lands.
 
 ### Appearance
 

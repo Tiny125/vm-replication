@@ -586,7 +586,22 @@ async function runConnTest(btn){
 
 async function loadSettings(){
   const st=await api('GET','/api/v1/settings');
-  let h='<h2>Linode automation</h2>';
+  // This appliance. One quiet line of fact on a correctly-sized machine; the
+  // amber note appears only when it is under-spec or short of disk, so nothing
+  // ever cries wolf on a healthy setup.
+  let h='';
+  const specs=[];
+  if(st.appliance_vcpus) specs.push(st.appliance_vcpus+' vCPU');
+  if(st.appliance_mem_bytes) specs.push(fmtBytes(st.appliance_mem_bytes)+' RAM');
+  if(st.appliance_disk_known) specs.push('disk '+fmtBytes(st.appliance_disk_free)+' free of '+fmtBytes(st.appliance_disk_total));
+  if(specs.length){
+    h+='<h2>This appliance</h2><div class="muted" style="line-height:1.6">'+esc(specs.join(' · '))+'</div>';
+    if(st.appliance_undersized){
+      h+='<div class="banner warn" style="margin-top:8px">Recommended for replication: <b>2 vCPU / 4 GB</b>. This appliance is smaller, so transfers will be slower — each in-flight copy does SHA-256 verification at line rate. You can resize it in Cloud Manager.</div>';
+    }
+    h+='<div style="height:18px"></div>';
+  }
+  h+='<h2>Linode automation</h2>';
   if(st.linode_token_set){
     h+='<div style="line-height:1.6"><span class="y">✔</span> Linode API token validated &amp; stored.'+
        (st.linode_account?(' Account: <b>'+esc(st.linode_account)+'</b>.'):'')+'<br>'+
@@ -1531,5 +1546,13 @@ function cycleTheme(){
   applyTheme(order[themePref()]||'auto');
 }
 applyTheme(themePref());
+
+/* fmtBytes renders a byte count for the appliance line. */
+function fmtBytes(n){
+  n=Number(n)||0;
+  const u=['B','KB','MB','GB','TB']; let i=0;
+  while(n>=1024&&i<u.length-1){n/=1024;i++}
+  return (i===0?n:n.toFixed(1))+' '+u[i];
+}
 </script>
 </body></html>`

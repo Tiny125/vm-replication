@@ -98,6 +98,9 @@ type Server struct {
 	// that are the ONLY completion signal in direct mode; see file_direct.go.
 	// In-memory by design: full_sync_done is monotonic in the store, so a restart
 	// can at worst re-credit one already-recorded pass.
+	// Host specs of the appliance itself, read once in New(); see health.go.
+	vcpus        int
+	memBytes     int64
 	directPasses sync.Map
 	// Token-gated bootstrap for the destination's receiver install (token ->
 	// *destBootstrap); see file_direct.go.
@@ -142,6 +145,9 @@ func New(ctx context.Context, cfg Config) *Server {
 		ctx:            ctx,
 		auditCh:        make(chan auditEntry, 2048),
 	}
+	// Host specs are read once: neither changes without a reboot, and both are
+	// only used for sizing advice.
+	s.vcpus, s.memBytes = hostSpecs()
 	go s.auditDrain()
 	go s.auditUploader()
 	s.routes()
@@ -334,17 +340,27 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	auditReady, _, _ := s.st.GetSetting(ctx, keyAuditReady)
 	auditErr, _, _ := s.st.GetSetting(ctx, keyAuditErr)
 	bucket, _ := s.auditBucket(ctx)
+	// The console polls this every 5s, so it is also where the disk headroom is
+	// sampled — one statfs, no disk I/O.
+	s.checkDiskHeadroom(ctx)
+	diskFree, diskTotal, diskOK := applianceDiskFree(s.cfg.DataDir)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"linode_token_set":    linodeSet,
-		"linode_account":      account,
-		"appliance_linode_id": s.cfg.ApplianceLinodeID,
-		"public_host":         s.cfg.PublicHost,
-		"region":              s.cfg.Region,
-		"linode_automation":   s.cfg.ApplianceLinodeID != 0,
-		"audit_ready":         auditReady == "1",
-		"audit_bucket":        bucket.Label,
-		"audit_region":        bucket.Region,
-		"audit_error":         auditErr,
+		"appliance_vcpus":      s.vcpus,
+		"appliance_mem_bytes":  s.memBytes,
+		"appliance_disk_free":  diskFree,
+		"appliance_disk_total": diskTotal,
+		"appliance_disk_known": diskOK,
+		"appliance_undersized": applianceUndersized(s.vcpus, s.memBytes),
+		"linode_token_set":     linodeSet,
+		"linode_account":       account,
+		"appliance_linode_id":  s.cfg.ApplianceLinodeID,
+		"public_host":          s.cfg.PublicHost,
+		"region":               s.cfg.Region,
+		"linode_automation":    s.cfg.ApplianceLinodeID != 0,
+		"audit_ready":          auditReady == "1",
+		"audit_bucket":         bucket.Label,
+		"audit_region":         bucket.Region,
+		"audit_error":          auditErr,
 	})
 }
 
@@ -604,6 +620,13 @@ func (s *Server) StartActiveReceivers() {
 			if err := s.ensureReceivers(m); err != nil {
 				log.Printf("appliance: start receivers for migration %d: %v", m.ID, err)
 			}
+			// Say so in the migration's own log. The service restarting mid-copy is
+			// handled correctly but was completely invisible, so an operator who
+			// noticed the gap had no way to tell what had happened. Phrase it as the
+			// reassurance it is: an in-flight pass is discarded WHOLE, never applied
+			// half-way (see receiver.applyStaged).
+			_ = s.st.AddEvent(s.ctx, m.ID, "info",
+				"the appliance service restarted — receivers are back up and replication continues. A copy pass that was in flight was discarded whole (never applied half-way) and the agent retries within ~60s.")
 		}
 	}
 	// File transfer: destination tracking is in-memory, so rebuild the readiness
