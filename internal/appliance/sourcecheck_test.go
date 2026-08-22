@@ -353,3 +353,48 @@ func methodByName(t *testing.T, a api.SourceAssessment, name string) api.MethodA
 	t.Fatalf("assessment has no method %q", name)
 	return api.MethodAssessment{}
 }
+
+// The source check prints its result to the terminal AND posts it back so the
+// console's Source check tab can show it. That delivery used to interpolate the
+// whole pre-quoted pin flag into a shell variable:
+//
+//	PIN="-k --pinnedpubkey 'sha256//AAAA…' "
+//	CURL="curl -fsSL"
+//	[ -n "$PIN" ] && CURL="$CURL $PIN"
+//
+// Shell quote removal does not apply to text arriving through a variable, so
+// curl received --pinnedpubkey with LITERAL single quotes around the value and
+// rejected every pin: "SSL: public key does not match pinned public key". The
+// delivery always failed, the console waited forever, and the script blamed the
+// operator's network — telling them to open firewall ports that were never shut.
+//
+// The enrollment script has always done this correctly: pass the BARE pin and
+// build the flag literally in the script. This asserts the source check matches.
+func TestSourceCheckScriptBuildsPinFlagFromBareValue(t *testing.T) {
+	// The delivery used to interpolate the whole PRE-QUOTED pin flag into a shell
+	// variable and then word-split it:
+	//
+	//	PIN="-k --pinnedpubkey 'sha256//AAAA…' "
+	//	CURL="curl -fsSL"
+	//	[ -n "$PIN" ] && CURL="$CURL $PIN"
+	//
+	// Shell quote removal does not apply to text arriving through a variable, so
+	// curl received --pinnedpubkey with LITERAL single quotes around the value and
+	// rejected every pin ("SSL: public key does not match pinned public key").
+	// Delivery therefore ALWAYS failed against the self-signed console cert: the
+	// Source check tab waited forever, and the script blamed the operator's
+	// network, telling them to open firewall ports that were never shut.
+	//
+	// The enrollment script has always done this correctly — pass the BARE pin and
+	// build the flag literally. This pins the source check to the same shape.
+	if !strings.Contains(sourceCheckScript, `CURL="$CURL -k --pinnedpubkey sha256//$PIN"`) {
+		t.Error("the delivery must build the pin flag literally from the bare pin value")
+	}
+	if strings.Contains(sourceCheckScript, `CURL="$CURL $PIN"`) {
+		t.Error("interpolating a pre-quoted pin flag puts literal quotes in curl's argv; curl then rejects every pin")
+	}
+	// -k must survive: the console certificate is self-signed by design.
+	if !strings.Contains(sourceCheckScript, "-k --pinnedpubkey") {
+		t.Error("the delivery needs -k: the console's certificate is self-signed")
+	}
+}
