@@ -115,7 +115,7 @@ func (s *Server) handleSourceCheckScript(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	base := fmt.Sprintf("%s://%s:%d", s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort)
-	script := fmt.Sprintf(sourceCheckScript, base, tok, s.cfg.PublicHost, chk.probePort, s.curlPinFlag())
+	script := fmt.Sprintf(sourceCheckScript, base, tok, s.cfg.PublicHost, chk.probePort, s.cfg.PublicKeyPin)
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
 	_, _ = w.Write([]byte(script))
 }
@@ -590,8 +590,14 @@ fi
 echo "============================================================="
 echo
 
+# Build the pin flag from the BARE pin value, exactly as the enrollment script
+# does. Interpolating a pre-quoted flag here instead would put literal single
+# quotes into curl's argv — shell quote removal does not apply to text that
+# arrives through a variable — and curl would reject every pin it was given
+# ("SSL: public key does not match pinned public key"), so the result could
+# never be delivered.
 CURL="curl -fsSL"
-[ -n "$PIN" ] && CURL="$CURL $PIN"
+[ -n "$PIN" ] && CURL="$CURL -k --pinnedpubkey sha256//$PIN"
 echo ">> Delivering the result to your migration console…"
 if echo "$REPORT" | $CURL -X POST -H 'Content-Type: application/json' --data-binary @- "$BASE/check/report?token=$TOKEN" >/dev/null 2>&1; then
   echo ">> Delivered. The Source check tab in the console now shows this result too."
