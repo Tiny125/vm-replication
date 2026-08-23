@@ -79,13 +79,31 @@ and warns once in the activity log if it runs short.
 
 ### Block Storage to provision (this is what scales)
 
-> peak Block Storage ≈ **sum of all source disk sizes replicating concurrently**
-> + **the largest single disk again** during its clone at cutover.
+Cutover clones **every** disk, and the clones and the replication volumes exist
+at the same time, so:
 
-Example: migrating one EC2 with 3 EBS volumes of 80 + 200 + 200 GB → ~480 GB of
-volumes during replication, peaking ~680 GB while the 200 GB disk clones. Make
-sure your **account Block Storage quota** covers it (raise it via a support
-ticket if needed).
+> **Separate-volume boot** — peak Block Storage ≈ **2 × the sum of all source
+> disk sizes**; it settles back to **1 ×** once the migration is closed and the
+> replication volumes are released.
+>
+> **Local-disk boot** — peak ≈ **2 × sum − boot disk**, settling at **the data
+> disks only**. The boot disk never gets a clone (it streams straight from its
+> replication volume onto the instance's local disk) and afterwards lives on the
+> plan's own storage at no extra cost.
+
+Example — one EC2 with 3 EBS volumes of 80 + 200 + 200 GB (480 GB total), where
+the 80 GB disk is the boot disk:
+
+| | during replication | peak at cutover | after close |
+|---|---|---|---|
+| Separate-volume boot | 480 GB | **960 GB** | 480 GB |
+| Local-disk boot | 480 GB | **880 GB** | **400 GB** |
+
+Make sure your **account Block Storage quota** covers the peak, and note that
+Linode also caps the **number of active services** on an account — volumes count
+towards it. Both are raised via a support ticket, and it is worth doing *before*
+a large multi-disk migration: a clone refused part-way through cutover fails the
+run.
 
 ### Limits to know
 

@@ -68,22 +68,38 @@ ensure_stage_dir() {
   mkdir -p "$d"
   chmod 700 "$d"
 }
-# dev_on_migrated_disk reports whether $1 is the migrated disk ($DEV) itself or
-# one of its partitions (kernel name or kpartx mapping).
+# migrated_devs prints every disk that came along with this migration, one per
+# line. Local-disk boot now carries data disks beside the boot disk, so the
+# question "did this device get migrated?" is about a SET, not a single disk.
+# MIGRATED_DEVS (space-separated) holds the whole set; it falls back to $DEV
+# alone, which is both the single-disk case and what the swap tests rely on.
+migrated_devs() {
+  local d
+  for d in ${MIGRATED_DEVS:-${DEV:-}}; do
+    [ -n "$d" ] && printf '%s\n' "$d"
+  done
+}
+# dev_on_migrated_disk reports whether $1 is one of the migrated disks itself or
+# one of their partitions (kernel name or kpartx mapping).
 #
 # This is the difference between "this device exists" and "this device came along
 # with the migration". blkid answers from every block device the CONVERTING HOST
 # can see — including the appliance's own disks — so a successful lookup on its
 # own proves nothing.
 dev_on_migrated_disk() {
-  local d="$1" base
-  [ -n "$d" ] && [ -n "${DEV:-}" ] || return 1
-  [ "$d" = "$DEV" ] && return 0
-  base=$(basename "$DEV")
-  case "$d" in
-    "$DEV"[0-9]*|"$DEV"p[0-9]*) return 0 ;;          # /dev/sdc2, /dev/nvme0n1p2
-    "/dev/mapper/$base"[0-9]*|"/dev/mapper/$base"p[0-9]*) return 0 ;;  # kpartx mapping
-  esac
+  local d="$1" dev base
+  [ -n "$d" ] || return 1
+  while IFS= read -r dev; do
+    [ -n "$dev" ] || continue
+    [ "$d" = "$dev" ] && return 0
+    base=$(basename "$dev")
+    case "$d" in
+      "$dev"[0-9]*|"$dev"p[0-9]*) return 0 ;;        # /dev/sdc2, /dev/nvme0n1p2
+      "/dev/mapper/$base"[0-9]*|"/dev/mapper/$base"p[0-9]*) return 0 ;;  # kpartx mapping
+    esac
+  done <<EOF
+$(migrated_devs)
+EOF
   return 1
 }
 # swap_spec_exists reports whether an fstab swap spec resolves to a device that
@@ -100,25 +116,139 @@ dev_on_migrated_disk() {
 # prevent, and the collision is guaranteed on the most common path of all
 # (Linode to Linode).
 swap_spec_exists() {
-  local spec="$1" dev="" pnum cand
+  local spec="$1" dev="" pnum cand mdev
   case "$spec" in
     UUID=*)   dev=$(blkid -U "${spec#UUID=}" 2>/dev/null || true) ;;
     LABEL=*)  dev=$(blkid -L "${spec#LABEL=}" 2>/dev/null || true) ;;
     PARTUUID=*|PARTLABEL=*) dev=$(blkid -t "$spec" -o device 2>/dev/null | head -1 || true) ;;
     /dev/*)
+      # A bare device name does not survive a migration (source /dev/sdc becomes
+      # destination /dev/sdb), so the name itself proves nothing. Look for a swap
+      # signature at the same partition NUMBER on any migrated disk.
       pnum=$(printf '%s' "$spec" | grep -oE '[0-9]+$' || true)
-      if [ -n "$pnum" ] && [ -n "${DEV:-}" ]; then
-        for cand in "${DEV}${pnum}" "${DEV}p${pnum}"; do
-          if [ -b "$cand" ] && [ "$(blkid -s TYPE -o value "$cand" 2>/dev/null)" = "swap" ]; then
-            return 0
-          fi
-        done
+      if [ -n "$pnum" ]; then
+        while IFS= read -r mdev; do
+          [ -n "$mdev" ] || continue
+          for cand in "${mdev}${pnum}" "${mdev}p${pnum}"; do
+            if [ -b "$cand" ] && [ "$(blkid -s TYPE -o value "$cand" 2>/dev/null)" = "swap" ]; then
+              return 0
+            fi
+          done
+        done <<EOF
+$(migrated_devs)
+EOF
       fi
       return 1 ;;
     *) return 0 ;; # unknown spec form — leave it alone
   esac
   # Resolving is not enough: it has to be part of the disk we migrated.
   dev_on_migrated_disk "$dev"
+}
+# fstab_spec_device resolves an fstab spec to the device it names, or prints
+# nothing. It answers "what does this refer to", NOT "was it migrated" — callers
+# must still put the answer through dev_on_migrated_disk.
+fstab_spec_device() {
+  local spec="$1"
+  case "$spec" in
+    UUID=*)      blkid -U "${spec#UUID=}" 2>/dev/null || true ;;
+    LABEL=*)     blkid -L "${spec#LABEL=}" 2>/dev/null || true ;;
+    PARTUUID=*|PARTLABEL=*) blkid -t "$spec" -o device 2>/dev/null | head -1 || true ;;
+    /dev/*)      printf '%s\n' "$spec" ;;
+    *)           : ;;   # UUID-less forms, network shares, pseudo filesystems
+  esac
+}
+# fstab_entry_action decides what to do with ONE non-root fstab entry, given its
+# spec and filesystem type. Three outcomes:
+#
+#   keep    the spec resolves onto a disk that came with the migration — leave
+#           the line exactly as it is
+#   nofail  it is a local block device that resolves nowhere on the migrated set
+#           — the mount cannot succeed, so let the machine boot without it
+#   skip    not ours to touch (network shares, pseudo filesystems, swap)
+#
+# Measured rationale for `nofail` (E7, 2026-08-23): a data entry that cannot
+# resolve does NOT drop the machine to emergency mode as we assumed. On Ubuntu
+# 24.04 the machine boots, SSH comes up and `systemctl --failed` is empty, but
+# `local-fs.target` never activates, boot stalls 90s on a device timeout, the
+# system sits in `maintenance`, and the mountpoint is an empty directory on the
+# root filesystem. The empty-directory hazard is therefore present with or
+# without `nofail`; `nofail` only removes the stall and the degraded state. What
+# actually protects the operator is being TOLD — see the vmrepl-fstab marker.
+fstab_entry_action() {
+  local spec="$1" fstype="$2" dev
+  case "$fstype" in
+    # swap has its own dedicated handling in disable_stale_swap; two functions
+    # rewriting the same lines would fight each other.
+    swap) echo skip; return 0 ;;
+    nfs|nfs4|cifs|smbfs|smb3|glusterfs|ceph|fuse.*|sshfs|9p|virtiofs) echo skip; return 0 ;;
+    tmpfs|proc|procfs|sysfs|devpts|devtmpfs|debugfs|securityfs|cgroup|cgroup2|overlay|squashfs|autofs|mqueue|hugetlbfs|configfs|tracefs|bpf|pstore|efivarfs|ramfs|none)
+      echo skip; return 0 ;;
+  esac
+  # Network shares are also recognisable by their spec, whatever the fstype says.
+  case "$spec" in
+    *:/*|//*) echo skip; return 0 ;;
+  esac
+  dev=$(fstab_spec_device "$spec")
+  if [ -n "$dev" ] && dev_on_migrated_disk "$dev"; then
+    echo keep
+  else
+    echo nofail
+  fi
+}
+# fix_data_fstab makes the DATA mounts of a migrated machine safe to boot with.
+#
+# It never touches the root entry: a root that silently does not mount is not a
+# bootable machine, and there is no degraded mode worth having there. For every
+# other local block-device entry it applies fstab_entry_action; unverifiable
+# entries gain `nofail` plus a bounded device timeout, and the original line is
+# preserved above them as a `# vmrepl:` comment so the operator can see exactly
+# what changed and put it back.
+#
+# It prints a machine-readable summary line for the appliance to parse:
+#   vmrepl-fstab: verified=<n> adjusted=<n> mounts=<mountpoint,mountpoint,...>
+# where `mounts` lists ONLY the adjusted ones — those are what the operator has
+# to hear about before powering the source off.
+fix_data_fstab() {
+  local fstab="$1"
+  [ -f "$fstab" ] || return 0
+  local tmp="$fstab.vmrepl-fstab-tmp" line spec mp fstype opts rest
+  local action changed=0 verified=0 adjusted=0 adjusted_mounts=""
+  : > "$tmp"
+  while IFS= read -r line; do
+    case "$line" in
+      \#*|"") printf '%s\n' "$line" >> "$tmp"; continue ;;
+    esac
+    spec=$(printf '%s' "$line" | awk '{print $1}')
+    mp=$(printf '%s' "$line" | awk '{print $2}')
+    fstype=$(printf '%s' "$line" | awk '{print $3}')
+    opts=$(printf '%s' "$line" | awk '{print $4}')
+    # The root filesystem is never rewritten.
+    if [ "$mp" = "/" ]; then
+      printf '%s\n' "$line" >> "$tmp"; continue
+    fi
+    action=$(fstab_entry_action "$spec" "$fstype")
+    case "$action" in
+      skip) printf '%s\n' "$line" >> "$tmp" ;;
+      keep) verified=$((verified + 1)); printf '%s\n' "$line" >> "$tmp" ;;
+      nofail)
+        # Already tolerant? Then it cannot stall the boot; leave it be.
+        case ",$opts," in
+          *,nofail,*) verified=$((verified + 1)); printf '%s\n' "$line" >> "$tmp"; continue ;;
+        esac
+        rest=$(printf '%s' "$line" | awk '{for(i=5;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":"")}')
+        printf '# vmrepl: could not verify this device on the migrated disks; added nofail: %s\n' "$line" >> "$tmp"
+        printf '%s %s %s %s %s\n' "$spec" "$mp" "$fstype" "${opts},nofail,x-systemd.device-timeout=30s" "$rest" >> "$tmp"
+        adjusted=$((adjusted + 1)); changed=1
+        adjusted_mounts="${adjusted_mounts}${adjusted_mounts:+,}${mp}"
+        log "WARNING: fstab entry '$spec' at $mp could not be resolved on any migrated disk — added nofail so the migrated machine still boots, but $mp will NOT be mounted"
+        ;;
+    esac
+  done < "$fstab"
+  if [ "$changed" = 1 ]; then
+    cat "$tmp" > "$fstab"
+  fi
+  rm -f "$tmp"
+  printf 'vmrepl-fstab: verified=%s adjusted=%s mounts=%s\n' "$verified" "$adjusted" "$adjusted_mounts"
 }
 # disable_stale_swap comments out fstab swap entries whose device did NOT come
 # along with the migration (typically a SEPARATE swap disk — clouds attach one
@@ -210,6 +340,20 @@ trap cleanup EXIT
 # canonical device so partition re-read and node names are predictable.
 DEV="$(readlink -f "$DEV" 2>/dev/null || echo "$DEV")"
 [ -b "$DEV" ] || { echo "$DEV is not a block device"; exit 1; }
+# MIGRATED_DEVS lists every disk in this migration (the appliance passes it for
+# multi-disk cutovers). Canonicalise each the same way, so comparisons against
+# blkid output — which always reports /dev/sdX — actually match. Missing or
+# empty, it falls back to $DEV alone: the single-disk case.
+if [ -n "${MIGRATED_DEVS:-}" ]; then
+  _mdevs=""
+  for _d in $MIGRATED_DEVS; do
+    _r="$(readlink -f "$_d" 2>/dev/null || echo "$_d")"
+    [ -b "$_r" ] && _mdevs="${_mdevs}${_mdevs:+ }${_r}"
+  done
+  MIGRATED_DEVS="$_mdevs"
+  unset _mdevs _d _r
+  log "migrated disks: ${MIGRATED_DEVS:-none}"
+fi
 
 # Shrink-only mode (disk-mode cutover). The appliance calls this AFTER it has
 # created the instance's local disk, so the shrink can be sized to the real disk
@@ -473,6 +617,14 @@ log "Root filesystem UUID: $ROOT_UUID"
 # Disable fstab swap entries whose device didn't come along with the migration
 # (e.g. a separate cloud swap disk) — left active they stall every boot ~90s.
 disable_stale_swap "$MNT/etc/fstab"
+
+# Make the DATA mounts safe to boot with. Entries that resolve onto a migrated
+# disk are left exactly as they are; ones that cannot be matched get nofail, so
+# the machine comes up reachable instead of stalling 90s on a device timeout and
+# landing in `maintenance` with local-fs.target dead. The marker line this prints
+# is parsed by the appliance and shown to the operator BEFORE they power the
+# source off — that warning, not the rewrite, is what actually protects them.
+fix_data_fstab "$MNT/etc/fstab"
 
 # Stage the conversion steps inside the chroot. The image must have a /root to
 # stage into — a heavy fsck repair can have dropped it (see ensure_stage_dir).

@@ -184,9 +184,10 @@ func TestConsoleFileCutoverOmitsBlockFields(t *testing.T) {
 	if !strings.Contains(js, "if(!file){") {
 		t.Error("cutover dialog must gate its optional fields behind !file")
 	}
-	// The vol_name field must be doubly gated (volume-boot only).
-	if !strings.Contains(js, "if(!disk)fields.push({id:'vol_name'") {
-		t.Error("vol_name field must be present for volume boot")
+	// The vol_name field must stay gated: never for file (no volume exists), and
+	// for local-disk boot only when there are DATA disks to clone into volumes.
+	if !strings.Contains(js, "if(!disk||nDisks>1)fields.push({id:'vol_name'") {
+		t.Error("vol_name must be offered for volume boot and for multi-disk local-disk boot, but not for file or single-disk local boot")
 	}
 	// The credential note (access) must be suppressed for file.
 	if !strings.Contains(js, "html:how+(file?'':access)+prep") {

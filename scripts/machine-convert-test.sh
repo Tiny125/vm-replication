@@ -198,3 +198,123 @@ echo "ok  machine-convert.sh helpers (ensure_dir_mount, ensure_stage_dir)"
 # the shrink rather than silently skipping and failing the copy later.
 [ "$(shrink_decision 0 51184 51200)" = "shrink" ] \
   || fail "an unknown filesystem size must attempt the shrink, not skip"
+
+# 12) MULTI-DISK RESOLUTION. Local-disk boot now carries data disks alongside the
+#     boot disk, so "did this device come along with the migration?" stops being
+#     a question about ONE disk. dev_on_migrated_disk must answer against the
+#     whole migrated SET, while still defaulting to $DEV alone when no set is
+#     given (which is what keeps the single-disk swap tests above honest).
+DEV=/dev/sdc
+unset MIGRATED_DEVS
+dev_on_migrated_disk /dev/sdc  || fail "the migrated disk itself must count"
+dev_on_migrated_disk /dev/sdc2 || fail "a partition of the migrated disk must count"
+dev_on_migrated_disk /dev/sdd  && fail "an unrelated disk must NOT count when no set is configured"
+
+# With a set, every member and their partitions count -- and nothing else does.
+MIGRATED_DEVS="/dev/sdc /dev/sdd"
+dev_on_migrated_disk /dev/sdc   || fail "first member of the migrated set must count"
+dev_on_migrated_disk /dev/sdd   || fail "second member of the migrated set must count"
+dev_on_migrated_disk /dev/sdd3  || fail "a partition of a data disk in the set must count"
+dev_on_migrated_disk /dev/sdc1  || fail "a partition of the boot disk must count"
+dev_on_migrated_disk /dev/sde   && fail "a disk outside the set must NOT count"
+dev_on_migrated_disk /dev/sde1  && fail "a partition of a disk outside the set must NOT count"
+dev_on_migrated_disk /dev/mapper/sdd2 || fail "a kpartx mapping of a set member must count"
+unset MIGRATED_DEVS
+
+# 13) fstab_spec_device: resolve each spec form to a device. This is the
+#     extraction of the logic swap_spec_exists already had, generalised so it
+#     can serve ANY fstab entry rather than only swap.
+DEV=/dev/sdc
+MIGRATED_DEVS="/dev/sdc /dev/sdd"
+blkid() {
+  case "$*" in
+    "-U 11111111-1111-1111-1111-111111111111") echo /dev/sdd1; return 0 ;;  # on the migrated set
+    "-U 99999999-9999-9999-9999-999999999999") echo /dev/sde1; return 0 ;;  # HOST disk, not migrated
+    "-L datalabel") echo /dev/sdd2; return 0 ;;
+    "-t PARTUUID=aaaa-bbbb -o device") echo /dev/sdd3; return 0 ;;
+    *) return 2 ;;
+  esac
+}
+[ "$(fstab_spec_device 'UUID=11111111-1111-1111-1111-111111111111')" = /dev/sdd1 ] \
+  || fail "fstab_spec_device must resolve UUID="
+[ "$(fstab_spec_device 'LABEL=datalabel')" = /dev/sdd2 ] \
+  || fail "fstab_spec_device must resolve LABEL="
+[ "$(fstab_spec_device 'PARTUUID=aaaa-bbbb')" = /dev/sdd3 ] \
+  || fail "fstab_spec_device must resolve PARTUUID="
+[ "$(fstab_spec_device '/dev/sdd4')" = /dev/sdd4 ] \
+  || fail "fstab_spec_device must pass a bare device through"
+[ -z "$(fstab_spec_device 'UUID=00000000-0000-0000-0000-000000000000')" ] \
+  || fail "an unresolvable UUID must resolve to nothing"
+
+# 14) fstab_entry_action: the three-way policy. An entry that resolves onto the
+#     migrated set is left EXACTLY as it was; one that resolves nowhere (or only
+#     on the converting host) gets nofail so the destination still boots; and a
+#     non-block filesystem is never touched at all.
+#     Signature: fstab_entry_action <spec> <fstype> -> keep|nofail|skip
+[ "$(fstab_entry_action 'UUID=11111111-1111-1111-1111-111111111111' ext4)" = keep ] \
+  || fail "an entry resolving onto the migrated set must be kept as-is"
+[ "$(fstab_entry_action 'LABEL=datalabel' ext4)" = keep ] \
+  || fail "a LABEL= entry on the migrated set must be kept"
+[ "$(fstab_entry_action 'PARTUUID=aaaa-bbbb' xfs)" = keep ] \
+  || fail "a PARTUUID= entry on the migrated set must be kept"
+[ "$(fstab_entry_action 'UUID=00000000-0000-0000-0000-000000000000' ext4)" = nofail ] \
+  || fail "an entry resolving nowhere must be marked nofail"
+
+# The shared-UUID trap again, now for DATA entries: resolving on the converting
+# host proves nothing. /dev/sde1 is the appliance's own disk, not migrated.
+[ "$(fstab_entry_action 'UUID=99999999-9999-9999-9999-999999999999' ext4)" = nofail ] \
+  || fail "an entry resolving only on the CONVERTING HOST must be marked nofail, not kept"
+
+# Network and virtual filesystems are somebody else's problem -- never rewrite them.
+for fs in nfs nfs4 cifs tmpfs proc sysfs devpts overlay; do
+  [ "$(fstab_entry_action 'whatever' "$fs")" = skip ] \
+    || fail "$fs entries must be left alone entirely"
+done
+# swap keeps its own dedicated handling (disable_stale_swap), not this one.
+[ "$(fstab_entry_action 'UUID=00000000-0000-0000-0000-000000000000' swap)" = skip ] \
+  || fail "swap must be left to disable_stale_swap, not double-handled here"
+
+# 15) fix_data_fstab end to end. Verified entries survive byte-for-byte; a bare
+#     /dev/sdX that resolves onto the migrated set is rewritten to the UUID we
+#     read off it (device names do NOT survive a migration -- source /dev/sdc
+#     becomes destination /dev/sdb -- but the filesystem UUID does); and an
+#     unverifiable entry gains nofail with its original preserved as a comment.
+FSTAB4="$WORK/fstab4"
+cat > "$FSTAB4" <<'EOF'
+# comment stays
+UUID=16829997-c4bf-8fc8-89a5-e49ca9f84956 / ext4 errors=remount-ro 0 1
+UUID=11111111-1111-1111-1111-111111111111 /srv/keep ext4 defaults 0 2
+UUID=00000000-0000-0000-0000-000000000000 /srv/ghost ext4 defaults 0 2
+nfsserver:/export /srv/net nfs defaults 0 0
+EOF
+fix_data_fstab "$FSTAB4" >/dev/null
+grep -q '^# comment stays' "$FSTAB4" || fail "fix_data_fstab must keep comments"
+grep -q '^UUID=11111111.* /srv/keep ext4 defaults 0 2$' "$FSTAB4" \
+  || fail "a verified entry must be left byte-for-byte unchanged"
+grep -q '^nfsserver:/export /srv/net nfs defaults 0 0$' "$FSTAB4" \
+  || fail "an NFS entry must be left untouched"
+grep -qE '^UUID=00000000[^#]*nofail' "$FSTAB4" \
+  || fail "an unverifiable entry must gain nofail"
+grep -q '^# vmrepl: ' "$FSTAB4" \
+  || fail "the original line must be preserved as a commented vmrepl marker"
+
+# The root entry must never be given nofail -- a root that silently does not
+# mount is not a bootable machine, and there is no degraded mode worth having.
+grep -q '^UUID=16829997.* / ext4 errors=remount-ro 0 1$' "$FSTAB4" \
+  || fail "the root entry must never be rewritten"
+
+# 15b) An fstab with nothing to fix is left byte-identical (no gratuitous churn).
+FSTAB5="$WORK/fstab5"
+cat > "$FSTAB5" <<'EOF'
+UUID=16829997-c4bf-8fc8-89a5-e49ca9f84956 / ext4 errors=remount-ro 0 1
+UUID=11111111-1111-1111-1111-111111111111 /srv/keep ext4 defaults 0 2
+EOF
+cp "$FSTAB5" "$FSTAB5.orig"
+fix_data_fstab "$FSTAB5" >/dev/null
+cmp -s "$FSTAB5" "$FSTAB5.orig" || fail "an fstab needing no changes must be untouched"
+
+unset -f blkid
+unset MIGRATED_DEVS
+unset DEV
+
+echo "machine-convert-test: all tests passed"
