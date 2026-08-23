@@ -1249,19 +1249,21 @@ func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration,
 			}
 		}
 		if d.VolumeID != 0 && haveLinode {
-			_ = cl.DetachVolume(ctx, d.VolumeID) // always detach from the appliance
 			if !opts.keepReplVolume {
-				var derr error
-				for i := 0; i < 10; i++ {
-					if derr = cl.DeleteVolume(ctx, d.VolumeID); derr == nil {
-						break
-					}
-					time.Sleep(2 * time.Second)
-				}
-				if derr != nil {
-					log.Printf("appliance: delete volume %d failed (remove it in Cloud Manager): %v", d.VolumeID, derr)
+				// Use detachAndDeleteVolume, which WAITS for the detach to finish
+				// before deleting. This used to fire a detach and then retry the
+				// delete for only 20s; Linode rejects a delete until the detach has
+				// completed ("This volume must be detached before it can be
+				// deleted"), and a detach routinely takes longer than that when
+				// several volumes are released at once — which is exactly what a
+				// multi-disk migration does. The result was that closing a two-disk
+				// migration deleted one volume and left the other detached, active
+				// and BILLING, with the operator told to clean it up by hand.
+				if err := s.detachAndDeleteVolume(ctx, cl, d.VolumeID); err != nil {
+					log.Printf("appliance: delete volume %d failed (remove it in Cloud Manager): %v", d.VolumeID, err)
 				}
 			} else {
+				_ = cl.DetachVolume(ctx, d.VolumeID) // detach but keep, for reference
 				log.Printf("appliance: migration %d: replication volume %d detached and kept for reference", m.ID, d.VolumeID)
 			}
 		} else if isFileMethod(m.BootTarget) {
