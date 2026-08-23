@@ -80,7 +80,7 @@ but get no automatic repair pass.
 - **Crash-consistent cutover** via LVM point-in-time snapshot (falls back to a live read + warning when no snapshot mechanism exists).
 - **Automated boot conversion** for Linode: virtio initramfs, GRUB reinstall (or Linode-kernel boot for partitionless disks), `fsck`, Lish serial console, fresh machine-id, and a **DHCP network reset** (strips the source's static IP/DNS config so the new instance gets its own Linode IP).
 - **Console/SSH access seeding** at cutover (set a root password and/or install an SSH key so the launched instance is reachable).
-- **Choice of boot target and plan** at create time: a **separate Block Storage volume** (default), or the Linode's **local disk** (NVMe — faster, no separate volume cost, single-disk only). Either way you pick the launch plan from a Shared/Dedicated list (local-disk offers only plans whose disk fits); the volume option shows the estimated monthly Block Storage cost alongside the plan price.
+- **Choice of boot target and plan** at create time: a **separate Block Storage volume** (default), or the Linode's **local disk** (NVMe — faster, and the boot disk costs nothing beyond the plan). Local-disk boot is **multi-disk**: the first disk becomes the instance's own local disk and every further disk is cloned into a Block Storage volume attached to the same instance (up to 7 of them — `sda` holds the boot disk, leaving `sdb`–`sdh`). Either way you pick the launch plan from a Shared/Dedicated list; local-disk boot only needs a plan whose disk fits the **boot** disk, and both options show the estimated monthly Block Storage cost alongside the plan price.
 - **Reboot-based cutover** that launches a new Linode from the replicated image.
 
 ## What it does **not** support
@@ -91,7 +91,6 @@ but get no automatic repair pass.
 - **Application- or database-aware migration.** It moves the whole disk image, not individual apps/DBs. Use the optional quiesce **pre/post hooks** for app-consistent snapshots if needed.
 - **Encrypted root (LUKS).** Encrypted blocks replicate, but the conversion can't unlock/mount the root to fix it up — needs manual handling.
 - **Automatic repair for btrfs / ZFS roots** (no `fsck` pass; replication still works, boot fixup is best-effort).
-- **Multi-disk with local-disk boot.** Local-disk boot supports a **single disk**; multi-disk migrations must use Separate-volume boot.
 
 ---
 

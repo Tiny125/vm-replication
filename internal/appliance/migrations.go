@@ -43,6 +43,26 @@ func (s *Server) diskDevicePath(m api.Migration, d api.Disk) string {
 	return filepath.Join(s.cfg.DataDir, fmt.Sprintf("migration-%d-disk%d.img", m.ID, d.Index))
 }
 
+// migratedDevicePaths lists every disk that came along with this migration, as
+// a space-separated string for machine-convert.sh's MIGRATED_DEVS.
+//
+// The convert script needs the whole SET, not just the boot disk: an fstab entry
+// for a data mount resolves onto a data disk, and checking it against the boot
+// disk alone would mark every data mount unverifiable. Paths may be
+// /dev/disk/by-id/... symlinks; the script canonicalises them.
+func (s *Server) migratedDevicePaths(m api.Migration) string {
+	if isFileMethod(m.BootTarget) {
+		return "" // no block devices involved
+	}
+	paths := make([]string, 0, len(m.Disks))
+	for _, d := range m.Disks {
+		if p := s.diskDevicePath(m, d); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return strings.Join(paths, " ")
+}
+
 // fileStageRoot is where a file-transfer migration's copied tree is staged on
 // the appliance before it is delivered to the launched destination at cutover.
 func (s *Server) fileStageRoot(m api.Migration) string {
@@ -639,10 +659,13 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	case api.BootTargetDisk:
-		if len(devices) > 1 {
-			writeErr(w, http.StatusBadRequest, "local-disk boot currently supports a single disk; use Separate-volume boot for multi-disk migrations")
-			return
-		}
+		// Multi-disk local-disk boot: the FIRST disk becomes the instance's own
+		// local disk (free with the plan, NVMe-backed) and every other disk is
+		// cloned into a Block Storage volume attached to the same instance. So
+		// the plan only has to hold the boot disk — see bootDiskBytes. The
+		// overall 8-disk cap checked above is exactly right here: sda for the
+		// local disk plus sdb–sdh for the data volumes.
+		bootBytes := bootDiskBytes(devices)
 		cl, ok := s.linodeClient(ctx)
 		if !ok {
 			writeErr(w, http.StatusBadRequest, "local-disk boot needs a valid Linode API token (to size the plan) — add one in Settings")
@@ -666,23 +689,27 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, http.StatusBadRequest, "the selected plan is not a "+req.PlanClass+" plan — pick one from the list")
 				return
 			}
-			if int64(chosen.DiskMB)*1024*1024 < total {
-				// Name a plan that WOULD fit, and point at the volume method — for a
-				// disk this size the extra Block Storage is usually cheaper than the
-				// jump to the next plan, and the old message never mentioned it.
+			if int64(chosen.DiskMB)*1024*1024 < bootBytes {
+				// Name a plan that WOULD fit. Only the boot disk is measured here:
+				// the data disks become Block Storage and are not constrained by
+				// the plan, so the advice is about the boot disk alone.
 				alt := ""
-				if bigger, ok := linode.ClosestType(types, req.PlanClass, total); ok && bigger.ID != chosen.ID {
+				if bigger, ok := linode.ClosestType(types, req.PlanClass, bootBytes); ok && bigger.ID != chosen.ID {
 					alt = fmt.Sprintf(" The smallest %s plan that fits is %s (%d GB disk).", req.PlanClass, bigger.ID, bigger.DiskMB/1024)
 				}
+				extra := ""
+				if len(devices) > 1 {
+					extra = fmt.Sprintf(" (Only the boot disk %s has to fit the plan — the other %d disk(s) become Block Storage volumes.)", devices[0].Device, len(devices)-1)
+				}
 				writeErr(w, http.StatusBadRequest, fmt.Sprintf(
-					"the selected plan %s has a %d GB local disk, which cannot hold %s of source data.%s If that is more than you want to pay, use Separate-volume boot instead — it sizes Block Storage to your data and is not limited by the plan's disk.",
-					chosen.ID, chosen.DiskMB/1024, humanBytes(total), alt))
+					"the selected plan %s has a %d GB local disk, which cannot hold the %s boot disk.%s%s If that is more than you want to pay, use Separate-volume boot instead — it sizes Block Storage to your data and is not limited by the plan's disk.",
+					chosen.ID, chosen.DiskMB/1024, humanBytes(bootBytes), alt, extra))
 				return
 			}
 		} else {
-			plan, ok := linode.ClosestType(types, req.PlanClass, total)
+			plan, ok := linode.ClosestType(types, req.PlanClass, bootBytes)
 			if !ok {
-				writeErr(w, http.StatusBadRequest, fmt.Sprintf("no %s Linode plan has enough local disk for %s of data — choose a larger source or use Separate-volume boot", req.PlanClass, humanBytes(total)))
+				writeErr(w, http.StatusBadRequest, fmt.Sprintf("no %s Linode plan has enough local disk for the %s boot disk — choose a smaller boot disk or use Separate-volume boot", req.PlanClass, humanBytes(bootBytes)))
 				return
 			}
 			req.LinodeType = plan.ID
@@ -1420,6 +1447,11 @@ type convertOutcome struct {
 	envIssue           bool // missing command / bad conversion environment (not inconsistent data)
 	noRoot             bool // no root/OS filesystem found (wrong source device or incomplete sync)
 	mountIssue         bool // chroot setup failed (a pseudo-fs mount point was not a directory)
+	// fstab is what the convert reported about the migrated machine's DATA
+	// mounts: how many resolved onto the migrated disks, and which mountpoints
+	// had to be marked nofail because they did not.
+	fstab   fstabMarker
+	hasFtab bool
 }
 
 // storeCutoverConvert / takeCutoverConvert cache a guided cutover's phase-1
@@ -1458,6 +1490,12 @@ func (s *Server) convertBootDisk(ctx context.Context, m api.Migration, req api.F
 	// Pass console/SSH access via the environment (not argv) so the secrets don't
 	// show up in `ps`. The script seeds them into the migrated image's root account.
 	cmd.Env = os.Environ()
+	// Tell the convert which disks came along with this migration. Without the
+	// full set it can only check fstab entries against the boot disk, and every
+	// data mount looks unmigrated — see MIGRATED_DEVS in machine-convert.sh.
+	if devs := s.migratedDevicePaths(m); devs != "" {
+		cmd.Env = append(cmd.Env, "MIGRATED_DEVS="+devs)
+	}
 	if req.RootPassword != "" {
 		cmd.Env = append(cmd.Env, "VMREPL_ROOT_PASSWORD="+req.RootPassword)
 	}
@@ -1478,6 +1516,13 @@ func (s *Server) convertBootDisk(ctx context.Context, m api.Migration, req api.F
 	// panics with "unable to mount root fs".
 	if rd := convertField(string(out), "vmrepl-root:"); rd != "" {
 		co.rootDevice = rd
+	}
+	co.fstab, co.hasFtab = parseFstabMarker(string(out))
+	// Surface unverifiable data mounts NOW. In a guided cutover this runs in
+	// phase 1, while the source is still up — the last point at which backing
+	// out costs nothing. A warning after the power-off would be too late to act on.
+	if w := fstabWarning(co.fstab); w != "" {
+		_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: "+w)
 	}
 	if err != nil {
 		co.failed = true
@@ -1575,7 +1620,7 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 			}
 			return
 		}
-		s.finalizeDisk(ctx, m, cl, kernel, rootDevice, cutoverInstanceLabel(req.Label, m.Name))
+		s.finalizeDisk(ctx, m, cl, kernel, rootDevice, cutoverInstanceLabel(req.Label, m.Name), req.VolumeLabel)
 		return
 	}
 
@@ -1730,9 +1775,13 @@ func retryableLinodeErr(err error) bool {
 // appliance's replication volume onto the disk, grows the root, and powers the
 // instance off; the appliance then boots it from the local disk. No clone
 // volume, no reliance on the migrated OS booting from a volume (see
-// cutover_stream.go). Single-disk only (enforced at create time). The boot
-// conversion already ran in finalize().
-func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.Client, kernel, rootDevice, instLabel string) {
+// cutover_stream.go). The boot conversion already ran in finalize().
+//
+// Multi-disk: only the FIRST disk goes onto local storage. Every other disk is
+// cloned into a Block Storage volume and attached at sdb+ by the final config
+// profile, so a whole multi-disk server migrates in one go — root on fast local
+// storage, data on volumes — while the rescue window stays single-disk simple.
+func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.Client, kernel, rootDevice, instLabel, volumeLabel string) {
 	sctx := s.ctx
 	canceled := func() bool { return ctx.Err() != nil }
 	boot := m.Disks[0]
@@ -1869,6 +1918,37 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		return
 	}
 
+	// 3b) Clone the DATA disks into Block Storage volumes. They are attached to
+	//     the instance by the final config profile (see diskBootDeviceMap), so
+	//     the rescue window below stays exactly as it was for a single disk:
+	//     one instance, one writable /dev/sda, one pasted command.
+	//
+	//     The clones are ISSUED here — before rescue — because CloneVolume fails
+	//     synchronously on an account's Block Storage service limit, and finding
+	//     that out after the operator has spent an hour pasting would throw the
+	//     whole copy away (a retry deletes the instance and its local disk).
+	//     Only the WAIT is deferred until after the copy, so the clones hydrate
+	//     during the paste instead of adding their own wall-clock.
+	dataDisks := m.Disks[1:]
+	dataClones := make([]int64, len(dataDisks))
+	for i, d := range dataDisks {
+		label := cutoverVolumeLabelFor(volumeLabel, m.Name, d.Index, len(m.Disks))
+		log.Printf("appliance: migration %d: cloning data disk %d volume %d -> %s", m.ID, d.Index, d.VolumeID, label)
+		clone, err := cl.CloneVolume(ctx, d.VolumeID, label)
+		if canceled() {
+			return
+		}
+		if err != nil {
+			s.fail(m.ID, fmt.Sprintf("clone data disk %d into %s: %v", d.Index, label, err))
+			return
+		}
+		dataClones[i] = clone.ID
+		// Record the artifact immediately, not after the wait: a crash in between
+		// would otherwise orphan a billing volume with nothing pointing at it.
+		_ = s.st.SetDiskArtifact(sctx, d.ID, fmt.Sprintf("volume:%d", clone.ID))
+		_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("data disk %d cloning into volume %q (id %d) — it will be attached when the instance boots", d.Index, label, clone.ID))
+	}
+
 	// 4) Authorize the image download and boot the instance into RESCUE MODE with
 	//    the blank local disk attached as /dev/sda. Rescue (Finnix) always boots
 	//    and never touches the migrated OS: the operator pastes ONE command in
@@ -1936,9 +2016,28 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	s.dropCutoverStream(m.ID) // copy done: kill the token and hide the command now
 	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("image copied onto the local disk in %s; booting from the local disk", time.Since(copyStart).Round(time.Minute)))
 
-	// 6) Boot from the local disk (sda) and confirm it comes up.
-	bootCfg, err := cl.CreateConfig(ctx, inst.ID, "boot-migrated", kernel, rootDevice,
-		map[string]any{"sda": map[string]any{"disk_id": rawDisk.ID}})
+	// 5b) The data clones were issued before rescue and have been hydrating while
+	//     the operator ran the copy, so this usually returns immediately.
+	for i, d := range dataDisks {
+		if _, err := cl.WaitVolumeActive(ctx, dataClones[i], 15*time.Minute); err != nil {
+			if canceled() {
+				return
+			}
+			s.fail(m.ID, fmt.Sprintf("wait data disk %d clone (volume %d) active: %v", d.Index, dataClones[i], err))
+			return
+		}
+	}
+
+	// 6) Boot from the local disk (sda) with the data volumes attached at sdb+.
+	//    Naming a volume in the config profile is what ATTACHES it: a separate
+	//    attach call is refused while the instance is offline or in rescue mode
+	//    ("Couldn't choose a configuration profile to add this volume to").
+	bootDevices, err := diskBootDeviceMap(rawDisk.ID, dataClones)
+	if err != nil {
+		s.fail(m.ID, err.Error())
+		return
+	}
+	bootCfg, err := cl.CreateConfig(ctx, inst.ID, "boot-migrated", kernel, rootDevice, bootDevices)
 	if err != nil {
 		if canceled() {
 			return
@@ -1967,13 +2066,18 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		log.Printf("appliance: migration %d: could not re-enable shutdown watchdog on instance %d: %v", m.ID, inst.ID, err)
 	}
 
-	// No temporary volume was created (the image streamed straight from the
-	// appliance's replication volume), so there is nothing to clean up here.
+	// The BOOT image needed no temporary volume (it streamed straight from the
+	// appliance's replication volume onto local storage). The data clones are
+	// permanent artifacts of the migration and were recorded as they were made.
 	_ = s.st.SetDiskArtifact(sctx, boot.ID, fmt.Sprintf("disk:%d", rawDisk.ID))
 	_ = s.st.SetMigrationImage(sctx, m.ID, fmt.Sprintf("disk:%d", rawDisk.ID), inst.ID)
 	_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
 	_ = s.st.SetMigrateFinished(sctx, m.ID)
-	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %q (id %d) is booting from its local disk on plan %s", instLabel, inst.ID, m.LinodeType))
+	withData := ""
+	if n := len(dataClones); n > 0 {
+		withData = fmt.Sprintf(", with %d data volume(s) attached", n)
+	}
+	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %q (id %d) is booting from its local disk on plan %s%s", instLabel, inst.ID, m.LinodeType, withData))
 }
 
 // finalizeFile cuts over a FILE-transfer migration. The destination was already

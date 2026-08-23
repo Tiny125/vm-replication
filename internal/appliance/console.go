@@ -688,12 +688,19 @@ async function loadPlans(){
 }
 function validHostname(h){return !!h&&h.length<=253&&/^[A-Za-z0-9.-]+$/.test(h)&&h[0]!=='-';}
 function totalDiskGB(){let g=0;document.querySelectorAll('#disks .d_size').forEach(i=>{const v=parseInt(i.value,10);if(v>0)g+=v;});return g;}
+// bootDiskGB is the FIRST disk row — the one that becomes the destination's boot
+// device. Under local-disk boot it is the only disk the plan has to hold.
+function bootDiskGB(){const i=document.querySelector('#disks .d_size');const v=i?parseInt(i.value,10):0;return v>0?v:0;}
+// dataDiskGB is everything after the boot disk. Under local-disk boot these
+// become Block Storage volumes, so they are billed but do not size the plan.
+function dataDiskGB(){return Math.max(0,totalDiskGB()-bootDiskGB());}
 function diskSizeChanged(){reloadPlanOptions();}
 // method returns the selected migration method ('file'|'volume'|'disk').
 function method(){return $('m_method')?$('m_method').value:'file';}
-// sizeGBForPlan returns the GB the plan must fit: used storage (file) or the
-// summed disk sizes (block).
-function sizeGBForPlan(){return method()==='file'?(parseInt($('m_used')&&$('m_used').value,10)||0):totalDiskGB();}
+// sizeGBForPlan returns the GB the plan's LOCAL DISK must fit: used storage
+// (file), the boot disk alone (local-disk boot — the data disks become volumes),
+// or the summed disk sizes (volume boot, where nothing uses the plan's disk).
+function sizeGBForPlan(){const m=method();return m==='file'?(parseInt($('m_used')&&$('m_used').value,10)||0):m==='disk'?bootDiskGB():totalDiskGB();}
 // methodChanged toggles the per-method fields and reloads the plan list.
 function methodChanged(){
   const m=method(), file=m==='file';
@@ -701,7 +708,7 @@ function methodChanged(){
   if($('diskFields'))$('diskFields').classList.toggle('hide',file);
   $('m_boot_help').innerHTML=
     file ? 'Copies the source’s <b>used files</b> onto a brand-new Linode running the OS image you pick — only used storage moves, so pick a small plan by <b>used</b> size. No block-layout concerns; the destination is a normal Linode.'
-    : m==='disk' ? 'Boots a block-for-block copy from the Linode’s <b>local NVMe disk</b> — faster, no separate volume cost. Pick a plan whose disk fits your data.'
+    : m==='disk' ? 'Boots a block-for-block copy from the Linode’s <b>local NVMe disk</b> — faster, and the boot disk costs nothing beyond the plan. Pick a plan whose disk fits your <b>first (boot) disk</b>; any further disks are copied to <b>Block Storage</b> volumes and attached to the same instance (~$0.10/GB-month).'
     : 'Boots a block-for-block copy from a <b>Block Storage volume</b> sized to your data. The volume is billed separately (~$0.10/GB-month) on top of the plan.';
   if(file)loadImages();
   reloadPlanOptions();
@@ -733,6 +740,13 @@ function updatePlanInfo(){
   if(method()==='volume'){
     const gb=totalDiskGB(), vol=gb*0.10;
     h+=' Block Storage volume'+(gb>0?(' ('+gb+' GB)'):'')+': ~$'+vol.toFixed(2)+'/mo'+(gb>0?'':' — enter disk size(s)')+'. <b>Est. total ~$'+(p.price_monthly+vol).toFixed(2)+'/mo.</b>';
+  }else if(method()==='disk'){
+    // The boot disk rides on the plan's own storage; only the DATA disks are
+    // billed as Block Storage. Quoting the plan alone understates a multi-disk bill.
+    const dgb=dataDiskGB(), vol=dgb*0.10;
+    h+=dgb>0
+      ? ' Boot disk ('+bootDiskGB()+' GB) on the plan’s local disk at no extra cost; '+dgb+' GB of data disks as Block Storage: ~$'+vol.toFixed(2)+'/mo. <b>Est. total ~$'+(p.price_monthly+vol).toFixed(2)+'/mo.</b>'
+      : ' <b>Local disk</b>: the boot disk uses the plan’s own storage — no separate volume cost.';
   }else if(method()==='file'){
     h+=' <b>File transfer</b>: no separate volume — the destination’s own disk holds your copied files.';
   }
@@ -843,7 +857,11 @@ async function startMig(id,btn){
   const fields=[];
   if(!file){
     fields.push({id:'inst_name',label:'New instance name (optional)',type:'text',placeholder:'default: '+defName});
-    if(!disk)fields.push({id:'vol_name',label:'New volume name (optional)',type:'text',placeholder:'default: '+defName});
+    // Volume boot names its boot volume; local-disk boot has no boot volume, but
+    // a MULTI-disk local-disk migration still creates a Block Storage volume per
+    // data disk, so the name applies there too.
+    const nDisks=(meta.disks||[]).length;
+    if(!disk||nDisks>1)fields.push({id:'vol_name',label:(disk?'Name for the data volume(s) (optional)':'New volume name (optional)'),type:'text',placeholder:'default: '+defName});
     fields.push(
       {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
       {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
@@ -1246,7 +1264,7 @@ function migCard(v){
   h+=(m.boot_target==='file')
     ? '<div class="banner warn" style="margin:0 0 10px"><b>File transfer</b>'+((m.linode_type)?(' — new '+esc(m.linode_type)+' Linode'+(m.os_image?(' running '+esc(m.os_image)):'')):'')+'</div>'
     : (m.boot_target==='disk')
-    ? '<div class="banner ok" style="margin:0 0 10px"><b>Boot: Linode local disk</b>'+((m.linode_type)?(' — '+esc((m.plan_class||'')+' plan '+m.linode_type)):'')+'</div>'
+    ? '<div class="banner ok" style="margin:0 0 10px"><b>Boot: Linode local disk</b>'+((m.linode_type)?(' — '+esc((m.plan_class||'')+' plan '+m.linode_type)):'')+(((m.disks||[]).length>1)?(' + '+((m.disks||[]).length-1)+' data volume(s) attached'):'')+'</div>'
     : '<div class="banner info" style="margin:0 0 10px"><b>Boot: separate Block Storage volume</b>'+((m.linode_type)?(' — plan '+esc(m.linode_type)):'')+'</div>';
 
   h+='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+statusLegend()+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
