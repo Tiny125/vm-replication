@@ -218,22 +218,6 @@ func runShell(cmd string) error {
 	return nil
 }
 
-// mountpointFor returns the mountpoint of dev, or o.Mountpoint if set.
-func mountpointFor(o Options) (string, error) {
-	if o.Mountpoint != "" {
-		return o.Mountpoint, nil
-	}
-	out, err := run("findmnt", "-n", "-o", "TARGET", "--source", o.Device)
-	if err != nil {
-		return "", fmt.Errorf("could not auto-detect mountpoint for %s (pass --mountpoint): %w", o.Device, err)
-	}
-	mp := strings.TrimSpace(strings.SplitN(out, "\n", 2)[0])
-	if mp == "" {
-		return "", fmt.Errorf("no mountpoint found for %s", o.Device)
-	}
-	return mp, nil
-}
-
 // maxFreezeHold bounds how long a filesystem may stay frozen. A watchdog
 // force-thaws after this so that a hang between freeze and the intended thaw
 // (e.g. lvcreate stalls, or the process is killed) can never leave the source
@@ -276,19 +260,24 @@ func freeze(mp string) (thaw func(), err error) {
 // it is a best-effort flush rather than a true point-in-time snapshot — use
 // ModeLVM for crash-consistency.
 func prepareFsfreeze(o Options) (string, func(), error) {
-	mp, err := mountpointFor(o)
+	// EVERY filesystem on the disk, not just one mounted on the bare device — a
+	// partitioned or LVM data disk has none of the latter (see mountpointsFor).
+	mps, err := mountpointsFor(o)
 	if err != nil {
 		return "", func() {}, err
 	}
 	if err := runShell(o.PreHook); err != nil {
 		return "", func() {}, err
 	}
-	log.Printf("snapshot: flushing %s with a brief freeze, then reading live (fsfreeze is not a point-in-time snapshot; use LVM for crash-consistency)", mp)
-	thaw, err := freeze(mp)
-	if err != nil {
-		return "", func() {}, err
+	log.Printf("snapshot: flushing %s (%d filesystem(s): %s) with a brief freeze, then reading live (fsfreeze is not a point-in-time snapshot; use LVM for crash-consistency)",
+		o.Device, len(mps), strings.Join(mps, " "))
+	for _, mp := range mps {
+		thaw, ferr := freeze(mp)
+		if ferr != nil {
+			return "", func() {}, ferr
+		}
+		thaw() // immediately — never hold the freeze across the read
 	}
-	thaw() // immediately — never hold the freeze across the read
 	_ = runShell(o.PostHook)
 	return o.Device, func() {}, nil
 }
@@ -298,7 +287,7 @@ func prepareFsfreeze(o Options) (string, func(), error) {
 // read-write and runs the post-hook, so an aborted cutover restores the source.
 // Intended for cutover on a source that will be powered off afterwards.
 func prepareRemountRO(o Options) (string, func(), error) {
-	mp, err := mountpointFor(o)
+	mps, err := mountpointsFor(o)
 	if err != nil {
 		return "", func() {}, err
 	}
@@ -306,19 +295,33 @@ func prepareRemountRO(o Options) (string, func(), error) {
 		return "", func() {}, err
 	}
 	_, _ = run("sync")
-	log.Printf("snapshot: remounting %s read-only for a consistent cutover read", mp)
-	if _, rerr := run("mount", "-o", "remount,ro", mp); rerr != nil {
-		_ = runShell(o.PostHook)
-		msg := fmt.Sprintf("could not remount %s read-only — a process is still writing to it (normal on a running system; the cutover continues from the current crash-consistent data). Stop the source's apps/services (databases, web servers, etc.) if you want a fully idle final pass: %v", mp, rerr)
-		if w := blockingWriters(mp); w != "" {
-			msg += " — processes holding " + mp + ": " + w
+	// Remount every filesystem on the disk. Whatever we manage to remount must be
+	// restored even if a later one fails, or an aborted cutover leaves the SOURCE
+	// with read-only filesystems — far worse than a non-quiesced copy.
+	var done []string
+	restore := func() {
+		for i := len(done) - 1; i >= 0; i-- {
+			if out, uerr := run("mount", "-o", "remount,rw", done[i]); uerr != nil {
+				log.Printf("snapshot: WARNING could not remount %s read-write again: %v (%s)", done[i], uerr, out)
+			}
 		}
-		return "", func() {}, fmt.Errorf("%s", msg)
+	}
+	log.Printf("snapshot: remounting %d filesystem(s) on %s read-only for a consistent cutover read: %s",
+		len(mps), o.Device, strings.Join(mps, " "))
+	for _, mp := range mps {
+		if _, rerr := run("mount", "-o", "remount,ro", mp); rerr != nil {
+			restore()
+			_ = runShell(o.PostHook)
+			msg := fmt.Sprintf("could not remount %s read-only — a process is still writing to it (normal on a running system; the cutover continues from the current crash-consistent data). Stop the source's apps/services (databases, web servers, etc.) if you want a fully idle final pass: %v", mp, rerr)
+			if w := blockingWriters(mp); w != "" {
+				msg += " — processes holding " + mp + ": " + w
+			}
+			return "", func() {}, fmt.Errorf("%s", msg)
+		}
+		done = append(done, mp)
 	}
 	cleanup := func() {
-		if out, uerr := run("mount", "-o", "remount,rw", mp); uerr != nil {
-			log.Printf("snapshot: WARNING could not remount %s read-write again: %v (%s)", mp, uerr, out)
-		}
+		restore()
 		_ = runShell(o.PostHook)
 	}
 	return o.Device, cleanup, nil
@@ -336,16 +339,24 @@ func prepareLVM(o Options) (string, func(), error) {
 	// Freeze just long enough to take the CoW snapshot, then thaw. The watchdog
 	// in freeze() force-thaws if lvcreate hangs, so the source can never stay
 	// frozen.
-	mp, mpErr := mountpointFor(o)
+	mps, mpErr := mountpointsFor(o)
 	if err := runShell(o.PreHook); err != nil {
 		return "", func() {}, err
 	}
-	thaw := func() {}
+	var thaws []func()
+	thaw := func() {
+		for i := len(thaws) - 1; i >= 0; i-- {
+			thaws[i]()
+		}
+	}
 	if mpErr == nil {
-		if t, err := freeze(mp); err != nil {
-			log.Printf("snapshot: WARNING could not freeze %s before snapshot: %v", mp, err)
-		} else {
-			thaw = t
+		for _, mp := range mps {
+			t, err := freeze(mp)
+			if err != nil {
+				log.Printf("snapshot: WARNING could not freeze %s before snapshot: %v", mp, err)
+				continue
+			}
+			thaws = append(thaws, t)
 		}
 	}
 

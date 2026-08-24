@@ -237,6 +237,7 @@ func replicateFiles(c cfg) (syncResult, error) {
 	}
 
 	var entries, bytesWire int64
+	var skipped skippedMounts
 	walkErr := filepath.WalkDir(c.root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			log.Printf("agent: skip %q: %v", p, err)
@@ -259,8 +260,11 @@ func replicateFiles(c cfg) (syncResult, error) {
 		if ierr != nil {
 			return nil
 		}
-		// Stay on the root filesystem: skip anything on a different device.
+		// Stay on the root filesystem: skip anything on a different device — but
+		// RECORD it. Skipping silently is how a source's mounted data volume
+		// vanished from a migration that reported success (F-09).
 		if st, ok := info.Sys().(*syscall.Stat_t); ok && rootDev != 0 && uint64(st.Dev) != rootDev {
+			skipped.add(rel)
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
@@ -294,8 +298,15 @@ func replicateFiles(c cfg) (syncResult, error) {
 		log.Printf("agent: file walk ended early: %v", walkErr)
 	}
 
+	// Say what was left behind. The operator is about to be told the copy is
+	// complete and then invited to power the source off; if data sat on another
+	// filesystem, this is their only chance to notice.
+	if warn := skipped.warning(); warn != "" {
+		log.Printf("agent: WARNING %s", warn)
+	}
 	if err := protocol.WriteJSON(w, protocol.MsgFileDone, protocol.FileDone{
 		Complete: complete, Entries: entries, BytesOnWire: bytesWire,
+		SkippedMounts: skipped.list(),
 	}); err != nil {
 		return res, err
 	}

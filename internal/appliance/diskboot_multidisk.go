@@ -50,6 +50,33 @@ func diskBootDeviceMap(bootDiskID int64, dataVolumeIDs []int64) (map[string]any,
 	return devices, nil
 }
 
+// skippedMountsWarning turns the agent's report of filesystems it did not copy
+// into the operator-facing warning.
+//
+// File transfer walks the ROOT filesystem only, which is the right scope — a
+// separately mounted disk is its own disk. Doing it silently was not: a source
+// with 5.1 GiB on a mounted volume produced a destination without it, while the
+// console said "file copy complete" and then "power off the source now". This
+// warning is emitted before that invitation.
+func skippedMountsWarning(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	const maxShown = 5
+	shown, suffix := paths, ""
+	if len(paths) > maxShown {
+		shown = paths[:maxShown]
+		suffix = fmt.Sprintf(" and %d more", len(paths)-maxShown)
+	}
+	abs := make([]string, len(shown))
+	for i, p := range shown {
+		abs[i] = "/" + strings.TrimPrefix(p, "/")
+	}
+	return fmt.Sprintf(
+		"%d separate filesystem(s) on the source were NOT copied: %s%s. File transfer moves the ROOT filesystem only — data on separately mounted disks or volumes does not come with it. Add those disks to a block-method migration (Separate-volume or Local-disk boot) if their contents must move, and do NOT decommission the source until you have checked.",
+		len(paths), strings.Join(abs, ", "), suffix)
+}
+
 // fstabMarker is what the convert script reports about the migrated machine's
 // data mounts. Mounts lists ONLY the adjusted ones — the mountpoints that will
 // not come up on the destination.

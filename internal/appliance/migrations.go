@@ -179,6 +179,12 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 				if err := s.st.RecordDiskSync(s.ctx, migID, diskID, st.Complete, st.BlocksWritten, st.ChangedBlocks, st.BytesOnWire); err != nil {
 					log.Printf("appliance: record file sync (migration %d disk %d): %v", migID, diskID, err)
 				}
+				// Anything the walk could not copy has to be said out loud, and
+				// said BEFORE "ready to cut over" invites the operator to power
+				// the source off (F-09).
+				if w := skippedMountsWarning(st.SkippedMounts); w != "" {
+					_ = s.st.AddEvent(s.ctx, migID, "warn", w)
+				}
 				switch {
 				case st.Complete && !wasBaselined:
 					_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("file copy complete: %d items (%s) staged for %s — ready to cut over. The destination now carries the source's users, passwords and SSH keys — log in with the SOURCE's credentials from here on, not the root password you set when creating it. Its kernel, boot files and network config stay its own until cutover.", st.BlocksWritten, humanBytes(st.BytesOnWire), dev0))
@@ -2415,6 +2421,15 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	return v
 }
 
+// migrationFinished reports whether the migration has already reached its end
+// state, so the pre-flight checks no longer describe anything actionable.
+//
+// A cutover in progress is deliberately NOT finished: the checklist still means
+// something while the image is being captured.
+func migrationFinished(m api.Migration) bool {
+	return m.State == api.MigLaunched
+}
+
 func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCheck {
 	n := len(m.Disks)
 	agentsSeen, fullDone, storageOK := 0, 0, 0
@@ -2478,6 +2493,23 @@ func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCh
 		fullDetail = s.fileCopyDetail(m, allFull)
 		fullName = "Initial file copy complete"
 	}
+	// A finished migration must not display a red checklist. These checks measure
+	// LIVE state, and after cutover every one of them is legitimately false: the
+	// operator was told to remove the agent, replication is stopped, and the lag
+	// clock keeps running unbounded. Showing that as FAILED tells someone their
+	// successful migration broke. Report what is actually true instead.
+	if migrationFinished(m) {
+		done := func(name, detail string) api.ValidationCheck {
+			return api.ValidationCheck{Name: name, OK: true, Detail: detail, Group: "pre"}
+		}
+		return []api.ValidationCheck{
+			done(first.Name, "migration finished — the destination is running"),
+			done("Agent connected", "not needed — replication ended at cutover"),
+			done(fmt.Sprintf("Replication lag within %ds", s.cfg.RPOTargetSec), "not tracked — replication ended at cutover"),
+			{Name: fullName, OK: allFull, Detail: fullDetail, Group: "migration"},
+		}
+	}
+
 	return []api.ValidationCheck{
 		// Pre-migration: environment/connectivity readiness while replicating.
 		first,

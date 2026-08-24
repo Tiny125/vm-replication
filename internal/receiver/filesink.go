@@ -100,7 +100,7 @@ func handleFileSession(w *bufio.Writer, r *bufio.Reader, root, manifestPath stri
 			// WHOLE tree. A pass that ended early applied real data and is not an
 			// error, but it must not be recorded as the baseline that unlocks
 			// cutover.
-			return Stats{Hello: hello, BlocksWritten: entries, ChangedBlocks: entries, BytesOnWire: bytesApplied, Duration: time.Since(start), Complete: done.Complete}, nil
+			return Stats{Hello: hello, BlocksWritten: entries, ChangedBlocks: entries, BytesOnWire: bytesApplied, Duration: time.Since(start), Complete: done.Complete, SkippedMounts: done.SkippedMounts}, nil
 		default:
 			return Stats{Hello: hello}, fmt.Errorf("unexpected frame type %d in file session", t)
 		}

@@ -37,6 +37,10 @@ type Stats struct {
 	// valid, successfully-applied session — but it is NOT the baseline, and must
 	// not unlock cutover.
 	Complete bool
+	// SkippedMounts are source paths on a DIFFERENT filesystem that the file
+	// walk did not copy. File transfer moves the root filesystem only; the
+	// appliance surfaces these so a migration cannot silently leave data behind.
+	SkippedMounts []string
 }
 
 // Progress reports live apply progress during a session: written blocks so far

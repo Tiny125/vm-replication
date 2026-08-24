@@ -167,6 +167,12 @@ type FileDone struct {
 	Complete    bool  `json:"complete"`
 	Entries     int64 `json:"entries"`
 	BytesOnWire int64 `json:"bytes_on_wire"`
+	// SkippedMounts are paths (relative to the copy root) that live on a
+	// DIFFERENT filesystem and were therefore not copied. File transfer only
+	// moves the root filesystem; leaving this unsaid is how a source's mounted
+	// data volume vanished from a migration that reported success. Empty on the
+	// normal single-filesystem source, and omitted by older agents.
+	SkippedMounts []string `json:"skipped_mounts,omitempty"`
 }
 
 // HelloAck is the receiver's response to Hello.
