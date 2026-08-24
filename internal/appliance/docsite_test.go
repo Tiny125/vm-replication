@@ -9,7 +9,8 @@ import (
 // The documentation site must be served at /documentation WITHOUT a console
 // session (it's the public how-to guide reached at https://<ip>:<port>/documentation),
 // and must cover the full console journey: install, sign-in, the Linode API
-// token, and creating a migration with each of the three methods.
+// token, and creating a migration with each of the two remaining (block)
+// methods.
 func TestDocsSiteServed(t *testing.T) {
 	s := &Server{}
 	rr := httptest.NewRecorder()
@@ -24,7 +25,7 @@ func TestDocsSiteServed(t *testing.T) {
 	for _, want := range []string{
 		// Core journey sections.
 		"Install the replication server", "Sign in", "Linode API token",
-		"Create a migration", "File transfer", "Volume boot", "Disk boot",
+		"Create a migration", "Volume boot", "Disk boot",
 		"Enroll the source server", "Start replication", "Cutover",
 		"Troubleshooting",
 		// Screenshots are embedded and referenced.
@@ -37,6 +38,12 @@ func TestDocsSiteServed(t *testing.T) {
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("documentation missing %q", want)
+		}
+	}
+	// The removed file-transfer method must leave no trace in the guide.
+	for _, gone := range []string{"File transfer", "file-transfer", "file receiver", "OS image"} {
+		if strings.Contains(body, gone) {
+			t.Errorf("documentation still references the removed file-transfer method (%q)", gone)
 		}
 	}
 	// No icons: the guide must not use emoji-style icons.

@@ -32,9 +32,7 @@ import (
 
 func main() {
 	var (
-		mode       = flag.String("mode", "block", "migration data path: block (device copy) | file (filesystem copy)")
-		root       = flag.String("root", "/", "source filesystem root to copy in file mode")
-		device     = flag.String("device", "", "source block device or image file (required in block mode)")
+		device     = flag.String("device", "", "source block device or image file (required)")
 		target     = flag.String("target", "", "receiver address host:port (required)")
 		serverName = flag.String("server-name", "", "expected receiver cert SAN (defaults to target host)")
 		manifest   = flag.String("manifest", "", "path to CBT manifest checkpoint (default <device-basename>.cbt)")
@@ -70,16 +68,12 @@ func main() {
 	)
 	flag.Parse()
 
-	if *target == "" || (*mode == "block" && *device == "") {
+	if *target == "" || *device == "" {
 		flag.Usage()
-		log.Fatal("agent: --target is required (and --device in block mode)")
+		log.Fatal("agent: --target and --device are required")
 	}
 	if *manifest == "" {
-		if *mode == "file" {
-			*manifest = defaultManifestPath(*root)
-		} else {
-			*manifest = defaultManifestPath(*device)
-		}
+		*manifest = defaultManifestPath(*device)
 	}
 	sni := *serverName
 	if sni == "" {
@@ -87,8 +81,6 @@ func main() {
 	}
 
 	c := cfg{
-		mode:           *mode,
-		root:           *root,
 		device:         *device,
 		target:         *target,
 		serverName:     sni,
@@ -115,13 +107,7 @@ func main() {
 	client := controlclient.New(*control, *controlToken)
 	registerSource(client, *sourceName, *device)
 
-	var res syncResult
-	var err error
-	if c.mode == "file" {
-		res, err = replicateFiles(c)
-	} else {
-		res, err = run(c)
-	}
+	res, err := run(c)
 	reportSync(client, *controlJob, res, err)
 	if err != nil {
 		log.Fatalf("agent: %v", err)
@@ -129,7 +115,6 @@ func main() {
 }
 
 type cfg struct {
-	mode, root                                  string
 	device, target, serverName, manifest, jobID string
 	blockSize                                   int
 	full, compress                              bool

@@ -144,6 +144,46 @@ EOF
   # Resolving is not enough: it has to be part of the disk we migrated.
   dev_on_migrated_disk "$dev"
 }
+# strip_migrated_agent removes the SOURCE's replication agent from the migrated
+# image ($1 = the image's mounted root).
+#
+# The agent is installed on the source, so a block-for-block copy brings it
+# along. On the destination it can never reach its job and fails, which leaves
+# every migrated instance permanently `degraded` — the first thing an operator
+# runs on a new server is `systemctl status`, and it tells them the machine is
+# broken when it is not. The agent also carries the mTLS client key for the
+# replication data plane, which has no business living on a migrated box.
+#
+# Only files the agent installer created are touched, so an image that never had
+# the agent (or one already cleaned) is left alone.
+strip_migrated_agent() {
+  local root="$1"
+  # Refuse an empty or root path outright: without this guard the removals below
+  # would run against the APPLIANCE's own filesystem and delete the live
+  # receiver's TLS material in the middle of a migration.
+  [ -n "$root" ] || return 1
+  [ "$root" != "/" ] || return 1
+  [ -d "$root" ] || return 0
+
+  local removed=0 f
+  # Un-enable first: the .wants symlink is what actually starts it at boot.
+  for f in "$root"/etc/systemd/system/*.target.wants/vmrepl-agent.* \
+           "$root"/etc/systemd/system/vmrepl-agent.service \
+           "$root"/etc/systemd/system/vmrepl-agent.timer \
+           "$root"/usr/local/bin/vmrepl-agent; do
+    if [ -e "$f" ] || [ -L "$f" ]; then
+      rm -f "$f" && removed=1
+    fi
+  done
+  # The agent's TLS material (agent.key is a live private key).
+  if [ -d "$root/etc/vm-repl" ]; then
+    rm -rf "$root/etc/vm-repl" && removed=1
+  fi
+  if [ "$removed" = 1 ]; then
+    log "removed the replication agent from the migrated image (it belongs to the source; left in place it fails on the destination and reports the system as degraded)"
+  fi
+  return 0
+}
 # fstab_spec_device resolves an fstab spec to the device it names, or prints
 # nothing. It answers "what does this refer to", NOT "was it migrated" — callers
 # must still put the answer through dev_on_migrated_disk.
@@ -625,6 +665,10 @@ disable_stale_swap "$MNT/etc/fstab"
 # is parsed by the appliance and shown to the operator BEFORE they power the
 # source off — that warning, not the rewrite, is what actually protects them.
 fix_data_fstab "$MNT/etc/fstab"
+
+# The source's replication agent came along with the copy. Left in place it
+# fails on the destination and every migrated instance boots `degraded`.
+strip_migrated_agent "$MNT"
 
 # Stage the conversion steps inside the chroot. The image must have a /root to
 # stage into — a heavy fsck repair can have dropped it (see ensure_stage_dir).

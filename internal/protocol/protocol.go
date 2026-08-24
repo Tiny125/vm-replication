@@ -31,16 +31,7 @@ const (
 	MsgBlock    MsgType = 3 // agent -> receiver: one changed block
 	MsgDone     MsgType = 4 // agent -> receiver: end of stream + stats
 	MsgDoneAck  MsgType = 5 // receiver -> agent: final result
-	// File-transfer method (additive; block sessions never send these):
-	MsgFileEntry MsgType = 6 // agent -> receiver: one file/dir/symlink's metadata (JSON)
-	MsgFileData  MsgType = 7 // agent -> receiver: a raw content chunk for the current regular file
-	MsgFileDone  MsgType = 8 // agent -> receiver: end of the file list (JSON: completeness + stats)
 )
-
-// ModeFile marks a Hello as a file-transfer session (empty Mode = block). A
-// file session carries no block device geometry, so Validate skips the block
-// checks for it.
-const ModeFile = "file"
 
 // Codec identifies how a block payload is encoded on the wire.
 type Codec byte
@@ -68,13 +59,8 @@ const (
 // receiver's manifest allocation (one hash per block) against absurd sizes.
 const MaxDeviceSize = 256 << 40
 
-// Validate sanity-checks a decoded Hello before the receiver acts on it. A
-// file-transfer Hello (Mode==ModeFile) carries no block geometry, so only the
-// block-mode checks are skipped for it.
+// Validate sanity-checks a decoded Hello before the receiver acts on it.
 func (h Hello) Validate() error {
-	if h.Mode == ModeFile {
-		return nil
-	}
 	if h.BlockSize < MinBlockSize || h.BlockSize > MaxBlockSize {
 		return fmt.Errorf("protocol: block size %d out of range [%d,%d]", h.BlockSize, MinBlockSize, MaxBlockSize)
 	}
@@ -108,65 +94,6 @@ type Hello struct {
 	// the cutover fast with an actionable message instead of waiting out its timeout.
 	// The receiver skips Validate / data apply for such a Hello.
 	QuiesceError string `json:"quiesce_error,omitempty"`
-	// Mode selects the session type: empty (default) is a block session; ModeFile
-	// is a file-transfer session (no block geometry; MsgFileEntry/MsgFileDone).
-	Mode string `json:"mode,omitempty"`
-	// ReportsPasses marks an agent build that CONFIRMS every completed file pass
-	// through the LastPass* fields below. It lets the appliance tell "a new agent
-	// whose first pass is still running" from "an old agent that will never
-	// confirm" — in direct mode (file data goes straight to the destination and
-	// the appliance never sees it) that is the difference between waiting and
-	// telling the operator to re-run the enrollment command. Old agents omit it.
-	ReportsPasses bool `json:"reports_passes,omitempty"`
-	// LastPass* report the agent's PREVIOUS completed file pass. They describe a
-	// pass that has ALREADY finished (the agent persists them next to its file
-	// manifest), never the pass this Hello is opening. In direct mode they are the
-	// only evidence the appliance can have that the destination holds the files:
-	// treating the redirect itself as a completion made the console announce
-	// "file copy complete" — and unlock cutover — while the destination was
-	// still empty.
-	LastPassSeq      int64  `json:"last_pass_seq,omitempty"`      // monotonic per-agent pass counter (dedup key; immune to clock steps)
-	LastPassComplete bool   `json:"last_pass_complete,omitempty"` // the agent walked the WHOLE tree (FileDone.Complete)
-	LastPassEntries  int64  `json:"last_pass_entries,omitempty"`
-	LastPassBytes    int64  `json:"last_pass_bytes,omitempty"`
-	LastPassAt       int64  `json:"last_pass_at,omitempty"`     // unix seconds the pass finished (display only)
-	LastPassTarget   string `json:"last_pass_target,omitempty"` // host:port the pass was streamed to
-}
-
-// FileEntry is the metadata for one filesystem object in a file-transfer
-// session — the JSON payload of a MsgFileEntry frame.
-//
-// Wire form: the agent sends one MsgFileEntry per object. For a regular file
-// with content to transfer (Type=="file" && !Unchanged), the entry is followed
-// by zero or more MsgFileData frames (raw chunks) totalling exactly Size bytes;
-// the receiver knows the file is complete once it has read Size bytes. Dirs,
-// symlinks, and Unchanged files carry no MsgFileData frames.
-type FileEntry struct {
-	Path     string `json:"path"`               // path relative to the source root (never absolute, never contains "..")
-	Type     string `json:"type"`               // "file" | "dir" | "symlink"
-	Mode     uint32 `json:"mode"`               // permission bits (os.FileMode &perm)
-	UID      int    `json:"uid"`                // numeric owner
-	GID      int    `json:"gid"`                // numeric group
-	Size     int64  `json:"size,omitempty"`     // regular-file content length (bytes following this frame)
-	ModTime  int64  `json:"mtime,omitempty"`    // unix seconds
-	Linkname string `json:"linkname,omitempty"` // symlink target (verbatim, may be absolute)
-	// Hash is the SHA-256 of a regular file's content, so a delta pass can skip
-	// unchanged files without resending them.
-	Hash string `json:"hash,omitempty"`
-	// Unchanged marks a regular file whose content matches the receiver's last
-	// pass (by Hash): metadata is refreshed but NO content bytes follow.
-	Unchanged bool `json:"unchanged,omitempty"`
-}
-
-// FileDone ends a file-transfer session (JSON payload of MsgFileDone).
-type FileDone struct {
-	// Complete is true when the agent walked the whole tree this pass. Only then
-	// may the receiver delete paths it did NOT see this pass (so removals on the
-	// source propagate). A partial/aborted pass leaves Complete false and the
-	// receiver deletes nothing.
-	Complete    bool  `json:"complete"`
-	Entries     int64 `json:"entries"`
-	BytesOnWire int64 `json:"bytes_on_wire"`
 }
 
 // HelloAck is the receiver's response to Hello.
@@ -186,15 +113,6 @@ type HelloAck struct {
 	// until the operator clicks "Start replication" in the console. Old agents
 	// that don't understand it see Accepted=false and simply retry next tick.
 	Hold bool `json:"hold,omitempty"`
-	// DataTarget redirects a file-transfer agent to stream to a DIFFERENT
-	// receiver (the launched destination Linode), instead of applying data here.
-	// The appliance's control receiver returns it (with Accepted=false) once the
-	// destination is up: the agent re-dials DataTarget, verifying the server
-	// against DataServerName (which stays the appliance's cert SAN — the
-	// destination presents the appliance's receiver cert, so no per-destination
-	// certificate is needed). Empty means "no redirect".
-	DataTarget     string `json:"data_target,omitempty"`
-	DataServerName string `json:"data_server_name,omitempty"`
 }
 
 // Done closes the stream and reports what the agent sent.

@@ -30,13 +30,8 @@ type Stats struct {
 	Hello         protocol.Hello
 	BlocksWritten int64
 	ChangedBlocks int64
-	BytesOnWire   int64 // bytes applied this session (set by the file path)
+	BytesOnWire   int64
 	Duration      time.Duration
-	// Complete is meaningful for a FILE session: the agent reported it walked the
-	// whole source tree (protocol.FileDone.Complete). A pass that ended early is a
-	// valid, successfully-applied session — but it is NOT the baseline, and must
-	// not unlock cutover.
-	Complete bool
 }
 
 // Progress reports live apply progress during a session: written blocks so far
@@ -72,16 +67,6 @@ type ReplicationGate func(hello protocol.Hello) bool
 // only fails much later at cutover. A nil check accepts every valid Hello.
 type HelloCheck func(hello protocol.Hello) error
 
-// FileTarget decides, for a file-transfer session, where the agent should apply
-// its data. It is consulted after the replication gate opens. Returning
-// hold=true tells the agent to wait (e.g. the destination Linode is still
-// launching). Returning a non-empty target redirects the agent to stream
-// straight to that receiver (the destination), verifying it against serverName;
-// the receiver here writes nothing. Returning target=="" and hold=false means
-// "apply the files locally" (the appliance-staging fallback). A nil FileTarget
-// always applies locally.
-type FileTarget func(hello protocol.Hello) (target, serverName string, hold bool)
-
 // errConsistentResync is returned by Handle when it deliberately bounced a live
 // pass to request a crash-consistent resync. It is an expected control outcome,
 // not a failure, so Serve does not surface it via onError.
@@ -92,17 +77,6 @@ var errConsistentResync = errors.New("receiver: crash-consistent resync requeste
 // without applying data. Like errConsistentResync it is an expected control
 // outcome, not a failure.
 var errReplicationHeld = errors.New("receiver: replication not started (connection held)")
-
-// errRedirectedToDest is returned by Handle when a file-transfer session was
-// REDIRECTED to the destination receiver (direct mode): the agent was told where
-// to stream and this receiver applied NOTHING. Like errConsistentResync and
-// errReplicationHeld it is an expected control outcome rather than a failure —
-// and, crucially, it is NOT a completed session. Reporting it as one made the
-// appliance record a baseline (full_sync_done) seconds after Start, so the
-// console told the operator it was safe to power the source off while the copy
-// had not even begun. The agent confirms the pass itself on its next Hello
-// (protocol.Hello LastPass*).
-var errRedirectedToDest = errors.New("receiver: file session redirected to the destination")
 
 // DrainGrace bounds how long an in-flight session may keep running after
 // Serve's context is cancelled (e.g. a cutover freeze stopping this receiver).
@@ -117,7 +91,7 @@ var DrainGrace = 3 * time.Minute
 // session. If once is true, Serve returns after the first successful session.
 // On cancellation Serve stops accepting immediately; a session already in
 // flight gets DrainGrace to finish and is then severed.
-func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress, onError func(error), requestConsistent ConsistencyFunc, replicationGate ReplicationGate, helloCheck HelloCheck, fileTarget FileTarget) error {
+func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string, once bool, onComplete func(Stats), onProgress Progress, onError func(error), requestConsistent ConsistencyFunc, replicationGate ReplicationGate, helloCheck HelloCheck) error {
 	var connMu sync.Mutex
 	var active net.Conn
 	go func() {
@@ -141,7 +115,7 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 		connMu.Lock()
 		active = conn
 		connMu.Unlock()
-		stats, herr := Handle(conn, devicePath, manifestPath, onProgress, requestConsistent, replicationGate, helloCheck, fileTarget)
+		stats, herr := Handle(conn, devicePath, manifestPath, onProgress, requestConsistent, replicationGate, helloCheck)
 		connMu.Lock()
 		active = nil
 		connMu.Unlock()
@@ -153,12 +127,6 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 			// Expected: agent connected, but replication isn't started yet. Connection
 			// recorded by the gate; nothing applied. Not an error.
 			log.Printf("receiver: %s connected; holding (replication not started)", conn.RemoteAddr())
-		case errors.Is(herr, errRedirectedToDest):
-			// Expected: a file session was sent straight to the destination. Nothing
-			// was applied here, so this is neither an error nor a completed pass —
-			// the agent reports the pass itself on its next Hello, which is the only
-			// completion signal direct mode can have.
-			log.Printf("receiver: redirected %s to the destination receiver; nothing applied here", conn.RemoteAddr())
 		case herr != nil:
 			log.Printf("receiver: session from %s ended with error: %v", conn.RemoteAddr(), herr)
 			if onError != nil {
@@ -179,7 +147,7 @@ func Serve(ctx context.Context, ln net.Listener, devicePath, manifestPath string
 // every block to devicePath, fsyncs, and writes the applied manifest.
 // onProgress (optional) is invoked at session start and every progressEvery
 // applied blocks.
-func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress, requestConsistent ConsistencyFunc, replicationGate ReplicationGate, helloCheck HelloCheck, fileTarget FileTarget) (Stats, error) {
+func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress, requestConsistent ConsistencyFunc, replicationGate ReplicationGate, helloCheck HelloCheck) (Stats, error) {
 	defer conn.Close()
 	r := bufio.NewReaderSize(conn, 1<<20)
 	w := bufio.NewWriterSize(conn, 1<<16)
@@ -253,29 +221,6 @@ func Handle(conn net.Conn, devicePath, manifestPath string, onProgress Progress,
 		_ = w.Flush()
 		return Stats{}, errConsistentResync
 	}
-	// File-transfer session: write the source's files into the output root
-	// (devicePath is a directory here, not a block device). This is a wholly
-	// separate data path from the block loop below; block sessions never reach it.
-	if hello.Mode == protocol.ModeFile {
-		if fileTarget != nil {
-			target, serverName, hold := fileTarget(hello)
-			if hold {
-				_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, Hold: true, Message: "destination not ready yet"})
-				_ = w.Flush()
-				return Stats{Hello: hello}, errReplicationHeld
-			}
-			if target != "" {
-				// Redirect the agent to stream straight to the destination; we apply
-				// nothing here, so this is NOT a completed session — see
-				// errRedirectedToDest.
-				_ = protocol.WriteJSON(w, protocol.MsgHelloAck, protocol.HelloAck{Accepted: false, DataTarget: target, DataServerName: serverName})
-				_ = w.Flush()
-				return Stats{Hello: hello}, errRedirectedToDest
-			}
-		}
-		return handleFileSession(w, r, devicePath, manifestPath, hello, onProgress)
-	}
-
 	log.Printf("receiver: session job=%q source=%q device=%q size=%d block=%d full=%v consistent=%v",
 		hello.JobID, hello.SourceHostname, hello.DevicePath, hello.DeviceSize, hello.BlockSize, hello.FullSync, hello.Consistent)
 

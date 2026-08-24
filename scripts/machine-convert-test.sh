@@ -317,4 +317,63 @@ unset -f blkid
 unset MIGRATED_DEVS
 unset DEV
 
+
+# 16) F-18: the migrated image must not carry the SOURCE's replication agent.
+#     The agent is installed on the source, so a block-for-block copy brings it
+#     along; on the destination it can never reach its job and fails, leaving
+#     EVERY migrated instance permanently `degraded`. It also carries the mTLS
+#     client key for the replication data plane, which has no business living on
+#     a migrated production box.
+IMG="$WORK/img-agent"
+mkdir -p "$IMG/etc/systemd/system/timers.target.wants" \
+         "$IMG/etc/systemd/system/multi-user.target.wants" \
+         "$IMG/usr/local/bin" "$IMG/etc/vm-repl"
+: > "$IMG/etc/systemd/system/vmrepl-agent.service"
+: > "$IMG/etc/systemd/system/vmrepl-agent.timer"
+ln -s /etc/systemd/system/vmrepl-agent.timer "$IMG/etc/systemd/system/timers.target.wants/vmrepl-agent.timer"
+: > "$IMG/usr/local/bin/vmrepl-agent"
+: > "$IMG/etc/vm-repl/agent.key"
+: > "$IMG/etc/vm-repl/agent.crt"
+: > "$IMG/etc/vm-repl/ca.crt"
+# Things that must survive untouched.
+ln -s /usr/lib/systemd/system/fstrim.timer "$IMG/etc/systemd/system/timers.target.wants/fstrim.timer"
+: > "$IMG/usr/local/bin/keep-me"
+mkdir -p "$IMG/etc/ssh"; : > "$IMG/etc/ssh/sshd_config"
+
+strip_migrated_agent "$IMG" >/dev/null
+
+[ ! -e "$IMG/etc/systemd/system/timers.target.wants/vmrepl-agent.timer" ] \
+  || fail "the agent timer must be un-enabled, or it starts on the migrated machine"
+[ ! -e "$IMG/etc/systemd/system/vmrepl-agent.service" ] \
+  || fail "the agent service unit must be removed"
+[ ! -e "$IMG/etc/systemd/system/vmrepl-agent.timer" ] \
+  || fail "the agent timer unit must be removed"
+[ ! -e "$IMG/usr/local/bin/vmrepl-agent" ] \
+  || fail "the agent binary must be removed"
+[ ! -e "$IMG/etc/vm-repl/agent.key" ] \
+  || fail "the agent's mTLS PRIVATE KEY must not ship on the migrated machine"
+[ ! -e "$IMG/etc/vm-repl" ] \
+  || fail "the agent's TLS directory must be removed entirely"
+
+# Collateral damage check: unrelated timers, binaries and config must survive.
+[ -L "$IMG/etc/systemd/system/timers.target.wants/fstrim.timer" ] \
+  || fail "strip_migrated_agent deleted an unrelated systemd timer"
+[ -f "$IMG/usr/local/bin/keep-me" ] \
+  || fail "strip_migrated_agent deleted an unrelated binary"
+[ -f "$IMG/etc/ssh/sshd_config" ] \
+  || fail "strip_migrated_agent touched unrelated configuration"
+
+# 16b) Idempotent, and safe on an image that never had the agent.
+IMG2="$WORK/img-noagent"
+mkdir -p "$IMG2/etc/systemd/system"
+: > "$IMG2/etc/systemd/system/other.service"
+strip_migrated_agent "$IMG2" >/dev/null
+[ -f "$IMG2/etc/systemd/system/other.service" ] || fail "strip_migrated_agent damaged an agent-free image"
+strip_migrated_agent "$IMG" >/dev/null || fail "strip_migrated_agent must be idempotent"
+
+# 16c) An empty root must be refused outright — a bare `rm -rf /etc/vm-repl`
+#      would be running against the APPLIANCE's own filesystem, deleting the
+#      live receiver's TLS material mid-migration.
+strip_migrated_agent "" 2>/dev/null && fail "strip_migrated_agent must refuse an empty root"
+strip_migrated_agent "/" 2>/dev/null && fail "strip_migrated_agent must refuse / (that is the appliance itself)"
 echo "machine-convert-test: all tests passed"

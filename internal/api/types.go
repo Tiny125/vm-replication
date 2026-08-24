@@ -217,13 +217,11 @@ type Migration struct {
 	// Disks (boot first). Authoritative per-disk state.
 	Disks []Disk `json:"disks"`
 
-	// Boot target chosen at create time (see CreateMigrationRequest). For disk
-	// and file modes PlanClass + LinodeType record the resolved Linode plan.
+	// Boot target chosen at create time (see CreateMigrationRequest). PlanClass +
+	// LinodeType record the resolved Linode plan.
 	BootTarget string `json:"boot_target,omitempty"`
 	PlanClass  string `json:"plan_class,omitempty"`
 	LinodeType string `json:"linode_type,omitempty"`
-	// OSImage is the destination's Linode image id (file mode only).
-	OSImage string `json:"os_image,omitempty"`
 
 	// ReplicationEnabled is the gate the operator flips with "Start replication":
 	// while false the receiver acknowledges the agent connection but holds (no
@@ -264,24 +262,21 @@ type CreateMigrationRequest struct {
 	SourceDevice   string       `json:"source_device,omitempty"`
 	SourceDiskSize int64        `json:"source_disk_size,omitempty"`
 
-	// Boot target / migration method: BootTargetFile (default) copies the source's
-	// files onto a freshly launched destination Linode (only used storage moves);
-	// BootTargetVolume boots a block-for-block copy from a Block Storage volume;
-	// BootTargetDisk boots a block-for-block copy from the Linode's local disk.
+	// Boot target / migration method: BootTargetDisk (default) boots a
+	// block-for-block copy from the Linode's own local disk; BootTargetVolume
+	// boots a block-for-block copy from a separate Block Storage volume.
 	// PlanClass ("shared"|"dedicated") and the resolved LinodeType size the plan.
 	BootTarget string `json:"boot_target,omitempty"`
 	PlanClass  string `json:"plan_class,omitempty"`
 	LinodeType string `json:"linode_type,omitempty"`
-	// OSImage is the Linode image id for the launched destination in file mode
-	// (e.g. "linode/ubuntu22.04"); ignored by the block methods.
-	OSImage string `json:"os_image,omitempty"`
 }
 
-// Boot targets / migration methods for a migration.
+// Boot targets / migration methods for a migration. The file-transfer method
+// (BootTargetFile) was removed — only the two block methods remain, with
+// BootTargetDisk as the default (empty boot_target resolves to it).
 const (
 	BootTargetVolume = "volume" // block copy booting from a Block Storage volume
-	BootTargetDisk   = "disk"   // block copy booting from the Linode's local disk
-	BootTargetFile   = "file"   // file-level copy onto a launched destination (default)
+	BootTargetDisk   = "disk"   // block copy booting from the Linode's local disk (default)
 )
 
 // LinodePlan is one Linode type offered for local-disk boot sizing, surfaced to
@@ -341,27 +336,6 @@ type MigrationView struct {
 	ReplicationActive  bool `json:"replication_active"`
 	ReplicationPaused  bool `json:"replication_paused"`
 	CanReplicate       bool `json:"can_replicate"`
-
-	// File-transfer destination (direct method): the console offers an explicit
-	// "Create destination instance" step and gates Start replication until the
-	// destination's receiver is confirmed ready. DestState is one of:
-	//   ""           — not a file-transfer migration (no destination step)
-	//   "fallback"   — file mode with no Linode automation (data staged on the
-	//                  appliance; no destination instance is launched)
-	//   "none"       — automation available, no destination created yet → the
-	//                  operator uses "Create destination instance"
-	//   "launching"  — the destination Linode is being created / booting
-	//   "installing" — the instance is up; waiting for its file receiver to start
-	//   "ready"      — the receiver is reachable; Start replication is unlocked
-	//   "failed"     — the launch failed (DestError says why); the operator retries
-	DestState    string `json:"dest_state,omitempty"`
-	DestLinodeID int64  `json:"dest_linode_id,omitempty"`
-	DestIP       string `json:"dest_ip,omitempty"`
-	DestError    string `json:"dest_error,omitempty"`
-	// DestManualCmd is a copy-paste command (run in the destination's Lish console
-	// / over SSH as root) that installs and starts the file receiver, for when the
-	// automatic cloud-init install stalls (e.g. the image/region lacks Metadata).
-	DestManualCmd string `json:"dest_manual_cmd,omitempty"`
 
 	// Live progress for the console: Phase is a human label ("initial sync",
 	// "finalizing", …); PercentDone/ETASeconds are -1 when unknown.
@@ -433,15 +407,9 @@ type SourceCheckDisk struct {
 
 // MethodAssessment is the verdict for one migration method.
 type MethodAssessment struct {
-	Method  string   `json:"method"`  // file | volume | disk
+	Method  string   `json:"method"`  // volume | disk
 	Verdict string   `json:"verdict"` // ok | warn | fail
 	Reasons []string `json:"reasons,omitempty"`
-	// RecommendedImage is the Linode OS image to pick as the destination (file
-	// method only; the block methods boot the source's own migrated disk).
-	RecommendedImage string `json:"recommended_image,omitempty"`
-	// RecommendedImageNote qualifies an APPROXIMATE recommendation (e.g. Amazon
-	// Linux → AlmaLinux is RHEL-family but not a drop-in replacement).
-	RecommendedImageNote string `json:"recommended_image_note,omitempty"`
 }
 
 // SourceAssessment is the appliance's evaluation of a SourceCheckReport.
@@ -465,15 +433,6 @@ type LoginRequest struct {
 // SetLinodeTokenRequest stores the Linode API token on the appliance.
 type SetLinodeTokenRequest struct {
 	Token string `json:"token"`
-}
-
-// CreateDestinationRequest launches a file-transfer migration's destination
-// Linode with an operator-chosen label and root password (so the operator can
-// log into it via Lish/SSH — e.g. to run the manual receiver-install fallback).
-// The root password is never logged or persisted in cleartext by the appliance.
-type CreateDestinationRequest struct {
-	Label        string `json:"label"`
-	RootPassword string `json:"root_password"`
 }
 
 // FinalizeRequest controls what happens when a migration is cut over.

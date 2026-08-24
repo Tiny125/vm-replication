@@ -351,7 +351,7 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
             <pre id="srcCmd" style="flex:1;margin:0">echo "Hostname : $(hostname)"; echo "IP       : $(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')"; ( . /etc/os-release 2>/dev/null; echo "OS       : ${PRETTY_NAME:-unknown}" ); echo "Used(GB) : $(df -B1 --total -x tmpfs -x devtmpfs -x overlay 2>/dev/null | awk '/^total/{printf "%d", ($3+1073741823)/1073741824}')"; lsblk -b -d -n -o NAME,SIZE,TYPE | awk '$3=="disk" && $2>0 && $1!~/^(nbd|loop|ram|zram|sr|fd)/{printf "Device   : /dev/%s\nSize(GB) : %d\n", $1, ($2+1073741823)/1073741824}'</pre>
             <button onclick="copyText(document.getElementById('srcCmd').textContent,this)">Copy</button>
           </div>
-          <div class="muted" style="font-size:12px"><b>File transfer</b> (default): use the printed <b>OS</b> to pick the destination image and <b>Used(GB)</b> to size the plan. <b>Block methods</b>: add <b>one row per whole disk</b> (e.g. <code style="display:inline;padding:1px 5px">/dev/sda</code>); the disk with the root filesystem <code style="display:inline;padding:1px 5px">/</code> is the boot disk — put it first. Round sizes up.</div>
+          <div class="muted" style="font-size:12px">Add <b>one row per whole disk</b> (e.g. <code style="display:inline;padding:1px 5px">/dev/sda</code>); the disk with the root filesystem <code style="display:inline;padding:1px 5px">/</code> is the boot disk — put it first. Round sizes up.</div>
         </div>
       </details>
       <div class="row">
@@ -363,9 +363,8 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
       <label style="margin-top:14px">Migration method</label>
       <div class="row">
         <div><select id="m_method" onchange="methodChanged()">
-          <option value="file" selected>File transfer — copy used files to a new Linode (default)</option>
+          <option value="disk" selected>Block: Linode local disk (NVMe, default)</option>
           <option value="volume">Block: separate Block Storage volume</option>
-          <option value="disk">Block: Linode local disk (NVMe)</option>
         </select></div>
         <div><select id="m_planclass" onchange="reloadPlanOptions()">
           <option value="shared">Shared CPU</option>
@@ -373,15 +372,7 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
         </select></div>
       </div>
 
-      <!-- File transfer: destination OS + used storage -->
-      <div id="fileFields">
-        <label style="margin-top:10px">Destination OS image</label>
-        <select id="m_osimage"></select>
-        <label style="margin-top:10px">Used storage on the source (GB)</label>
-        <input id="m_used" type="number" min="1" placeholder="from the command above — Used(GB)" oninput="reloadPlanOptions()">
-      </div>
-
-      <!-- Block methods: per-disk rows -->
+      <!-- Source disks (both methods are block methods). -->
       <div id="diskFields">
         <label style="margin-top:12px">Source disks (first = boot disk)</label>
         <div id="disks"></div>
@@ -395,7 +386,7 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
 
       <div style="margin-top:16px;display:flex;align-items:center;gap:2px">
         <button id="createBtn" class="primary" onclick="createMig(this)">Create migration</button>
-        <span class="info" data-tip="Registers this source server and generates the one-line agent enrollment command (block methods also provision one replication volume per disk on the appliance; file transfer launches a destination Linode at Start instead). No data is copied until you run that command on the source.">i</span>
+        <span class="info" data-tip="Registers this source server, provisions one replication volume per disk on the appliance, and generates the one-line agent enrollment command. No data is copied until you run that command on the source.">i</span>
       </div>
       <div id="createErr" class="err"></div>
     </div>
@@ -528,7 +519,7 @@ function renderSourceCheck(st){
   const rep=st.report||{},a=st.assessment||{checks:[],methods:[]};
   $('srcWait').textContent='Report received.';
   const V={ok:['ok','Supported'],warn:['warn','Supported with cautions'],bad:['bad','Not supported'],fail:['bad','Not supported']};
-  const MNAME={file:'File transfer',volume:'Volume boot',disk:'Disk boot'};
+  const MNAME={volume:'Volume boot',disk:'Disk boot'};
   let h='<div class="banner info"><b>'+esc(rep.os_pretty||'Unknown OS')+'</b>'+
     ' — '+esc(rep.arch||'?')+', kernel '+esc(rep.kernel||'?')+(rep.virt&&rep.virt!=='unknown'?(', virtualization: '+esc(rep.virt)):'')+
     (rep.hostname?(' <span class="muted">('+esc(rep.hostname)+')</span>'):'')+'</div>';
@@ -538,16 +529,11 @@ function renderSourceCheck(st){
     h+='<div style="font-size:13px;margin:2px 0"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>';
   // Per-method verdicts.
   h+='<div class="muted" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin:14px 0 4px">Migration methods</div>';
-  h+='<table><tr><th>Method</th><th>Verdict</th><th>Recommended destination</th><th>Notes</th></tr>';
+  h+='<table><tr><th>Method</th><th>Verdict</th><th>Notes</th></tr>';
   for(const m of (a.methods||[])){
     const v=V[m.verdict]||V.warn;
-    const dest=m.method==='file'
-      ?(m.recommended_image?('<code style="display:inline;padding:1px 5px">'+esc(m.recommended_image)+'</code> (pick this OS image)'+(m.recommended_image_note?('<div class="muted" style="font-size:12px;margin-top:3px">'+esc(m.recommended_image_note)+'</div>'):''))
-        :'no close image match — pick the nearest OS manually')
-      :'<span class="muted">not applicable — the destination boots your migrated disk</span>';
     h+='<tr><td><b>'+esc(MNAME[m.method]||m.method)+'</b></td>'+
        '<td><span class="pill '+v[0]+'">'+v[1]+'</span></td>'+
-       '<td>'+dest+'</td>'+
        '<td style="font-size:12.5px">'+((m.reasons||[]).map(esc).join('<br>')||'<span class="muted">—</span>')+'</td></tr>';
   }
   h+='</table>';
@@ -556,7 +542,7 @@ function renderSourceCheck(st){
   h+=okAny
     ?'<div class="resultbox ok" style="margin-top:10px"><b>✔ This server can migrate.</b> Use a supported method above — then create the migration on the Migrations tab.</div>'
     :'<div class="resultbox bad" style="margin-top:10px"><b>✘ This server cannot migrate with any method.</b> See the notes above for the blocking reasons.</div>';
-  if(rep.used_bytes>0)h+='<div class="muted" style="font-size:12.5px;margin-top:8px">Used storage on the source: <b>'+fmtBytes(rep.used_bytes)+'</b> — size a file-transfer plan by this. '+
+  if(rep.used_bytes>0)h+='<div class="muted" style="font-size:12.5px;margin-top:8px">Used storage on the source: <b>'+fmtBytes(rep.used_bytes)+'</b>. '+
     ((rep.disks&&rep.disks.length)?('Disks: '+rep.disks.map(d=>esc(d.name)+' ('+fmtBytes(d.size_bytes)+(d.ephemeral?' — ephemeral, exclude':'')+')').join(', ')+' — block methods replicate these whole (never the ephemeral ones).'):'')+'</div>';
   $('srcOut').innerHTML=h;
   $('srcOut').classList.remove('hide');
@@ -605,7 +591,7 @@ async function loadSettings(){
   if(st.linode_token_set){
     h+='<div style="line-height:1.6"><span class="y">✔</span> Linode API token validated &amp; stored.'+
        (st.linode_account?(' Account: <b>'+esc(st.linode_account)+'</b>.'):'')+'<br>'+
-       (st.linode_automation?('Appliance Linode '+esc(st.appliance_linode_id)+'; volumes created in its region.'):'(appliance Linode id unknown — file-fallback mode)')+'<br>'+
+       (st.linode_automation?('Appliance Linode '+esc(st.appliance_linode_id)+'; volumes created in its region.'):'(appliance Linode id unknown — local-file fallback mode, no Block Storage provisioned)')+'<br>'+
        (st.audit_ready?('<span class="y">✔</span> Audit log bucket <b>'+esc(st.audit_bucket)+'</b>'+(st.audit_region?(' in region <b>'+esc(st.audit_region)+'</b>'):'')+' — console &amp; per-migration logs upload to Object Storage (browse in Cloud Manager).')
         :(st.audit_error?('<span class="x">✘</span> Audit log bucket not created: '+esc(st.audit_error)):'<span class="muted">Audit log bucket: provisioning…</span>'))+'</div>'+
        '<div class="actions">'+
@@ -695,31 +681,28 @@ function bootDiskGB(){const i=document.querySelector('#disks .d_size');const v=i
 // become Block Storage volumes, so they are billed but do not size the plan.
 function dataDiskGB(){return Math.max(0,totalDiskGB()-bootDiskGB());}
 function diskSizeChanged(){reloadPlanOptions();}
-// method returns the selected migration method ('file'|'volume'|'disk').
-function method(){return $('m_method')?$('m_method').value:'file';}
-// sizeGBForPlan returns the GB the plan's LOCAL DISK must fit: used storage
-// (file), the boot disk alone (local-disk boot — the data disks become volumes),
-// or the summed disk sizes (volume boot, where nothing uses the plan's disk).
-function sizeGBForPlan(){const m=method();return m==='file'?(parseInt($('m_used')&&$('m_used').value,10)||0):m==='disk'?bootDiskGB():totalDiskGB();}
-// methodChanged toggles the per-method fields and reloads the plan list.
+// method returns the selected migration method ('volume'|'disk'). disk (local
+// NVMe) is the default.
+function method(){return $('m_method')?$('m_method').value:'disk';}
+// sizeGBForPlan returns the GB the plan's LOCAL DISK must fit: the boot disk
+// alone (local-disk boot — the data disks become volumes), or the summed disk
+// sizes (volume boot, where nothing uses the plan's disk).
+function sizeGBForPlan(){return method()==='disk'?bootDiskGB():totalDiskGB();}
+// methodChanged toggles the per-method help text and reloads the plan list.
 function methodChanged(){
-  const m=method(), file=m==='file';
-  if($('fileFields'))$('fileFields').classList.toggle('hide',!file);
-  if($('diskFields'))$('diskFields').classList.toggle('hide',file);
+  const m=method();
   $('m_boot_help').innerHTML=
-    file ? 'Copies the source’s <b>used files</b> onto a brand-new Linode running the OS image you pick — only used storage moves, so pick a small plan by <b>used</b> size. No block-layout concerns; the destination is a normal Linode.'
-    : m==='disk' ? 'Boots a block-for-block copy from the Linode’s <b>local NVMe disk</b> — faster, and the boot disk costs nothing beyond the plan. Pick a plan whose disk fits your <b>first (boot) disk</b>; any further disks are copied to <b>Block Storage</b> volumes and attached to the same instance (~$0.10/GB-month).'
+    m==='disk' ? 'Boots a block-for-block copy from the Linode’s <b>local NVMe disk</b> — faster, and the boot disk costs nothing beyond the plan. Pick a plan whose disk fits your <b>first (boot) disk</b>; any further disks are copied to <b>Block Storage</b> volumes and attached to the same instance (~$0.10/GB-month).'
     : 'Boots a block-for-block copy from a <b>Block Storage volume</b> sized to your data. The volume is billed separately (~$0.10/GB-month) on top of the plan.';
-  if(file)loadImages();
   reloadPlanOptions();
 }
-// Populate the plan dropdown from the chosen class + method. File and disk modes
-// require a plan whose local disk fits the data (used or disk sizes); the default
-// selection is the closest fit. The user's explicit choice is preserved.
+// Populate the plan dropdown from the chosen class + method. Local-disk boot
+// requires a plan whose local disk fits the boot disk; the default selection
+// is the closest fit. The user's explicit choice is preserved.
 async function reloadPlanOptions(){
   const sel=$('m_plan'); if(!sel)return;
-  const cls=$('m_planclass').value, m=method(), needFit=(m==='disk'||m==='file'), gb=sizeGBForPlan();
-  const fitGB=m==='file'?Math.ceil(gb*1.3):gb; // file mode leaves OS+growth headroom
+  const cls=$('m_planclass').value, m=method(), needFit=(m==='disk'), gb=sizeGBForPlan();
+  const fitGB=gb;
   let plans;
   try{plans=await loadPlans();}
   catch(e){sel.innerHTML='<option value="">add a Linode token in Settings to load plans</option>';$('m_plan_help').innerHTML='';return;}
@@ -740,30 +723,15 @@ function updatePlanInfo(){
   if(method()==='volume'){
     const gb=totalDiskGB(), vol=gb*0.10;
     h+=' Block Storage volume'+(gb>0?(' ('+gb+' GB)'):'')+': ~$'+vol.toFixed(2)+'/mo'+(gb>0?'':' — enter disk size(s)')+'. <b>Est. total ~$'+(p.price_monthly+vol).toFixed(2)+'/mo.</b>';
-  }else if(method()==='disk'){
+  }else{
     // The boot disk rides on the plan's own storage; only the DATA disks are
     // billed as Block Storage. Quoting the plan alone understates a multi-disk bill.
     const dgb=dataDiskGB(), vol=dgb*0.10;
     h+=dgb>0
       ? ' Boot disk ('+bootDiskGB()+' GB) on the plan’s local disk at no extra cost; '+dgb+' GB of data disks as Block Storage: ~$'+vol.toFixed(2)+'/mo. <b>Est. total ~$'+(p.price_monthly+vol).toFixed(2)+'/mo.</b>'
       : ' <b>Local disk</b>: the boot disk uses the plan’s own storage — no separate volume cost.';
-  }else if(method()==='file'){
-    h+=' <b>File transfer</b>: no separate volume — the destination’s own disk holds your copied files.';
   }
   help.innerHTML=h;
-}
-// loadImages fills the destination OS dropdown, grouped by vendor, once.
-let _imagesLoaded=false;
-async function loadImages(){
-  const sel=$('m_osimage'); if(!sel||_imagesLoaded)return;
-  try{
-    const r=await api('GET','/api/v1/linode/images');
-    const imgs=(r&&r.images)||[];
-    if(!imgs.length){sel.innerHTML='<option value="">add a Linode token in Settings to load OS images</option>';return;}
-    imgs.sort((a,b)=>(a.vendor||'').localeCompare(b.vendor||'')||(a.label||'').localeCompare(b.label||''));
-    sel.innerHTML=imgs.map(i=>'<option value="'+esc(i.id)+'">'+esc(i.label||i.id)+'</option>').join('');
-    _imagesLoaded=true;
-  }catch(e){sel.innerHTML='<option value="">add a Linode token in Settings to load OS images</option>';}
 }
 // IP addresses that passed the in-form connection test; only these may be used
 // to create a migration.
@@ -784,33 +752,22 @@ async function createMig(btn){
   if(!ip){$('createErr').textContent='Enter the source IP address.';return}
   if(!validIP(ip)){$('createErr').textContent='“'+ip+'” is not a valid IP address (e.g. 172.236.148.63).';return}
   const mth=method(), planClass=$('m_planclass').value, planType=$('m_plan').value;
-  const devices=[];let osImage='';
-  if(mth==='file'){
-    // File transfer: one synthetic "whole filesystem" entry sized by USED bytes,
-    // plus the destination OS image.
-    const used=parseInt($('m_used').value,10);
-    if(!used||used<=0){$('createErr').textContent='Enter the source’s used storage in GB (from the command above — Used(GB)).';return}
-    osImage=$('m_osimage').value;
-    if(!osImage){$('createErr').textContent='Pick the destination OS image (match it to the source’s OS).';return}
-    devices.push({device:'/',size_bytes:used*1073741824});
-  }else{
-    const rows=document.querySelectorAll('#disks .row');
-    for(const r of rows){const dev=r.querySelector('.d_dev').value.trim();const gbRaw=r.querySelector('.d_size').value.trim();const gb=parseInt(gbRaw,10);
-      if(!dev||!gbRaw){$('createErr').textContent='Fill in every disk row (device path and size) or remove the empty one before creating.';return}
-      if(!gb||gb<=0){$('createErr').textContent='Each disk needs a positive size (GB): '+dev;return}
-      devices.push({device:dev,size_bytes:gb*1073741824});}
-    if(!devices.length){$('createErr').textContent='Add at least one disk';return}
-  }
+  const devices=[];
+  const rows=document.querySelectorAll('#disks .row');
+  for(const r of rows){const dev=r.querySelector('.d_dev').value.trim();const gbRaw=r.querySelector('.d_size').value.trim();const gb=parseInt(gbRaw,10);
+    if(!dev||!gbRaw){$('createErr').textContent='Fill in every disk row (device path and size) or remove the empty one before creating.';return}
+    if(!gb||gb<=0){$('createErr').textContent='Each disk needs a positive size (GB): '+dev;return}
+    devices.push({device:dev,size_bytes:gb*1073741824});}
+  if(!devices.length){$('createErr').textContent='Add at least one disk';return}
   busy(btn,true);
   // Show a loading placeholder at the BOTTOM of the list while provisioning runs
   // (new migrations are appended, newest last).
   $('migs').insertAdjacentHTML('beforeend','<div id="creating" class="mig"><div class="center"><div class="spinner"></div><div>Creating migration…</div></div></div>');
   $('creating').scrollIntoView({behavior:'smooth',block:'center'});
   try{
-    await api('POST','/api/v1/migrations',{name:name,source_hostname:host,source_ip:ip,devices:devices,boot_target:mth,plan_class:planClass,linode_type:planType,os_image:osImage});
+    await api('POST','/api/v1/migrations',{name:name,source_hostname:host,source_ip:ip,devices:devices,boot_target:mth,plan_class:planClass,linode_type:planType});
     $('m_name').value=$('m_host').value=$('m_ip').value='';
-    if($('m_used'))$('m_used').value='';
-    $('disks').innerHTML='';diskSeq=0;addDisk();$('m_method').value='file';methodChanged();
+    $('disks').innerHTML='';diskSeq=0;addDisk();$('m_method').value='disk';methodChanged();
     await refresh(true);
     const last=$('migs').lastElementChild;if(last)last.scrollIntoView({behavior:'smooth',block:'center'});
     toast('Migration "'+name+'" created — enroll the source agent to start replicating','ok');
@@ -834,133 +791,64 @@ function rpoText(v,m){
 async function startMig(id,btn){
   const meta=migMeta[id]||{};
   const disk=meta.boot_target==='disk';
-  const file=meta.boot_target==='file';
   const planNote=meta.linode_type?(' on plan <b>'+esc(meta.linode_type)+'</b>'):'';
   const access='<div class="muted" style="font-size:12px;margin-top:10px">Your migrated system keeps the <b>source</b>’s logins, and cloud images usually leave root locked — so set a root password (and/or SSH key) below to reach the new instance via the Lish console without rescue mode.</div>';
   // Guided cutover, 3 steps with a power-off in between (same for volume- and
-  // disk-boot). Step 1 STOPS replication and, for the BLOCK methods, takes ONE
-  // consistent final pass with the source root remounted read-only (so the
-  // cloned/converted image is a clean point-in-time, not a live smear that fails
-  // fsck on convert). If the operator confirms the source is already powered off
-  // or idle, they can tick the box to skip that quiesce. Step 3 launches.
+  // disk-boot). Step 1 STOPS replication and takes ONE consistent final pass
+  // with the source root remounted read-only (so the cloned/converted image is
+  // a clean point-in-time, not a live smear that fails fsck on convert). If the
+  // operator confirms the source is already powered off or idle, they can tick
+  // the box to skip that quiesce. Step 3 launches.
   const how='<div style="margin-bottom:8px"><b>Cutover has 3 steps:</b>'+
-    '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> '+(file?'stop replication and hold the copied files for launch.':'stop replication, take a consistent final pass (the source root is briefly remounted read-only), then <b>convert the boot image and validate it is bootable</b> — all while the source is still running, so any problem surfaces before you power off.')+'</div>'+
-    '<div style="margin-top:4px"><b>Step 2:</b> '+(file?'power off the source server.':'once step 1 reports the image is validated, power off the source server.')+'</div>'+
-    '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(file?('reboots the destination Linode'+planNote+' (already launched at Start, with your files copied straight into it) so it boots into your migrated system — the migration is then complete. No Lish paste needed.'):disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the validated image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('clones the validated image and launches a new Linode'+planNote+'.'):'clones every disk into launchable volumes.'))+'</div></div>';
-  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the '+(file?'copied files are current.':'final pass is current. The final pass tries to remount the source root <b>read-only</b> for a perfectly clean image — if writers are still holding the root open (normal on a running system), the cutover <b>automatically falls back</b> to the current crash-consistent data, which is fsck-repaired on convert and validated as bootable before you power anything off. Tick the box below to skip the read-only attempt if the source is already powered off or idle.')+'</div>';
-  // Optional names/credentials the cutover applies. These ONLY apply to the
-  // block methods, which CREATE the instance (and, for volume boot, the cutover
-  // volume) at this step. File transfer created its destination earlier ("Create
-  // destination instance", where its name + root password were already set) and
-  // cutover merely reboots it — so file shows none of these fields.
+    '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> stop replication, take a consistent final pass (the source root is briefly remounted read-only), then <b>convert the boot image and validate it is bootable</b> — all while the source is still running, so any problem surfaces before you power off.</div>'+
+    '<div style="margin-top:4px"><b>Step 2:</b> once step 1 reports the image is validated, power off the source server.</div>'+
+    '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the validated image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('clones the validated image and launches a new Linode'+planNote+'.'):'clones every disk into launchable volumes.'))+'</div></div>';
+  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the final pass is current. The final pass tries to remount the source root <b>read-only</b> for a perfectly clean image — if writers are still holding the root open (normal on a running system), the cutover <b>automatically falls back</b> to the current crash-consistent data, which is fsck-repaired on convert and validated as bootable before you power anything off. Tick the box below to skip the read-only attempt if the source is already powered off or idle.</div>';
+  // Optional names/credentials the cutover applies — both methods CREATE the
+  // instance (and, for volume boot, the cutover volume) at this step.
   const defName=esc((meta.name||'')+'-cutover');
-  const fields=[];
-  if(!file){
-    fields.push({id:'inst_name',label:'New instance name (optional)',type:'text',placeholder:'default: '+defName});
-    // Volume boot names its boot volume; local-disk boot has no boot volume, but
-    // a MULTI-disk local-disk migration still creates a Block Storage volume per
-    // data disk, so the name applies there too.
-    const nDisks=(meta.disks||[]).length;
-    if(!disk||nDisks>1)fields.push({id:'vol_name',label:(disk?'Name for the data volume(s) (optional)':'New volume name (optional)'),type:'text',placeholder:'default: '+defName});
-    fields.push(
-      {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
-      {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
-    );
-  }
+  const fields=[{id:'inst_name',label:'New instance name (optional)',type:'text',placeholder:'default: '+defName}];
+  // Volume boot names its boot volume; local-disk boot has no boot volume, but
+  // a MULTI-disk local-disk migration still creates a Block Storage volume per
+  // data disk, so the name applies there too.
+  const nDisks=(meta.disks||[]).length;
+  if(!disk||nDisks>1)fields.push({id:'vol_name',label:(disk?'Name for the data volume(s) (optional)':'New volume name (optional)'),type:'text',placeholder:'default: '+defName});
+  fields.push(
+    {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
+    {id:'ssh_key',label:'SSH public key for root (optional)',type:'text',placeholder:'ssh-ed25519 AAAA… you@host'}
+  );
   const opts={
-    title:'Cut over migration #'+id+' — step 1 of 3: stop replication'+(file?'':' & take a consistent pass'),
+    title:'Cut over migration #'+id+' — step 1 of 3: stop replication & take a consistent pass',
     okText:'Stop replication & continue',
-    html:how+(file?'':access)+prep,
-    fields:fields
+    html:how+access+prep,
+    fields:fields,
+    // Default to the read-only quiesce, with an opt-out for an
+    // already-powered-off/idle source.
+    checkboxes:[{id:'skip_snap',label:'The source is already powered off or idle — skip the read-only snapshot',checked:false}]
   };
-  // Block methods: default to the read-only quiesce, with an opt-out for an
-  // already-powered-off/idle source. File transfer doesn't convert a block image,
-  // so it keeps its existing behaviour (no quiesce checkbox).
-  if(!file)opts.checkboxes=[{id:'skip_snap',label:'The source is already powered off or idle — skip the read-only snapshot',checked:false}];
   const r=await confirmModal(opts);
   if(!r)return;
   busy(btn,true);
-  // File keeps skip_snapshot:true (no block image to make consistent). Block
-  // methods quiesce by default (skip_snapshot:false) so finalize() captures a
+  // Quiesce by default (skip_snapshot:false) so finalize() captures a
   // crash-consistent final pass via the existing agent remount-ro / LVM path,
   // unless the operator opted out for an already-off source.
-  const skipSnap=file?true:!!r.skip_snap;
+  const skipSnap=!!r.skip_snap;
   try{await api('POST','/api/v1/migrations/'+id+'/start',{launch_instance:true,label:r.inst_name||'',volume_label:r.vol_name||'',root_password:r.root_pw||'',ssh_authorized_key:r.ssh_key||'',skip_snapshot:skipSnap,guided_shutdown:true});await refreshMig(id)}
   catch(e){alertModal({title:'Cannot start cutover',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function completeCutover(id,btn){
-  const file=((migMeta[id]||{}).boot_target==='file');
-  if(!await confirmModal({title:'Source powered off — launch the migrated instance?',html:'Confirm the <b>source server is shut down</b> (both machines must not run at once). This '+(file?'reboots the destination Linode into your copied files':'clones the already-validated boot image and launches the new instance')+'. This is the final step.',okText:'Launch instance'}))return;
+  if(!await confirmModal({title:'Source powered off — launch the migrated instance?',html:'Confirm the <b>source server is shut down</b> (both machines must not run at once). This clones the already-validated boot image and launches the new instance. This is the final step.',okText:'Launch instance'}))return;
   busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/complete',{});await refreshMig(id)}catch(e){alertModal({title:'Cannot complete',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
 async function stopMig(id,btn){
   if(!await confirmModal({title:'Stop cutover #'+id+'?',html:'The finalize run is cancelled and replication resumes.',okText:'Stop cutover',okDanger:true}))return;
   busy(btn,true);try{await api('POST','/api/v1/migrations/'+id+'/stop');await refreshMig(id)}catch(e){alertModal({title:'Cannot stop',html:esc(e.message),danger:true})}finally{busy(btn,false)}
 }
-// destPanel renders the file-transfer destination step: a "Create destination
-// instance" button (name + root password), then live launch/install status, a
-// manual receiver-install command fallback, and a ready/failed result — gating
-// Start replication until the destination's receiver answers. Empty for block
-// methods, the appliance-staging fallback, and post-replication states.
-function destPanel(v,m){
-  const st=v.dest_state;
-  if(!st||st==='fallback')return '';
-  if(['migrating','awaiting_cutover','image_ready','launched'].includes(m.state))return '';
-  // Kept as a variable so the two call sites below stay identical.
-  const amber='warn';
-  const idl=v.dest_linode_id||m.launched_linode_id;
-  const lish=idl?(' — <a href="https://cloud.linode.com/linodes/'+idl+'/lish/weblish" target="_blank" rel="noopener">open Lish</a>'):'';
-  const manual=v.dest_manual_cmd?('<div style="margin-top:8px;font-size:12px"><b>Once the destination is up:</b> open the instance’s Lish console (log in as root with the password you set)'+lish+' and paste this to install the receiver right away — no need to wait for the automatic install:</div>'+
-    '<div style="display:flex;gap:8px;align-items:flex-start;margin-top:6px"><pre id="dinstall'+m.id+'" style="flex:1;margin:0">'+esc(v.dest_manual_cmd)+'</pre>'+
-    '<button onclick="copyText(document.getElementById(\'dinstall'+m.id+'\').textContent,this)">Copy</button></div>'):'';
-  if(st==='none')
-    return '<div class="banner '+amber+'"><b>Step 1 — create the destination instance.</b>'+
-      '<div style="margin-top:6px">Launches a <b>'+esc(m.linode_type||'plan')+'</b> Linode running <b>'+esc(m.os_image||'your OS image')+'</b> and installs the file receiver on it. <b>Start replication</b> unlocks once it’s ready to receive.</div>'+
-      '<div style="margin-top:8px"><button class="primary" onclick="createDest('+m.id+',this)">Create destination instance</button></div></div>';
-  if(st==='failed')
-    return '<div class="banner bad"><b>Destination launch failed.</b>'+
-      '<div style="margin-top:6px">'+esc(v.dest_error||'see the activity log')+'</div>'+
-      '<div style="margin-top:8px"><button class="primary" onclick="createDest('+m.id+',this)">Retry — create destination instance</button></div></div>';
-  if(st==='ready')
-    return '<div class="resultbox ok" style="margin-top:10px"><b>✔ Destination ready</b> — Linode '+esc(idl||'')+(v.dest_ip?(' ('+esc(v.dest_ip)+')'):'')+' is ready to receive. Use <b>Start replication</b> to begin copying your files into it.</div>';
-  // launching / installing
-  const label=(st==='launching')?'Launching the destination Linode…':'Installing the file receiver on the destination…';
-  return '<div class="banner '+amber+'"><b>'+label+'</b>'+
-    '<div style="margin-top:6px">This can take a few minutes.'+(v.dest_ip?(' Destination IP: <b>'+esc(v.dest_ip)+'</b>.'):'')+' <b>Start replication</b> unlocks automatically once its receiver answers.</div>'+manual+'</div>';
-}
-// createDest launches the file-transfer destination instance with an operator
-// name + root password. The password is sent once to create the instance and is
-// never stored by the appliance.
-async function createDest(id,btn){
-  const meta=migMeta[id]||{};
-  const defName=esc((meta.name||'')+'-dest');
-  const r=await confirmModal({
-    title:'Create destination instance for #'+id,
-    html:'Launches a <b>'+esc(meta.linode_type||'plan')+'</b> Linode running <b>'+esc(meta.os_image||'your OS image')+'</b> and installs the file receiver on it. Set a <b>root password</b> so you can log into it (Lish/SSH) — e.g. to run the manual install if cloud-init is unavailable.',
-    okText:'Create destination',
-    fields:[
-      {id:'d_name',label:'Destination instance name (optional)',type:'text',placeholder:'default: '+defName},
-      {id:'d_pw',label:'Root password for the destination',type:'password',placeholder:'used to log in (Lish/SSH) — leave blank to auto-generate'}
-    ]
-  });
-  if(!r)return;
-  if(r.d_pw && r.d_pw.length<6){alertModal({title:'Password too short',html:'Enter at least 6 characters, or leave it blank to auto-generate a strong one.',danger:true});return;}
-  busy(btn,true);
-  try{await api('POST','/api/v1/migrations/'+id+'/destination',{label:r.d_name||'',root_password:r.d_pw||''});await refreshMig(id);}
-  catch(e){alertModal({title:'Cannot create destination',html:esc(e.message),danger:true});}finally{busy(btn,false);}
-}
 // startReplication starts (or, when resume=true, resumes) replication.
 async function startReplication(id,btn,resume){
-  // Method-aware wording: file transfer copies FILES onto a launched destination,
-  // block methods stream disk blocks. (boot_target comes from the migration meta.)
-  const file=((migMeta[id]||{}).boot_target==='file');
   const opts=resume
-    ?{title:'Resume replication for #'+id+'?',html: file
-        ?'Replication continues with an <b>incremental delta</b> — only the files that changed during the pause are re-copied, not a full re-copy.'
-        :'Replication continues with an <b>incremental delta sync</b> — only the blocks that changed during the pause are sent, not a full re-copy.',okText:'Resume replication'}
-    :{title:'Start replication for #'+id+'?',html: file
-        ?'The agent connection is validated. This <b>launches the destination Linode</b> and begins the <b>initial full copy</b> of the source’s <b>used files</b> straight into it. The copy then stays current; you can cut over once the baseline copy completes.'
-        :'The agent connection is validated. This begins the <b>initial full sync</b> from the source; the agent streams every block, then keeps the copy current. You can cut over once the baseline completes.',okText:'Start replication'};
+    ?{title:'Resume replication for #'+id+'?',html:'Replication continues with an <b>incremental delta sync</b> — only the blocks that changed during the pause are sent, not a full re-copy.',okText:'Resume replication'}
+    :{title:'Start replication for #'+id+'?',html:'The agent connection is validated. This begins the <b>initial full sync</b> from the source; the agent streams every block, then keeps the copy current. You can cut over once the baseline completes.',okText:'Start replication'};
   if(!await confirmModal(opts))return;
   busy(btn,true);
   try{await api('POST','/api/v1/migrations/'+id+'/replicate',{});await refreshMig(id)}
@@ -969,9 +857,8 @@ async function startReplication(id,btn,resume){
 // pauseReplication stops replication after any in-flight pass; data is kept and a
 // later resume continues with an incremental delta (no full re-copy).
 async function pauseReplication(id,btn){
-  const file=((migMeta[id]||{}).boot_target==='file');
   if(!await confirmModal({title:'Pause replication for #'+id+'?',
-    html:'<div class="warn"><b>Replication will stop.</b></div>The agent stops sending data once any pass already in flight finishes. Already-copied data and the change tracking are kept, so <b>Resume</b> later continues with an <b>incremental delta '+(file?'copy':'sync')+'</b> — no full re-copy. (Cutover needs replication running and up to date, so resume before cutting over.)',
+    html:'<div class="warn"><b>Replication will stop.</b></div>The agent stops sending data once any pass already in flight finishes. Already-copied data and the change tracking are kept, so <b>Resume</b> later continues with an <b>incremental delta sync</b> — no full re-copy. (Cutover needs replication running and up to date, so resume before cutting over.)',
     okText:'Pause replication',okDanger:true}))return;
   busy(btn,true);
   try{await api('POST','/api/v1/migrations/'+id+'/pause',{});await refreshMig(id)}
@@ -982,22 +869,20 @@ async function pauseReplication(id,btn){
 // soft "connection failed" after the post-install grace, or a waiting note. The
 // Start/Pause/Resume buttons live in the action row, not here.
 function connStatus(v,m){
-  const file=(m.boot_target==='file');
   if(v.replication_active)
-    return '<div class="resultbox ok" style="margin-top:10px">✔ Replication running — the agent is '+(file?'copying files.':'streaming changes.')+'</div>';
+    return '<div class="resultbox ok" style="margin-top:10px">✔ Replication running — the agent is streaming changes.</div>';
   if(v.replication_paused)
-    return '<div class="resultbox" style="margin-top:10px"><b>⏸ Replication paused.</b> Already-copied data is kept; use <b>Resume replication</b> to continue with a delta '+(file?'copy':'sync')+'.</div>';
+    return '<div class="resultbox" style="margin-top:10px"><b>⏸ Replication paused.</b> Already-copied data is kept; use <b>Resume replication</b> to continue with a delta sync.</div>';
   if(v.agent_connected)
-    return '<div class="resultbox ok" style="margin-top:10px"><b>✔ Agent connected</b> — connection validated. Use <b>Start replication</b> to begin the initial '+(file?'file copy.':'full sync.')+'</div>';
+    return '<div class="resultbox ok" style="margin-top:10px"><b>✔ Agent connected</b> — connection validated. Use <b>Start replication</b> to begin the initial full sync.</div>';
   if(v.connection_failed)
     return '<div class="resultbox bad" style="margin-top:10px"><b>✘ Connection failed.</b> The agent hasn’t checked in. Confirm the install command ran on <b>'+esc(m.source_hostname||'the source')+'</b>, and that the appliance’s receiver ports (TCP 5000–5100) are reachable. The agent retries every 60s, so this clears once it connects.</div>';
   return '<div class="resultbox" style="margin-top:10px">Waiting for the agent to connect (usually within ~60s of running the command above)…</div>';
 }
 async function deleteMig(id,name,btn){
-  const file=((migMeta[id]||{}).boot_target==='file');
   if(!await confirmModal({title:'Delete migration #'+id+'?',
-    html:'<b>'+esc(name)+'</b><div style="margin-top:8px" class="warn">This deletes '+(file?'the launched destination Linode':'any <name>-cutover image volume(s) and the launched cutover Linode')+'. It cannot be undone.</div>'+
-      '<div class="muted" style="margin-top:8px;font-size:13px">'+(file?'':'The <b>vrep-'+esc(name)+' replication volume is detached but kept</b> in your Linode account so you can still reference it. ')+'After deletion this card stays briefly with the command to remove the agent from the source — dismiss it once that’s done.</div>',
+    html:'<b>'+esc(name)+'</b><div style="margin-top:8px" class="warn">This deletes any <name>-cutover image volume(s) and the launched cutover Linode. It cannot be undone.</div>'+
+      '<div class="muted" style="margin-top:8px;font-size:13px">The <b>vrep-'+esc(name)+' replication volume is detached but kept</b> in your Linode account so you can still reference it. After deletion this card stays briefly with the command to remove the agent from the source — dismiss it once that’s done.</div>',
     okText:'Delete',okDanger:true}))return;
   busy(btn,true);
   try{
@@ -1016,12 +901,12 @@ async function deleteMig(id,name,btn){
 // button is revealed on the card (agentAcked) to clean up the appliance's
 // temporary replication volume while keeping the launched instance.
 async function completeMig(id){
-  const meta=migMeta[id]||{};const cmd=meta.uninstall||'';const file=(meta.boot_target==='file');
+  const meta=migMeta[id]||{};const cmd=meta.uninstall||'';
   const body='<div style="font-size:13.5px;margin-bottom:10px">Your server is migrated and launched on Linode. To finish, remove the replication agent from <b>'+esc(meta.source||'the source server')+'</b>:</div>'+
     (cmd?('<div style="display:flex;gap:8px;align-items:flex-start"><pre id="donecmd'+id+'" style="flex:1;margin:0">'+esc(cmd)+'</pre>'+
       '<button onclick="copyText(document.getElementById(\'donecmd'+id+'\').textContent,this)">Copy</button></div>')
       :'<div class="muted">Run your uninstall command on the source to remove the agent.</div>')+
-    '<div class="muted" style="font-size:12px;margin-top:10px">After you click <b>Done</b>, a <b>Close migration</b> button appears on the card. It '+(file?'clears the card — your migrated destination Linode is kept, untouched.':'removes the appliance’s temporary <b>vmrep-</b> replication volume and clears the card — your launched Linode and its volumes are kept, untouched.')+'</div>';
+    '<div class="muted" style="font-size:12px;margin-top:10px">After you click <b>Done</b>, a <b>Close migration</b> button appears on the card. It removes the appliance’s temporary <b>vmrep-</b> replication volume and clears the card — your launched Linode and its volumes are kept, untouched.</div>';
   await uiDialog({title:'Migration complete — remove source agent',html:body,wide:true,cancel:false,okText:'Done'});
   // Reveal the Close button on this card (persists across refreshes via the set).
   agentAcked.add(id);
@@ -1031,10 +916,9 @@ async function completeMig(id){
 // appliance's temporary replication volume (the vmrep- one) and clears the card,
 // while KEEPING the launched Linode and its cutover volumes.
 async function closeMig(id,name,btn){
-  const file=((migMeta[id]||{}).boot_target==='file');
   if(!await confirmModal({title:'Close migration #'+id+'?',
-    html:'<b>'+esc(name)+'</b><div style="margin-top:8px">This '+(file?'clears this card.':'removes the appliance’s temporary <b>vmrep-'+esc(name)+'</b> replication volume (no longer needed now that the server is migrated) and clears this card.')+'</div>'+
-      '<div class="muted" style="margin-top:8px;font-size:13px">Your <b>'+(file?'migrated destination Linode is kept, untouched':'launched Linode and its volumes are kept, untouched — only the replication volume is deleted')+'</b>. This cannot be undone.</div>',
+    html:'<b>'+esc(name)+'</b><div style="margin-top:8px">This removes the appliance’s temporary <b>vmrep-'+esc(name)+'</b> replication volume (no longer needed now that the server is migrated) and clears this card.</div>'+
+      '<div class="muted" style="margin-top:8px;font-size:13px">Your <b>launched Linode and its volumes are kept, untouched — only the replication volume is deleted</b>. This cannot be undone.</div>',
     okText:'Close migration',okDanger:true}))return;
   busy(btn,true);
   try{
@@ -1042,7 +926,7 @@ async function closeMig(id,name,btn){
     agentAcked.delete(id);
     const c=$('mig'+id);if(c)c.remove();
     if(!$('migs').children.length){$('migs').innerHTML='<div class="muted" style="padding:8px">No migrations yet. Create one above.</div>';}
-    toast('Migration #'+id+' ('+name+') closed'+(file?' — migrated destination Linode kept':' — replication volume removed, launched Linode kept'),'ok');
+    toast('Migration #'+id+' ('+name+') closed — replication volume removed, launched Linode kept','ok');
     loadSettings();
   }
   catch(e){toast('Close failed: '+e.message,'bad');busy(btn,false);}
@@ -1124,17 +1008,11 @@ function progressLine(v,m){
   else if(st==='migrating'){label='finalizing · running '+liveDur(m.migrate_started,v.elapsed_seconds);bar=progBar(0,true);}
   else if(st==='awaiting_cutover'){label='step 1 done — power off the source, then Launch instance';bar=progBar(100,false);}
   else{
-    const isFile=m.boot_target==='file';
     const allBase=disks(m).length>0&&disks(m).every(d=>d.full_sync_done);
-    if(allBase){label=isFile?'files copied · ready to cut over':'initial sync completed · 100%';bar=progBar(100,false);}
+    if(allBase){label='initial sync completed · 100%';bar=progBar(100,false);}
     else{
       const pct=syncPct(v,m);
-      if(isFile){
-        // File copy: bytes only land when a pass completes, so show motion + the
-        // item count rather than a fabricated percentage.
-        label=(st==='created'||st==='awaiting_agent'?'waiting for agent':'copying files (only used storage)…');
-        bar=progBar(0,true);
-      }else if(pct<0){
+      if(pct<0){
         // No live session reporting and not yet baselined — show motion, not a
         // fabricated percentage.
         label=(st==='created'||st==='awaiting_agent'?'waiting for agent':'initial sync in progress');
@@ -1167,12 +1045,11 @@ function liveDur(sinceISO,fallbackSecs){
   return '<span class="livedur" data-since="'+t+'">'+fmtDur((Date.now()-t)/1000)+'</span>';
 }
 function diskTable(m){const d=disks(m);if(!d.length)return '';
-  const isFile=(m.boot_target==='file');
-  let h='<table><tr><th>'+(isFile?'Source':'Disk')+'</th><th>Device</th><th>Size</th><th>Port</th><th>'+(isFile?'Copied':'Baseline')+'</th><th>'+(isFile?'Target / note':'Volume / note')+'</th></tr>';
+  let h='<table><tr><th>Disk</th><th>Device</th><th>Size</th><th>Port</th><th>Baseline</th><th>Volume / note</th></tr>';
   for(const x of d){const note=x.last_error?('<span class="x">'+esc(x.last_error)+'</span>'):(x.artifact_id?esc(x.artifact_id):(x.volume_id?('vol '+x.volume_id):'file'));
     h+='<tr><td>'+(x.index===0?'boot':('data '+x.index))+'</td><td class="muted">'+esc(x.source_device)+'</td>'+
        '<td class="muted">'+fmtBytes(x.size_bytes)+'</td><td class="muted">'+x.receiver_port+'</td>'+
-       '<td>'+(x.full_sync_done?'<span class="y">✔ done</span>':'<span class="muted">'+(isFile?'copying':'baselining')+'</span>')+'</td><td>'+note+'</td></tr>';}
+       '<td>'+(x.full_sync_done?'<span class="y">✔ done</span>':'<span class="muted">baselining</span>')+'</td><td>'+note+'</td></tr>';}
   return h+'</table>';
 }
 function infoIcon(tip){return '<span class="info" data-tip="'+esc(tip)+'">i</span>'}
@@ -1242,8 +1119,8 @@ function cleanupCard(id){
 }
 function dismissCleanup(id){delete pendingCleanup[id];const c=$('mig'+id);if(c)c.remove();}
 function migCard(v){
-  const m=v.migration;const err=anyDiskError(m);const file=(m.boot_target==='file');
-  migMeta[m.id]={uninstall:v.uninstall_cmd||'',source:m.source_hostname||'',name:m.name,boot_target:m.boot_target,plan_class:m.plan_class,linode_type:m.linode_type,os_image:m.os_image};
+  const m=v.migration;const err=anyDiskError(m);
+  migMeta[m.id]={uninstall:v.uninstall_cmd||'',source:m.source_hostname||'',name:m.name,boot_target:m.boot_target,plan_class:m.plan_class,linode_type:m.linode_type};
   const collapsed=collapsedMigs.has(m.id);
   const firstSeen=!seenMigs.has(m.id);seenMigs.add(m.id);
 
@@ -1260,17 +1137,20 @@ function migCard(v){
   }
 
   // Method header banner: distinct colours so the method is obvious at a glance
-  // (amber = file transfer, green = local disk, blue = separate volume).
-  h+=(m.boot_target==='file')
-    ? '<div class="banner warn" style="margin:0 0 10px"><b>File transfer</b>'+((m.linode_type)?(' — new '+esc(m.linode_type)+' Linode'+(m.os_image?(' running '+esc(m.os_image)):'')):'')+'</div>'
-    : (m.boot_target==='disk')
+  // (green = local disk, blue = separate volume). A migration created before a
+  // now-removed method (e.g. the old file-transfer method) can still carry that
+  // raw boot_target in the database — show it plainly instead of guessing which
+  // current method it resembles, and skip method-specific controls for it.
+  h+=(m.boot_target==='disk')
     ? '<div class="banner ok" style="margin:0 0 10px"><b>Boot: Linode local disk</b>'+((m.linode_type)?(' — '+esc((m.plan_class||'')+' plan '+m.linode_type)):'')+(((m.disks||[]).length>1)?(' + '+((m.disks||[]).length-1)+' data volume(s) attached'):'')+'</div>'
-    : '<div class="banner info" style="margin:0 0 10px"><b>Boot: separate Block Storage volume</b>'+((m.linode_type)?(' — plan '+esc(m.linode_type)):'')+'</div>';
+    : (m.boot_target===''||m.boot_target==='volume')
+    ? '<div class="banner info" style="margin:0 0 10px"><b>Boot: separate Block Storage volume</b>'+((m.linode_type)?(' — plan '+esc(m.linode_type)):'')+'</div>'
+    : '<div class="banner warn" style="margin:0 0 10px"><b>Unsupported migration method: '+esc(m.boot_target)+'</b> — this migration was created with a method that has since been removed from the console. It cannot be started, replicated or cut over from here; delete it and re-create it with a current method (Local disk or Block Storage volume).</div>';
 
   h+='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+statusLegend()+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
     '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_ip||m.source_hostname||'-')+'</span></td>'+
     '<td id="stat'+m.id+'">'+pillFor(v,m)+'</td>'+
-    '<td class="muted" id="disks'+m.id+'">'+(file?'1 filesystem':disks(m).length+' disk(s)')+'<br>'+(file?(allDone(m)?'files copied':'copying files'):(allDone(m)?'baseline done':'baselining'))+'</td>'+
+    '<td class="muted" id="disks'+m.id+'">'+disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining')+'</td>'+
     '<td id="prog'+m.id+'">'+progressLine(v,m)+'</td>'+
     '<td class="muted" id="rpo'+m.id+'">'+rpoText(v,m)+'</td></tr></table>';
 
@@ -1279,15 +1159,7 @@ function migCard(v){
   if(m.last_error)b+='<div class="resultbox bad">'+esc(m.last_error)+'</div>';
   else if(err)b+='<div class="resultbox bad">Last replication attempt failed: '+esc(err)+'</div>';
 
-  // File transfer: the explicit "Create destination instance" step + its status,
-  // shown before replication starts and gating the Start button.
-  b+=destPanel(v,m);
-
-  if(['image_ready','launched'].includes(m.state) && m.boot_target==='file'){
-    b+='<div class="banner ok">✔ <b>Migration completed.</b> '+
-       (m.launched_linode_id?('Your files were copied onto Linode '+esc(m.launched_linode_id)+' ('+esc(m.linode_type||'plan')+'), which rebooted into your migrated system — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a> and connect via Lish. No separate volume is used.')
-       :'Your files were copied onto the destination Linode, which is rebooting into your migrated system.')+'</div>';
-  } else if(['image_ready','launched'].includes(m.state) && m.boot_target==='disk'){
+  if(['image_ready','launched'].includes(m.state) && m.boot_target==='disk'){
     b+='<div class="banner ok">✔ <b>Migration completed.</b> '+
        (m.launched_linode_id?('Launched Linode '+esc(m.launched_linode_id)+' booting from its <b>local disk</b> ('+esc(m.linode_type||'plan')+') — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a> and connect via Lish. No separate volume is kept.')
        :'The image is ready to boot from the instance’s local disk.')+'</div>';
@@ -1304,15 +1176,14 @@ function migCard(v){
   // console (the command streams the image onto the local disk and powers the
   // instance off; the appliance finishes automatically from there).
   if(m.state==='migrating' && v.cutover_copy_cmd){
-    const isFile=m.boot_target==='file';
     b+='<div class="banner warn">'+
-      '<b>Action needed — '+(isFile?'copy your files onto the destination.':'copy the image onto the local disk.')+'</b>'+
+      '<b>Action needed — copy the image onto the local disk.</b>'+
       '<div style="margin-top:6px">1. Make sure the <b>source server is powered off</b>.</div>'+
-      '<div style="margin-top:4px">2. Open the '+(isFile?'destination':'cutover')+' instance’s <b>Lish console</b>'+(m.launched_linode_id?(' — <a href="https://cloud.linode.com/linodes/'+m.launched_linode_id+'/lish/weblish" target="_blank" rel="noopener">open Weblish</a>'):'')+(isFile?' (log in as root).':' (it is booted in Rescue Mode).')+'</div>'+
+      '<div style="margin-top:4px">2. Open the cutover instance’s <b>Lish console</b>'+(m.launched_linode_id?(' — <a href="https://cloud.linode.com/linodes/'+m.launched_linode_id+'/lish/weblish" target="_blank" rel="noopener">open Weblish</a>'):'')+' (it is booted in Rescue Mode).</div>'+
       '<div style="margin-top:4px">3. Paste this one line there:</div>'+
       '<div style="display:flex;gap:8px;align-items:flex-start;margin-top:6px"><pre id="cutcmd'+m.id+'" style="flex:1;margin:0">'+esc(v.cutover_copy_cmd)+'</pre>'+
       '<button onclick="copyText(document.getElementById(\'cutcmd'+m.id+'\').textContent,this)">Copy</button></div>'+
-      '<div style="font-size:12px;margin-top:6px">'+(isFile?'It copies your files onto the destination and reboots it — the appliance then marks the migration complete automatically. Nothing else to click here.':'The copy shows live progress in the Lish session and powers the instance off when it finishes — the appliance then boots your server from its local disk automatically. Nothing else to click here.')+'</div></div>';
+      '<div style="font-size:12px;margin-top:6px">The copy shows live progress in the Lish session and powers the instance off when it finishes — the appliance then boots your server from its local disk automatically. Nothing else to click here.</div></div>';
   }
 
   // Two groups: pre-migration (environment readiness while replicating) and
@@ -1336,7 +1207,7 @@ function migCard(v){
   // pre-checks force the section open or drop the "all passing" note.
   const allOk=postCutover?mig.every(c=>c.ok):(v.validations||[]).every(c=>c.ok);
   b+='<details'+(allOk?'':' open')+'><summary>Validation checks'+(allOk?' (all passing)':'')+'</summary><div>'+
-     '<div class="muted" style="font-size:12px;margin-bottom:6px">Pre-migration checks track readiness while replicating (informational after cutover). The migration check — <b>'+(file?'initial file copy complete':'initial full sync complete')+'</b> — is what allows cutover.</div>'+checks+'</div></details>';
+     '<div class="muted" style="font-size:12px;margin-bottom:6px">Pre-migration checks track readiness while replicating (informational after cutover). The migration check — <b>initial full sync complete</b> — is what allows cutover.</div>'+checks+'</div></details>';
   b+='<details><summary>Disks ('+disks(m).length+')</summary><div>'+diskTable(m)+'</div></details>';
   const cachedLog=logCache[m.id];
   b+='<details ontoggle="if(this.open)ensureLog('+m.id+')"><summary>Activity log</summary><div>'+
@@ -1348,7 +1219,7 @@ function migCard(v){
     const certErr=/certificate|tls|x509/i.test(err||'');
     // Default-open on first sight; afterwards the open/closed state is preserved
     // across refreshes (openKeys), so closing it makes it stay closed.
-    b+='<details'+(firstSeen?' open':'')+'><summary>Enroll the source server'+(file?'':' (all '+disks(m).length+' disk(s))')+'</summary><div>';
+    b+='<details'+(firstSeen?' open':'')+'><summary>Enroll the source server (all '+disks(m).length+' disk(s))</summary><div>';
     if(certErr)b+='<div class="resultbox bad" style="margin-bottom:8px">The agent could not complete the TLS handshake — this usually means it was installed against an <b>older appliance certificate</b>. A retry will not fix it: <b>re-run the command below</b> to reinstall the agent with the current certificates.</div>';
     b+='<label>Run this on '+esc(m.source_hostname||'the source')+'</label>'+
        '<div style="display:flex;gap:8px;align-items:flex-start"><pre id="enroll'+m.id+'" style="flex:1;margin:0">'+esc(v.enroll_cmd)+'</pre>'+
@@ -1368,17 +1239,17 @@ function migCard(v){
   // Step 1 in progress (drain + freeze): the operator must NOT power off yet.
   if(m.state==='migrating' && v.cutover_freezing){
     b+='<div class="banner warn">'+
-      '<b>'+(file?'Finishing the last file-copy pass':'Preparing &amp; validating the boot image')+' — keep the source server running.</b>'+
-      '<div style="margin-top:6px">'+(file?'The appliance is waiting for the file-copy pass currently in flight to finish, so the copied files carry your latest changes':'The appliance is finishing the last replication pass, then converting the boot image and checking it is bootable — all BEFORE you power off, so any problem surfaces while the source is still running')+' (this can take a few minutes on a large '+(file?'filesystem':'disk')+').</div>'+
+      '<b>Preparing &amp; validating the boot image — keep the source server running.</b>'+
+      '<div style="margin-top:6px">The appliance is finishing the last replication pass, then converting the boot image and checking it is bootable — all BEFORE you power off, so any problem surfaces while the source is still running (this can take a few minutes on a large disk).</div>'+
       '<div style="margin-top:4px">This card will tell you when it is safe to power off the source — <b>do not power it off yet</b>.</div></div>';
   }
   // Step 1 done: NOW the operator powers the source off, then launches.
   if(m.state==='awaiting_cutover'){
     b+='<div class="banner warn">'+
       '<b>Action needed — it is now safe to power off the source server.</b>'+
-      '<div style="margin-top:6px">✓ <b>Step 1 done</b> — replication is stopped and '+(file?'the copied files are held for launch':'the boot image has been <b>converted and validated as bootable</b>')+'.</div>'+
+      '<div style="margin-top:6px">✓ <b>Step 1 done</b> — replication is stopped and the boot image has been <b>converted and validated as bootable</b>.</div>'+
       '<div style="margin-top:4px"><b>Step 2 — now:</b> <b>power off the source server</b> (so the old and new machines aren’t both running at once).</div>'+
-      '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> below to '+(file?'reboot the destination into your files':'clone the validated image and launch')+'.</div></div>';
+      '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> below to clone the validated image and launch.</div></div>';
   }
   b+='<div class="actions">';
   const migDone=['image_ready','launched'].includes(m.state);
@@ -1389,39 +1260,38 @@ function migCard(v){
     b+='<button class="primary done" onclick="completeMig('+m.id+')">✓ Migration complete — remove source agent</button>';
     if(agentAcked.has(m.id))
       b+='<button class="danger" onclick="closeMig('+m.id+',\''+esc(m.name)+'\',this)">Close migration</button>'+
-        infoIcon(file?'Clears this card. Your migrated destination Linode is kept, untouched.':'Removes the appliance’s temporary vmrep- replication volume and clears this card. Your launched Linode and its volumes are kept, untouched.');
+        infoIcon('Removes the appliance’s temporary vmrep- replication volume and clears this card. Your launched Linode and its volumes are kept, untouched.');
   }else if(m.state==='migrating'){
     b+='<button class="danger" onclick="stopMig('+m.id+',this)">Stop</button>';
   }else if(m.state==='awaiting_cutover'){
     // Guided cutover: phase 1 captured a consistent image and froze it (receivers
     // stopped). The step banner is rendered above this row; only buttons here.
     b+='<button class="primary" onclick="completeCutover('+m.id+',this)">Launch instance</button>'+
-      infoIcon(file?'Reboots the already-launched destination into your copied files. Power off the source first. Final step.':'Converts the frozen image, clones the disk(s), and launches the new Linode. Power off the source first. Final step.')+
+      infoIcon('Converts the frozen image, clones the disk(s), and launches the new Linode. Power off the source first. Final step.')+
       '<button class="danger" onclick="stopMig('+m.id+',this)">Cancel</button>';
   }else if(m.state==='failed' && allDone(m)){
     // A cutover failed but the data is fully replicated — retry re-runs it.
     b+='<button class="primary" onclick="startMig('+m.id+',this)">Retry cutover</button>'+
-      infoIcon(file?'Re-runs the cutover using the files already copied to the destination — reboots it into your migrated system. No re-copy of the source is needed.':'Re-runs the cutover on the data already replicated to this appliance. It first removes any half-built <name>-cutover instance/volumes from the failed attempt, then launches fresh — no re-replication of the source is needed.');
+      infoIcon('Re-runs the cutover on the data already replicated to this appliance. It first removes any half-built <name>-cutover instance/volumes from the failed attempt, then launches fresh — no re-replication of the source is needed.');
   }else{
     // Replication controls (start / pause / resume) precede the cutover button,
     // but only during the replication phase.
     const ctrl=['created','awaiting_agent','replicating','ready'].includes(m.state);
     if(ctrl && !v.replication_started){
-      const startTitle=file&&v.dest_state&&v.dest_state!=='fallback'&&v.dest_state!=='ready'?'Create the destination instance and wait for it to be ready first':'Waiting for the agent connection to be validated';
-      b+='<button class="primary"'+(v.can_replicate?'':' disabled title="'+startTitle+'"')+' onclick="startReplication('+m.id+',this,false)">Start replication</button>'+
-        infoIcon('Replication does not start automatically. Once the agent connection shows a green tick'+(file?' and the destination is ready':'')+', this begins the initial '+(file?'file copy.':'full sync.'));
+      b+='<button class="primary"'+(v.can_replicate?'':' disabled title="Waiting for the agent connection to be validated"')+' onclick="startReplication('+m.id+',this,false)">Start replication</button>'+
+        infoIcon('Replication does not start automatically. Once the agent connection shows a green tick, this begins the initial full sync.');
     }else if(ctrl && v.replication_active){
       b+='<button class="danger" onclick="pauseReplication('+m.id+',this)">Pause replication</button>'+
         infoIcon('Stops sending data after any in-flight pass finishes. Already-copied data is kept; resume continues with an incremental delta — no full re-copy.');
     }else if(ctrl && v.replication_paused){
       b+='<button class="primary"'+(v.can_replicate?'':' disabled title="Waiting for the agent connection"')+' onclick="startReplication('+m.id+',this,true)">Resume replication</button>'+
-        infoIcon(file?'Continues copying — only the files that changed during the pause are re-copied.':'Continues replication with an incremental delta sync — only the blocks changed during the pause are sent.');
+        infoIcon('Continues replication with an incremental delta sync — only the blocks changed during the pause are sent.');
     }
     // Readiness is auto-computed: the Cutover button enables itself once the
-    // initial full sync / file copy is complete (no manual assessment).
+    // initial full sync is complete (no manual assessment).
     const ready=v.can_migrate;
-    b+='<button class="primary"'+(ready?'':' disabled title="'+(file?'The initial file copy must finish first':'The initial full sync must complete on all disks first')+'"')+' onclick="startMig('+m.id+',this)">Cutover instance</button>'+
-      infoIcon(file?'Cuts over to Linode: reboots the already-launched destination into your copied files. Enables once the initial copy completes.':'Cuts over to Linode: stops replication, converts the boot disk, clones every disk into <name>-cutover volumes, and (optionally) launches a <name>-cutover Linode. Enables automatically once the initial full sync completes.');
+    b+='<button class="primary"'+(ready?'':' disabled title="The initial full sync must complete on all disks first"')+' onclick="startMig('+m.id+',this)">Cutover instance</button>'+
+      infoIcon('Cuts over to Linode: stops replication, converts the boot disk, clones every disk into <name>-cutover volumes, and (optionally) launches a <name>-cutover Linode. Enables automatically once the initial full sync completes.');
   }
   // Delete is hidden once the migration is complete (launched / image ready) so
   // the migrated server can't be torn down by accident — use "Close migration"
@@ -1444,9 +1314,6 @@ function migCard(v){
   // the next 5s pass).
   card.dataset.cutcmd=v.cutover_copy_cmd?'1':'';
   card.dataset.frz=v.cutover_freezing?'1':'';
-  // Rebuild when the file-transfer destination's status changes (none → launching
-  // → installing → ready/failed) so its panel + the Start gate update promptly.
-  card.dataset.dest=v.dest_state||'';
   return card;
 }
 
@@ -1521,12 +1388,11 @@ function startTimers(){
       api('GET','/api/v1/migrations/'+id).then(v=>{
         const m=v.migration;
         if(String(m.state)!==card.dataset.state){replaceCard(id,v);return;} // structure changed
-        if((v.dest_state||'')!==card.dataset.dest){replaceCard(id,v);return;} // destination status changed
         if((v.cutover_copy_cmd?'1':'')!==card.dataset.cutcmd){replaceCard(id,v);return;} // copy step appeared/finished
         if((v.cutover_freezing?'1':'')!==card.dataset.frz){replaceCard(id,v);return;} // freeze phase started/ended
         const set=(sel,html)=>{const el=card.querySelector(sel);if(el)el.innerHTML=html;};
         set('#stat'+id,pillFor(v,m));
-        set('#disks'+id,(m.boot_target==='file'?'1 filesystem':disks(m).length+' disk(s)')+'<br>'+(m.boot_target==='file'?(allDone(m)?'files copied':'copying files'):(allDone(m)?'baseline done':'baselining')));
+        set('#disks'+id,disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining'));
         set('#prog'+id,progressLine(v,m));
         set('#rpo'+id,rpoText(v,m));
       }).catch(()=>{});

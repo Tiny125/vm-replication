@@ -37,6 +37,89 @@ For the manual/CLI workflow instead, see [`GETTING_STARTED.md`](docs/GETTING_STA
 
 ---
 
+## Choosing a migration method
+
+The console offers exactly **two** migration methods, picked from one selector
+on the New-migration form (§4). Both are **block-for-block** copies — the
+exact disk contents, not just files — replicated continuously (an initial full
+sync, then deltas every ~60s), and both convert the boot image for Linode at
+cutover (virtio drivers, GRUB/initramfs, network, serial console) and
+**validate it is bootable before you're asked to power off the source**. Both
+carry over the source's users, passwords and SSH keys, and both cap a
+migration at **8 disks** (Linode device slots `sda`–`sdh`). Where they differ:
+
+| | **Disk boot** *(default)* | **Volume boot** |
+|---|---|---|
+| Boot disk lives on | the new Linode's own **local NVMe disk** (free with the plan) | a **Block Storage volume**, cloned into a launchable image volume at cutover |
+| Data disks live on | **Block Storage volumes**, attached at `sdb`, `sdc`, … | **Block Storage volumes**, attached at `sdb`, `sdc`, … |
+| Cutover's last step | **Manual**: the new Linode boots into Rescue Mode and you paste a one-line copy command into its Lish console | **Automated**: the appliance clones the volumes and launches the instance — no operator step |
+| Size ceiling | **Yes** — the plan's local disk must fit the boot disk (the console only offers plans that do) | **None** — Block Storage is sized to the data, independent of any plan |
+| Ongoing cost | Boot disk free with the plan; only data volumes billed | Every disk billed as Block Storage, ≈ **$0.10/GB-month** |
+| Max disks | 8 (boot disk + up to 7 data disks) | 8 |
+
+**The practical difference that matters most:** disk-boot's cutover needs one
+manual paste into the instance's Lish console (see §7, step 3); volume-boot's
+cutover is fully hands-off. In exchange, disk boot is usually cheaper to run
+(no volume cost for the boot disk) and gives the boot disk faster local
+storage — but only if a plan's local disk is big enough to hold it; volume
+boot has no such ceiling. See **"Block Storage to provision"** below for the
+storage-sizing math (peak/settled GB) behind each method, and **"Sizing
+local-disk boot"** in §4 for how the plan-fit constraint plays out in practice.
+
+### The process, step by step
+
+Both methods share the same create → enroll → replicate → cutover → close
+flow (§4–§7); only the two starred steps differ.
+
+**Disk boot (default):**
+1. Create the migration, choosing **Linode local disk** as the method, and add
+   one disk row per source disk (§4).
+2. ★ Pick a **plan whose local disk fits the boot disk** — the console only
+   lists plans that do, and names a bigger one if your first choice is too
+   small.
+3. Run the generated enrollment command on the source (§5); the agent
+   replicates every disk to the appliance.
+4. Watch replication and validation in the console (§6).
+5. Cut over (§7): stop the source, click **Cutover instance** — the appliance
+   takes a final pass and validates the converted boot image while the source
+   is still running.
+6. ★ Power off the source, click **Launch instance**: the new Linode boots
+   into **Rescue Mode** and the card shows a one-line copy command — paste it
+   into the instance's **Lish console**. The image streams onto the local
+   disk with live progress; the instance powers itself off and the appliance
+   boots it from the local disk automatically.
+7. Remove the source agent and **Close** the migration (§7).
+
+**Volume boot:**
+1. Create the migration, choosing **separate Block Storage volume** as the
+   method, and add one disk row per source disk (§4). No plan-fit constraint —
+   pick any plan.
+2. Run the generated enrollment command on the source (§5); the agent
+   replicates every disk to its own Block Storage volume.
+3. Watch replication and validation in the console (§6).
+4. Cut over (§7): stop the source, click **Cutover instance** — the appliance
+   takes a final pass and validates the converted boot image while the source
+   is still running.
+5. Power off the source, click **Launch instance**: the appliance **clones
+   every volume** into a launchable image volume and boots a new Linode from
+   them — no Rescue Mode, no manual step.
+6. Remove the source agent and **Close** the migration (§7).
+
+### Guidance
+
+- **Disk boot (default)** suits most servers: cheaper to run and faster
+  storage, at the cost of one manual Lish paste at cutover and needing a plan
+  whose local disk fits the boot disk.
+- **Volume boot** suits: a boot disk too large for any reasonable plan;
+  wanting a fully hands-off cutover with no Lish step; or wanting to keep the
+  volumes themselves as reusable artifacts.
+
+Not sure which applies to a given server? The **Source check** (§3.5) reports
+a verdict — Supported / Supported with cautions / Not supported — for each
+method against that specific source, before you commit to either.
+
+---
+
 ## Prerequisites — sizing the replication server
 
 One appliance migrates **many servers (and many disks) in parallel** — each
@@ -331,9 +414,8 @@ Singapore appliance gets a Singapore bucket). Override with the
 ## 3.5 Check the source first (Source check tab)
 
 Before creating a migration, run the **Source check** — a **read-only
-pre-migration assessment** that tells you whether a server can migrate, **which
-of the three methods it supports**, and which **destination OS image** to pick
-for file transfer.
+pre-migration assessment** that tells you whether a server can migrate and
+**which of the two methods it supports**.
 
 1. Open the **Source check** tab and click **Generate check command**.
 2. Run the shown one-liner on the **source server** as root (valid for 30
@@ -343,23 +425,17 @@ for file transfer.
    connects back to a temporary probe port on the appliance). It sends one
    report and exits — **nothing is installed**, so there is nothing to remove.
 3. The tab updates itself when the report arrives: source facts as ✔/✘ checks,
-   plus a verdict per method — **Supported**, **Supported with cautions** (with
-   the exact reasons, e.g. *SELinux enforcing: file copy does not preserve
-   contexts*), or **Not supported** (e.g. *LUKS-encrypted root cannot be
-   converted — use file transfer*) — and the recommended Linode image
-   (e.g. Ubuntu 24.04 source → `linode/ubuntu24.04`).
+   plus a verdict per method — **Supported**, **Supported with cautions**, or
+   **Not supported** (e.g. *LUKS-encrypted root cannot be converted to boot on
+   Linode*) — with the exact reasons.
 
 What it evaluates: x86_64 requirement (hard fail otherwise), distro/version
 recognition, systemd presence (the agent installs as a systemd timer),
-convertible root filesystem for the block methods (ext2/3/4/XFS supported; LVM
-fine; btrfs cautioned; ZFS/LUKS refused), software-RAID caution, the 10 TiB
-Block Storage per-volume limit, SELinux mode for file transfer, **cloud
-ephemeral disks** (Azure's temporary resource disk at `/mnt` is flagged
-"do not block-migrate" and excluded from size checks), and data-plane
-reachability (TCP 5000–5100). Approximate image recommendations carry an
-honest note — e.g. Amazon Linux → AlmaLinux is RHEL-family but **not a
-drop-in**; RHEL → AlmaLinux is the binary-compatible rebuild; SLES → openSUSE
-Leap shares the codebase.
+convertible root filesystem (ext2/3/4/XFS supported; LVM fine; btrfs cautioned;
+ZFS/LUKS refused), software-RAID caution, the 10 TiB Block Storage per-volume
+limit, **cloud ephemeral disks** (Azure's temporary resource disk at `/mnt` is
+flagged "do not block-migrate" and excluded from size checks), and data-plane
+reachability (TCP 5000–5100).
 
 **Works offline too.** The script prints the **full result in the source
 server's own terminal** before delivering it, so even when the network to the
@@ -372,20 +448,13 @@ receives it as well.
 
 ## 4. Create a migration (single or multi-disk)
 
-> **Migration method.** The **New migration** form offers three methods from one
-> selector: **File transfer** (the default — copies only used files onto a fresh
-> Linode you pick an OS image for) and the two **block** methods (separate Block
-> Storage volume, or Linode local disk). The disk rows below apply to the **block**
-> methods. For **File transfer** you instead pick a **destination OS image** + plan
-> and, after creating the migration, use the card's **Create destination instance**
-> step (name it + set a root password) — **Start replication** unlocks only once
-> that destination's file receiver is confirmed ready (with a manual-install
-> fallback if cloud-init can't reach it; the console **keeps watching
-> indefinitely** and unlocks Start whenever the receiver answers — even from a
-> manual Lish install done much later). See
-> [`docs/FILE-MIGRATION.md`](docs/FILE-MIGRATION.md) for the full file-transfer flow.
+> **Migration method.** The **New migration** form offers two **block**
+> methods from one selector: **Linode local disk** (the default) and
+> **separate Block Storage volume**. Both take the same disk rows below; see
+> **"Choosing a migration method"** above for the full comparison and how to
+> decide.
 
-For the **block** methods: click **New migration**, enter a **Name** and
+Click **New migration**, enter a **Name** and
 **hostname**, then **add one disk row per source disk** (device + size in GB). The **first row is the boot disk**
 (the one whose partitions include the root filesystem `/`); additional rows are
 data disks. A server with everything on one disk just has a single row.
@@ -413,13 +482,15 @@ data disks are listed.
 Use the **whole disks** (e.g. `/dev/sda`, `/dev/sdb`), not partitions. For LVM,
 if a volume group spans multiple disks, add **all** of its member disks.
 
-**Boot target & plan.** Choose how the cutover instance boots — a **separate
-Block Storage volume** (default) or the Linode's **local disk** — and pick the
+**Boot target & plan.** Choose how the cutover instance boots — the Linode's
+**local disk** (default) or a **separate Block Storage volume** — and pick the
 **Linode plan** (Shared or Dedicated). The form lists each plan's vCPU/RAM/disk
 and price; for the volume option it also shows the estimated monthly Block
 Storage cost (≈ $0.10/GB) and an estimated total. For local-disk boot only
-plans whose disk fits your data are offered (single-disk migrations only). The
-launched instance uses this plan at cutover.
+plans whose local disk fits your **boot disk** are offered — any further disks
+become attached Block Storage volumes, so a multi-disk source is not
+constrained by the plan's disk size. The launched instance uses this plan at
+cutover.
 
 > **Sizing local-disk boot.** The whole source disk is copied, so the plan's
 > local disk has to hold all of it — not just the used part. A stock 50 GB
@@ -483,23 +554,6 @@ retry with:
 sudo systemctl start vmrepl-agent.service
 ```
 
-**File transfer: "the copy seems to be running but *Initial file copy complete*
-never turns green."** That check is driven by the source agent's report of a
-finished pass, so work back along that chain:
-
-1. On the **source**, `journalctl -u vmrepl-agent -f` — you want a
-   `file pass complete: N entries, … on wire` line. If you only ever see
-   `streaming files directly to the destination`, the pass has not finished yet
-   (large sources take a while); if it errors, fix that first.
-2. On the **destination**, `systemctl status vmrepl-receiver` must be
-   `active (running)` and `ss -lntp | grep 5999` must show it listening.
-3. If the card says the agent is an **older build that cannot confirm the copy**,
-   re-run the enrollment one-liner on the source (no re-copy — the delta
-   checkpoint is kept).
-
-Re-running the enrollment one-liner is also safe at any time — it stops the
-previous agent and replaces it atomically.
-
 ### Wrong-disk & stale-agent protection
 
 Every agent session is checked at the handshake, before it can show as
@@ -548,50 +602,16 @@ right after the appliance was updated/restarted).
 Each migration shows aggregate progress and a **per-disk table** (expand
 **Disks**), plus a checklist that requires **all disks**:
 - ✔ Agent connected — _N/N disks checked in_
-- ✔ Initial full sync complete — _N/N disks baselined_ (block methods)
-- ✔ **Initial file copy complete** — _files copied_ (file transfer)
+- ✔ Initial full sync complete — _N/N disks baselined_
 - ✔ Replication lag within target — _worst lag across disks_
-- ✔ Storage provisioned — _N/N volumes ready_ (block methods) / ✔ Destination ready (file transfer)
+- ✔ Storage provisioned — _N/N volumes ready_
 
 When all checks pass, run **Pre-migration assessment**; on success the **Cutover
 instance** button enables.
 
-### File transfer: the copy is complete when the AGENT says so
-
-In file transfer the agent streams your files **straight into the destination
-Linode** — the data never passes through the replication server. So the console
-cannot see the copy finish by watching its own receiver; it learns that a pass
-finished from the **source agent**, which reports each completed pass on its
-next check-in.
-
-Two consequences worth knowing:
-
-- **"Initial file copy complete" turns green up to ~60 s after the copy actually
-  ends** — the agent reports on its next tick. It is deliberately late rather
-  than early: the check going green means a pass that walked your **whole**
-  source tree has been confirmed delivered.
-- **While the first pass is still running** the check stays amber and says
-  _"first copy pass streaming to the destination (N min so far) — it must finish
-  before cutover"_. On a large source that can be hours. That is the copy
-  working, not a stall — watch **transferred / speed** on the card, and
-  `journalctl -u vmrepl-agent -f` on the source for `file pass complete` lines.
-
-If the check instead says **"the source agent is an older build that cannot
-confirm the copy finished"**, re-run the enrollment one-liner on the source. It
-updates the agent in place — **nothing is re-copied**, the delta checkpoint is
-kept. If it says **"the last pass ended early"**, the agent hit an error partway
-through the walk; it retries automatically every ~60 s, and cutover needs one
-complete pass.
-
 ---
 
 ## 7. Cut over the instance
-
-> **File transfer — never power the source off before the check is green.** The
-> **Initial file copy complete** check is the *only* signal that your files
-> actually reached the destination; the copy runs source→destination, so the
-> card cannot infer it any other way. **Cutover instance** stays disabled until a
-> complete pass is confirmed. Wait for the green tick, then follow the steps.
 
 Cutover is **three steps: freeze the image, power off the source, launch** (the same for volume-boot and
 local-disk boot):

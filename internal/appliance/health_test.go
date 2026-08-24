@@ -6,7 +6,31 @@ import (
 	"testing"
 
 	"github.com/tiny125/vm-replication/internal/api"
+	"github.com/tiny125/vm-replication/internal/store"
 )
+
+// automationServer builds a Server backed by an in-memory store with a Linode
+// token and a known appliance instance id set, so Linode-automation-gated code
+// paths (e.g. provisioning, plan sizing) can be exercised without real network
+// calls.
+func automationServer(t *testing.T) *Server {
+	t.Helper()
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	st.SetEncryptionKey(make([]byte, 32)) // deterministic test key for at-rest token
+	if err := st.SetLinodeToken(context.Background(), "tok-123"); err != nil {
+		t.Fatalf("set token: %v", err)
+	}
+	s := &Server{st: st, ctx: context.Background()}
+	s.cfg.ApplianceLinodeID = 42
+	s.cfg.RPOTargetSec = 120
+	s.cfg.PublicHost = "203.0.113.10"
+	s.cfg.ConsolePort = 8080
+	return s
+}
 
 func TestApplianceDiskFree(t *testing.T) {
 	free, total, ok := applianceDiskFree(t.TempDir())

@@ -32,11 +32,6 @@ import (
 // ---- per-disk paths ----
 
 func (s *Server) diskDevicePath(m api.Migration, d api.Disk) string {
-	// File transfer: the receiver writes the source's file TREE into a staging
-	// directory (handleFileSession), not a block device/image.
-	if isFileMethod(m.BootTarget) {
-		return s.fileStageRoot(m)
-	}
 	if d.VolumeDevice != "" {
 		return d.VolumeDevice
 	}
@@ -51,9 +46,6 @@ func (s *Server) diskDevicePath(m api.Migration, d api.Disk) string {
 // disk alone would mark every data mount unverifiable. Paths may be
 // /dev/disk/by-id/... symlinks; the script canonicalises them.
 func (s *Server) migratedDevicePaths(m api.Migration) string {
-	if isFileMethod(m.BootTarget) {
-		return "" // no block devices involved
-	}
 	paths := make([]string, 0, len(m.Disks))
 	for _, d := range m.Disks {
 		if p := s.diskDevicePath(m, d); p != "" {
@@ -61,12 +53,6 @@ func (s *Server) migratedDevicePaths(m api.Migration) string {
 		}
 	}
 	return strings.Join(paths, " ")
-}
-
-// fileStageRoot is where a file-transfer migration's copied tree is staged on
-// the appliance before it is delivered to the launched destination at cutover.
-func (s *Server) fileStageRoot(m api.Migration) string {
-	return filepath.Join(s.cfg.DataDir, fmt.Sprintf("filemig-%d-root", m.ID))
 }
 
 func (s *Server) diskManifestPath(m api.Migration, d api.Disk) string {
@@ -168,25 +154,6 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 				return
 			}
 			lastErrEvt = "" // a pass landed; log the next failure even if it repeats
-			// File-transfer session: no block geometry (BlockSize/DeviceSize are 0,
-			// so NumBlocks would divide by zero). Only a pass that walked the WHOLE
-			// tree is the baseline — a walk that ended early applied real data but
-			// must not unlock cutover. This is the appliance-STAGING path; a direct
-			// (redirected) migration never reaches it and baselines from the agent's
-			// pass report instead — see recordDirectFilePass.
-			if st.Hello.Mode == protocol.ModeFile {
-				wasBaselined := s.diskBaselined(migID, diskID)
-				if err := s.st.RecordDiskSync(s.ctx, migID, diskID, st.Complete, st.BlocksWritten, st.ChangedBlocks, st.BytesOnWire); err != nil {
-					log.Printf("appliance: record file sync (migration %d disk %d): %v", migID, diskID, err)
-				}
-				switch {
-				case st.Complete && !wasBaselined:
-					_ = s.st.AddEvent(s.ctx, migID, "info", fmt.Sprintf("file copy complete: %d items (%s) staged for %s — ready to cut over. The destination now carries the source's users, passwords and SSH keys — log in with the SOURCE's credentials from here on, not the root password you set when creating it. Its kernel, boot files and network config stay its own until cutover.", st.BlocksWritten, humanBytes(st.BytesOnWire), dev0))
-				case !st.Complete:
-					_ = s.st.AddEvent(s.ctx, migID, "warn", fmt.Sprintf("the file copy pass ended before the whole source tree was walked (%d items, %s) — the copy is NOT complete; the agent retries on its next pass (~60s)", st.BlocksWritten, humanBytes(st.BytesOnWire)))
-				}
-				return
-			}
 			total := blockdiff.NumBlocks(st.Hello.DeviceSize, st.Hello.BlockSize)
 			bytes := st.BlocksWritten * int64(st.Hello.BlockSize)
 			wasBaselined := s.diskBaselined(migID, diskID)
@@ -247,38 +214,27 @@ func (s *Server) ensureDiskReceiver(m api.Migration, d api.Disk, tlsCfg *tls.Con
 			// disk. Everything else is rejected at the Hello, before any data
 			// lands and before the console shows "agent connected".
 			return checkAgentHello(expectJob, declaredSize, diskIdx, dev0, h)
-		}, func(h protocol.Hello) (string, string, bool) {
-			// File-transfer redirect: send the agent straight to the launched
-			// destination Linode (direct copy, no appliance staging). Returns
-			// hold=true while the destination is still launching/booting, the
-			// destination target once its receiver is up, or ("","",false) when
-			// there is no automation (appliance-staging fallback).
-			//
-			// It is ALSO where a DIRECT migration learns that a copy pass finished:
-			// the file data never touches this appliance, so the agent reports its
-			// last completed pass in this Hello (like the replication gate above,
-			// this hook doubles as a reporting channel). Recorded BEFORE the
-			// hold/redirect decision, so a finished pass is still credited if the
-			// destination momentarily probes not-ready.
-			s.recordDirectFilePass(migID, diskID, dev0, h)
-			target, sni, hold := s.fileDataTarget(migID)
-			if target != "" {
-				// Data is about to flow straight to the destination. Advance the
-				// console to "replicating": the block path does this from onProgress,
-				// which a redirected session never reaches — without this the card
-				// would sit on "waiting for agent" for the whole first pass.
-				if err := s.st.MarkReplicating(s.ctx, migID); err != nil {
-					log.Printf("appliance: mark replicating (migration %d): %v", migID, err)
-				}
-				s.noteDirectStreaming(migID, diskID, target, h)
-			}
-			return target, sni, hold
 		})
 		if err != nil && ctx.Err() == nil {
 			log.Printf("appliance: receiver (migration %d disk %d) stopped: %v", migID, diskID, err)
 		}
 	}()
 	return nil
+}
+
+// diskBaselined reports whether a disk has already recorded its initial full
+// sync. Used to emit the "initial full sync complete" event exactly once.
+func (s *Server) diskBaselined(migID, diskID int64) bool {
+	m, err := s.st.Migration(s.ctx, migID)
+	if err != nil {
+		return false
+	}
+	for _, d := range m.Disks {
+		if d.ID == diskID {
+			return d.FullSyncDone
+		}
+	}
+	return false
 }
 
 // replicationEnabled reports whether the receiver should apply data for a
@@ -634,16 +590,7 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 		total += d.SizeBytes
 	}
 	switch req.BootTarget {
-	case api.BootTargetFile:
-		// File-transfer: one source entry sized by USED bytes, a destination OS
-		// image, and a plan whose disk fits used+headroom. No block volume is
-		// provisioned (the data streams to a launched destination).
-		if err := s.validateFileCreate(ctx, &req, total); err != nil {
-			writeErr(w, http.StatusBadRequest, err.Error())
-			return
-		}
-	case "", api.BootTargetVolume:
-		req.BootTarget = api.BootTargetVolume
+	case api.BootTargetVolume:
 		// Validate the picked plan exists, when we have a token to check against.
 		if req.LinodeType != "" {
 			if cl, ok := s.linodeClient(ctx); ok {
@@ -658,7 +605,10 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-	case api.BootTargetDisk:
+	case "", api.BootTargetDisk:
+		// Empty boot_target defaults to local-disk boot (the default migration
+		// method).
+		req.BootTarget = api.BootTargetDisk
 		// Multi-disk local-disk boot: the FIRST disk becomes the instance's own
 		// local disk (free with the plan, NVMe-backed) and every other disk is
 		// cloned into a Block Storage volume attached to the same instance. So
@@ -714,6 +664,13 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 			}
 			req.LinodeType = plan.ID
 		}
+	case "file":
+		// The file-transfer method has been removed entirely — give a clear,
+		// actionable message instead of the generic "must be 'volume' or 'disk'"
+		// (which doesn't explain WHY 'file' — a value that used to work — no
+		// longer does).
+		writeErr(w, http.StatusBadRequest, "the file-transfer migration method has been removed — create the migration with boot_target 'disk' (the default, boots from the Linode's own local disk) or 'volume' (boots from a separate Block Storage volume) instead")
+		return
 	default:
 		writeErr(w, http.StatusBadRequest, "boot_target must be 'volume' or 'disk'")
 		return
@@ -734,21 +691,18 @@ func (s *Server) handleCreateMigration(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		// Block methods provision a replication volume per disk here; the file
-		// method streams to a launched destination and provisions none.
-		if provisionsBlockStorage(m.BootTarget) {
-			if err := s.provisionDiskStorage(ctx, m, d); err != nil {
-				s.rollbackCreate(ctx, m.ID)
-				writeErr(w, http.StatusInternalServerError, "provision storage: "+err.Error())
-				return
-			}
+		// Provision a replication volume per disk (each block method uses it:
+		// volume boot as the boot artifact itself, disk boot as staging that later
+		// streams onto the instance's local disk).
+		if err := s.provisionDiskStorage(ctx, m, d); err != nil {
+			s.rollbackCreate(ctx, m.ID)
+			writeErr(w, http.StatusInternalServerError, "provision storage: "+err.Error())
+			return
 		}
 	}
 
 	_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("migration created with %d disk(s); waiting for the source agent", len(m.Disks)))
-	if isFileMethod(m.BootTarget) {
-		_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("method: file transfer — copies used files onto a new %s Linode running %s", m.LinodeType, m.OSImage))
-	} else if m.BootTarget == api.BootTargetDisk {
+	if m.BootTarget == api.BootTargetDisk {
 		_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("boot target: Linode local disk (%s plan %s)", m.PlanClass, m.LinodeType))
 	} else if m.LinodeType != "" {
 		_ = s.st.AddEvent(ctx, m.ID, "info", fmt.Sprintf("boot target: separate Block Storage volume; launch plan %s", m.LinodeType))
@@ -797,36 +751,13 @@ func (s *Server) handleLinodePlans(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"plans": plans})
 }
 
-// handleLinodeImages returns the deployable public OS images (grouped by vendor
-// client-side), for the file-transfer method's destination OS dropdown.
-func (s *Server) handleLinodeImages(w http.ResponseWriter, r *http.Request) {
-	cl, ok := s.linodeClient(r.Context())
-	if !ok {
-		writeErr(w, http.StatusBadRequest, "add a valid Linode API token in Settings to load OS images")
-		return
-	}
-	images, err := cl.ListImages(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, "could not load Linode images: "+err.Error())
-		return
-	}
-	// Only public distribution images make sense as a fresh destination OS.
-	out := []map[string]any{}
-	for _, im := range images {
-		if !im.IsPublic {
-			continue
-		}
-		out = append(out, map[string]any{"id": im.ID, "label": im.Label, "vendor": im.Vendor})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"images": out})
-}
-
 // provisionDiskStorage creates and attaches a Linode volume for one disk when
-// automation is configured; otherwise it's a no-op (file fallback).
+// automation is configured; otherwise it's a no-op (no Linode token/appliance-id
+// configured yet).
 func (s *Server) provisionDiskStorage(ctx context.Context, m api.Migration, d api.Disk) error {
 	cl, ok := s.linodeClient(ctx)
 	if !ok || s.cfg.ApplianceLinodeID == 0 {
-		return nil // file fallback
+		return nil // no Linode automation configured
 	}
 	// Size the volume to exactly the entered size, rounded up to whole GiB. The
 	// console form computes size_bytes as <GB input> * 2^30, so this matches the
@@ -966,31 +897,16 @@ func (s *Server) handleStartReplication(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusConflict, "the agent has not connected on all disks yet — wait for the connection to be validated")
 		return
 	}
-	// File transfer (direct): the destination instance must be created and its
-	// receiver reachable before the agent can copy into it. This mirrors the
-	// disabled Start button and rejects a raced/scripted call.
-	if !s.destReady(m) {
-		writeErr(w, http.StatusConflict, "create the destination instance first and wait for it to be ready before starting the copy")
-		return
-	}
 	resuming := replicationHasRun(m)
 	if err := s.st.SetReplicationEnabled(ctx, id, true); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	switch {
-	case resuming && isFileMethod(m.BootTarget):
-		_ = s.st.AddEvent(ctx, id, "info", "replication resumed by operator; the agent re-copies only the files that changed during the pause on its next pass (within ~60s)")
-	case resuming:
+	if resuming {
 		_ = s.st.AddEvent(ctx, id, "info", "replication resumed by operator; the agent ships only the blocks changed during the pause on its next pass (within ~60s)")
-	case isFileMethod(m.BootTarget):
-		_ = s.st.AddEvent(ctx, id, "info", "replication started by operator; launching the destination Linode, then the agent copies your used files straight into it (within ~60s)")
-	default:
+	} else {
 		_ = s.st.AddEvent(ctx, id, "info", "replication started by operator; the agent will stream the initial full sync on its next pass (within ~60s)")
 	}
-	// File transfer (direct): the destination is created explicitly by the operator
-	// ("Create destination instance") BEFORE this point, and Start is gated on its
-	// receiver being ready (see CanReplicate), so there is nothing to launch here.
 	// Receivers are already listening from create time; they will now accept data.
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "replicating"})
 }
@@ -1023,11 +939,7 @@ func (s *Server) handlePauseReplication(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if isFileMethod(m.BootTarget) {
-		_ = s.st.AddEvent(ctx, id, "info", "replication paused by operator; a pass already in flight finishes, then the agent holds. Resume to continue re-copying only the files that changed (no full re-copy).")
-	} else {
-		_ = s.st.AddEvent(ctx, id, "info", "replication paused by operator; a pass already in flight finishes, then the agent holds. Resume to continue with an incremental delta sync (no full re-copy).")
-	}
+	_ = s.st.AddEvent(ctx, id, "info", "replication paused by operator; a pass already in flight finishes, then the agent holds. Resume to continue with an incremental delta sync (no full re-copy).")
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "paused"})
 }
 
@@ -1051,19 +963,11 @@ func (s *Server) handleStartMigration(w http.ResponseWriter, r *http.Request) {
 	// full sync is complete. No manual assessment, and the live agent/lag don't
 	// gate it (so a previously-failed cutover can be retried).
 	if !cutoverReady(m) {
-		if isFileMethod(m.BootTarget) {
-			writeErr(w, http.StatusConflict, "the initial file copy must finish before cutover")
-		} else {
-			writeErr(w, http.StatusConflict, "the initial full sync must finish on all disks before cutover")
-		}
+		writeErr(w, http.StatusConflict, "the initial full sync must finish on all disks before cutover")
 		return
 	}
 	if m.State == api.MigFailed {
-		if isFileMethod(m.BootTarget) {
-			_ = s.st.AddEvent(ctx, id, "info", "retrying cutover — rebooting the destination into the copied files")
-		} else {
-			_ = s.st.AddEvent(ctx, id, "info", "retrying cutover on the already-replicated data")
-		}
+		_ = s.st.AddEvent(ctx, id, "info", "retrying cutover on the already-replicated data")
 	}
 	if err := s.st.SetMigrationState(ctx, id, api.MigMigrating, ""); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -1110,11 +1014,7 @@ func (s *Server) handleCompleteCutover(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if isFileMethod(m.BootTarget) {
-		_ = s.st.AddEvent(ctx, id, "info", "cutover: operator confirmed — rebooting the destination into your copied files")
-	} else {
-		_ = s.st.AddEvent(ctx, id, "info", "cutover: operator confirmed — completing (convert, clone, launch)")
-	}
+	_ = s.st.AddEvent(ctx, id, "info", "cutover: operator confirmed — completing (convert, clone, launch)")
 	finCtx, cancel := context.WithCancel(s.ctx)
 	s.recMu.Lock()
 	s.finalizes[id] = cancel
@@ -1242,7 +1142,7 @@ type cleanupOpts struct {
 //     are deleted unless opts.keepLaunched is set.
 //   - The vmrep-<name> replication volume is deleted, or only DETACHED and kept
 //     when opts.keepReplVolume is set.
-//   - File-fallback images and manifests are always removed.
+//   - Disk images and manifests are always removed.
 func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration, opts cleanupOpts) {
 	s.recMu.Lock()
 	if cancel := s.finalizes[m.ID]; cancel != nil {
@@ -1251,7 +1151,6 @@ func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration,
 	}
 	s.recMu.Unlock()
 	s.stopReceivers(m)
-	s.dropFileDest(m.ID)          // forget any direct file-transfer destination tracking
 	s.cutoverConvert.Delete(m.ID) // forget any cached phase-1 conversion result
 
 	cl, haveLinode := s.linodeClient(ctx)
@@ -1293,8 +1192,6 @@ func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration,
 				_ = cl.DetachVolume(ctx, d.VolumeID) // detach but keep, for reference
 				log.Printf("appliance: migration %d: replication volume %d detached and kept for reference", m.ID, d.VolumeID)
 			}
-		} else if isFileMethod(m.BootTarget) {
-			_ = os.RemoveAll(s.diskDevicePath(m, d)) // the file-staging tree
 		} else {
 			_ = os.Remove(s.diskDevicePath(m, d))
 		}
@@ -1313,17 +1210,6 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	}()
 	canceled := func() bool { return ctx.Err() != nil }
 	sctx := s.ctx // store writes survive a Stop (which owns its own transition)
-
-	// msg picks method-appropriate wording: the file method copies files onto an
-	// already-launched destination (no image/volume/convert), so its cutover
-	// events must not use block-method vocabulary.
-	fileMode := isFileMethod(m.BootTarget)
-	msg := func(fileMsg, blockMsg string) string {
-		if fileMode {
-			return fileMsg
-		}
-		return blockMsg
-	}
 
 	// Guided step 1 is now running (drain + freeze): light the console's "keep
 	// the source running" banner until the migration parks in awaiting_cutover
@@ -1346,9 +1232,8 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	//    sources, quiesce the source first and use skip — see docs/CUTOVER.md.
 	consistent := false
 	if req.SkipSnapshot {
-		_ = s.st.AddEvent(sctx, m.ID, "info", msg(
-			"cutover: replication stopped; holding the copied files for launch. Power off the source before launching so the copy is final.",
-			"cutover: replication stopped; freezing the current replicated copy as the image (crash-consistent, repaired with fsck on convert). Power off the source before launching so the captured state is final."))
+		_ = s.st.AddEvent(sctx, m.ID, "info",
+			"cutover: replication stopped; freezing the current replicated copy as the image (crash-consistent, repaired with fsck on convert). Power off the source before launching so the captured state is final.")
 		consistent = true // operator's assertion
 	} else if !s.sourceAgentActive(m) {
 		// No agent checked in — the source appears powered off, so the current
@@ -1384,46 +1269,41 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 	drainStart := time.Now()
 	if s.drainReceivers(m, receiver.DrainGrace) {
 		if waited := time.Since(drainStart); waited > 2*time.Second {
-			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf(msg(
-				"cutover: waited %s for the in-flight file-copy pass to end — passes apply atomically (an interrupted pass is discarded whole), so the copied files are the last complete pass",
-				"cutover: waited %s for the in-flight replication pass to end — delta passes apply atomically (an interrupted pass is discarded whole), so the frozen image is the last complete pass"), waited.Round(time.Second)))
+			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf(
+				"cutover: waited %s for the in-flight replication pass to end — delta passes apply atomically (an interrupted pass is discarded whole), so the frozen image is the last complete pass", waited.Round(time.Second)))
 		}
 	} else {
-		_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf(msg(
-			"cutover: a file-copy pass was still running after %s and was severed; its partial data was discarded whole — the copied files remain the last completely applied pass",
-			"cutover: a replication pass was still running after %s and was severed; its staged data was discarded whole — the frozen image remains the last completely applied pass"), receiver.DrainGrace))
+		_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf(
+			"cutover: a replication pass was still running after %s and was severed; its staged data was discarded whole — the frozen image remains the last completely applied pass", receiver.DrainGrace))
 	}
 	s.clearConsistency(m)
 
 	if req.GuidedShutdown {
 		// Guided cutover: a consistent point-in-time image is now frozen (receivers
-		// stopped). For the BLOCK methods, run — and validate — the boot-disk
-		// conversion NOW, while the source is still running, so a conversion failure
-		// (wrong disk, inconsistent image, bad environment) surfaces BEFORE the
-		// operator powers the source off. Only once it is validated do we ask them to
-		// power off. File transfer has no block image to convert, so it skips this.
-		if !isFileMethod(m.BootTarget) {
-			co, canc := s.convertBootDisk(ctx, m, req)
-			if canc {
-				return
-			}
-			if co.failed {
-				// Fail now — the source is still running and nothing was launched, so
-				// the operator can fix the cause and retry without any downtime.
-				switch {
-				case co.noRoot:
-					s.fail(m.ID, "cutover aborted before power-off — "+wrongDiskMsg)
-				case co.mountIssue:
-					s.fail(m.ID, convertMountMsg)
-				case co.envIssue:
-					s.fail(m.ID, "boot disk conversion failed because a required command was missing in the conversion environment (exit 127 / \"command not found\"). This is an appliance/PATH bug, NOT an inconsistent source — re-syncing won't help. Update the appliance to the latest build, restart applianced, and retry the cutover. Nothing was launched and the source was NOT powered off.")
-				default:
-					s.fail(m.ID, "boot disk conversion failed BEFORE power-off, so the launched instance would not boot (grub> prompt). The replicated filesystem is most likely inconsistent — retry the cutover and let it take the read-only snapshot (don't tick \"skip\" unless the source is already powered off). Nothing was launched and the source was NOT powered off; see the conversion detail above.")
-				}
-				return
-			}
-			s.storeCutoverConvert(m.ID, co)
+		// stopped). Run — and validate — the boot-disk conversion NOW, while the
+		// source is still running, so a conversion failure (wrong disk, inconsistent
+		// image, bad environment) surfaces BEFORE the operator powers the source
+		// off. Only once it is validated do we ask them to power off.
+		co, canc := s.convertBootDisk(ctx, m, req)
+		if canc {
+			return
 		}
+		if co.failed {
+			// Fail now — the source is still running and nothing was launched, so
+			// the operator can fix the cause and retry without any downtime.
+			switch {
+			case co.noRoot:
+				s.fail(m.ID, "cutover aborted before power-off — "+wrongDiskMsg)
+			case co.mountIssue:
+				s.fail(m.ID, convertMountMsg)
+			case co.envIssue:
+				s.fail(m.ID, "boot disk conversion failed because a required command was missing in the conversion environment (exit 127 / \"command not found\"). This is an appliance/PATH bug, NOT an inconsistent source — re-syncing won't help. Update the appliance to the latest build, restart applianced, and retry the cutover. Nothing was launched and the source was NOT powered off.")
+			default:
+				s.fail(m.ID, "boot disk conversion failed BEFORE power-off, so the launched instance would not boot (grub> prompt). The replicated filesystem is most likely inconsistent — retry the cutover and let it take the read-only snapshot (don't tick \"skip\" unless the source is already powered off). Nothing was launched and the source was NOT powered off; see the conversion detail above.")
+			}
+			return
+		}
+		s.storeCutoverConvert(m.ID, co)
 		// Pause for the operator to power the source off (verified by the agent going
 		// silent), then resume via /complete. Stash the request so phase 2 reuses the
 		// options.
@@ -1431,9 +1311,8 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		s.pendingCutover[m.ID] = req
 		s.recMu.Unlock()
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigAwaitingCutover, "")
-		_ = s.st.AddEvent(sctx, m.ID, "info", msg(
-			"cutover step 1 done: replication stopped and the copied files held for launch. Now POWER OFF the source server, then click \"Launch instance\" to reboot the destination into your migrated files.",
-			"cutover step 1 done: the boot image was converted and VALIDATED as bootable. It is now safe to POWER OFF the source server — then click \"Launch instance\" to clone and launch."))
+		_ = s.st.AddEvent(sctx, m.ID, "info",
+			"cutover step 1 done: the boot image was converted and VALIDATED as bootable. It is now safe to POWER OFF the source server — then click \"Launch instance\" to clone and launch.")
 		return
 	}
 	s.finalizeComplete(ctx, m, req)
@@ -1562,14 +1441,6 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 	}()
 	canceled := func() bool { return ctx.Err() != nil }
 	sctx := s.ctx
-
-	// File transfer: no block conversion/clone — launch the destination from the
-	// chosen OS image and deliver the staged file tree onto it. Wholly separate
-	// from the block finalize below.
-	if isFileMethod(m.BootTarget) {
-		s.finalizeFile(ctx, m, req)
-		return
-	}
 
 	boot := m.Disks[0] // the boot disk (its cloned volume is the headline artifact)
 
@@ -2080,48 +1951,6 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %q (id %d) is booting from its local disk on plan %s%s", instLabel, inst.ID, m.LinodeType, withData))
 }
 
-// finalizeFile cuts over a FILE-transfer migration. The destination was already
-// launched at "Start replication" and the agent has been copying the source's
-// files STRAIGHT INTO it (direct, no appliance staging). Cutover just reboots
-// the destination so it comes up running the migrated files, then marks the
-// migration launched.
-func (s *Server) finalizeFile(ctx context.Context, m api.Migration, req api.FinalizeRequest) {
-	sctx := s.ctx
-	cl, ok := s.linodeClient(sctx)
-	if !ok || s.cfg.ApplianceLinodeID == 0 {
-		_ = s.st.SetMigrationState(sctx, m.ID, api.MigImageReady,
-			"Linode automation not configured; the copied files are staged on the appliance")
-		_ = s.st.SetMigrateFinished(sctx, m.ID)
-		return
-	}
-	instID := m.LaunchedID
-	if v, ok := s.fileDests.Load(m.ID); ok {
-		if d := v.(*fileDest); d.instanceID != 0 {
-			instID = d.instanceID
-		}
-	}
-	if instID == 0 {
-		s.fail(m.ID, "the destination was never launched — click Start replication first so the destination comes up and receives your files, then cut over")
-		return
-	}
-	// Reboot the destination so it boots cleanly into the migrated files (the
-	// receiver copied them onto its live root while it idled).
-	if err := cl.RebootInstance(ctx, instID); err != nil {
-		s.fail(m.ID, fmt.Sprintf("could not reboot the destination (id %d): %v — reboot it in Cloud Manager and it will come up as your migrated server", instID, err))
-		return
-	}
-	if err := cl.WaitInstanceStatus(ctx, instID, "running", 10*time.Minute); err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		_ = s.st.AddEvent(sctx, m.ID, "warn", "destination is slow to come back after reboot; check its Lish console")
-	}
-	s.dropFileDest(m.ID)
-	_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
-	_ = s.st.SetMigrateFinished(sctx, m.ID)
-	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: destination (id %d) rebooted into your migrated system. Power off the source now if you haven't. (You can remove the leftover vmrepl-receiver service on the destination: systemctl disable --now vmrepl-receiver.)", instID))
-}
-
 // randPassword returns a strong random password for a launched destination when
 // the operator didn't supply one. It is never logged.
 func randPassword() string {
@@ -2298,15 +2127,11 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	v.ReplicationActive = m.ReplicationEnabled
 	v.ReplicationStarted = m.ReplicationEnabled || hasRun
 	v.ReplicationPaused = !m.ReplicationEnabled && hasRun && replicationControllable(m.State)
-	// File-transfer destination status (direct method): drives the "Create
-	// destination instance" step and gates Start until the receiver is ready.
-	v.DestState, v.DestLinodeID, v.DestIP, v.DestError, v.DestManualCmd = s.destStatusFor(m)
 
 	if !m.ReplicationEnabled && replicationControllable(m.State) {
 		// The gate is off: either not started yet, or paused. Either way the
-		// Start/Resume button is enabled once the connection is validated — and, for
-		// direct file transfer, once the destination's receiver is ready to receive.
-		v.CanReplicate = v.AgentConnected && s.destReady(m)
+		// Start/Resume button is enabled once the connection is validated.
+		v.CanReplicate = v.AgentConnected
 		// "Connection failed" only applies pre-start (a paused migration's agent is
 		// connected and simply held); never flag it once replication has run.
 		if !hasRun && !v.AgentConnected && !m.EnrolledAt.IsZero() && time.Since(m.EnrolledAt) > agentConnectGrace {
@@ -2372,15 +2197,7 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 			}
 		}
 	case api.MigMigrating:
-		// Method-aware: the block methods really do convert the boot image and
-		// clone it, but a file migration does neither — it reboots the destination
-		// into the files already copied into it. Saying "convert + clone" there
-		// describes work that is not happening.
-		if isFileMethod(m.BootTarget) {
-			v.Phase = "finalizing (rebooting the destination)"
-		} else {
-			v.Phase = "finalizing (convert + clone)"
-		}
+		v.Phase = "finalizing (convert + clone)"
 		if !m.MigrateStarted.IsZero() {
 			v.ElapsedSeconds = int64(time.Since(m.MigrateStarted).Seconds())
 		}
@@ -2415,6 +2232,15 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	return v
 }
 
+// migrationFinished reports whether the migration has already reached its end
+// state, so the pre-flight checks no longer describe anything actionable.
+//
+// A cutover in progress is deliberately NOT finished: the checklist still means
+// something while the image is being captured.
+func migrationFinished(m api.Migration) bool {
+	return m.State == api.MigLaunched
+}
+
 func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCheck {
 	n := len(m.Disks)
 	agentsSeen, fullDone, storageOK := 0, 0, 0
@@ -2443,41 +2269,26 @@ func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCh
 	lagOK := anySync && rpoSec <= float64(s.cfg.RPOTargetSec)
 
 	diskWord := func(k int) string { return fmt.Sprintf("%d/%d disks", k, n) }
-	// The first pre-check differs by method: block methods provision a replication
-	// volume ("Storage provisioned"); the file method provisions no block storage
-	// and instead needs a destination OS image + plan chosen ("Destination ready").
-	var first api.ValidationCheck
-	if isFileMethod(m.BootTarget) {
-		configured := m.OSImage != "" && m.LinodeType != ""
-		switch {
-		case !configured:
-			first = api.ValidationCheck{Name: "Destination configured", OK: false, Detail: "choose a destination OS image and plan", Group: "pre"}
-		case !s.fileAutomation():
-			// No Linode automation: data is staged on the appliance (fallback); there
-			// is no destination instance to create.
-			first = api.ValidationCheck{Name: "Destination configured", OK: true, Detail: "OS image + plan chosen (appliance-staging fallback)", Group: "pre"}
-		default:
-			// The destination instance is created explicitly ("Create destination
-			// instance") and this check tracks its lifecycle up to receiver-ready.
-			state, _, _, _, _ := s.destStatusFor(m)
-			detail := map[string]string{
-				"none":       "create the destination instance to continue",
-				"launching":  "destination instance launching…",
-				"installing": "instance up — installing the file receiver…",
-				"ready":      "destination instance ready to receive",
-				"failed":     "destination launch failed — retry Create destination",
-			}[state]
-			first = api.ValidationCheck{Name: "Destination ready", OK: state == "ready", Detail: detail, Group: "pre"}
-		}
-	} else {
-		first = api.ValidationCheck{Name: "Storage provisioned", OK: allStorage, Detail: diskWord(storageOK) + " ready", Group: "pre"}
-	}
+	first := api.ValidationCheck{Name: "Storage provisioned", OK: allStorage, Detail: diskWord(storageOK) + " ready", Group: "pre"}
 	fullDetail := diskWord(fullDone) + " baselined"
 	fullName := "Initial full sync complete"
-	if isFileMethod(m.BootTarget) {
-		fullDetail = s.fileCopyDetail(m, allFull)
-		fullName = "Initial file copy complete"
+	// A finished migration must not display a red checklist. These checks measure
+	// LIVE state, and after cutover every one of them is legitimately false: the
+	// operator was told to remove the agent, replication is stopped, and the lag
+	// clock keeps running unbounded. Showing that as FAILED tells someone their
+	// successful migration broke. Report what is actually true instead.
+	if migrationFinished(m) {
+		done := func(name, detail string) api.ValidationCheck {
+			return api.ValidationCheck{Name: name, OK: true, Detail: detail, Group: "pre"}
+		}
+		return []api.ValidationCheck{
+			done(first.Name, "migration finished — the destination is running"),
+			done("Agent connected", "not needed — replication ended at cutover"),
+			done(fmt.Sprintf("Replication lag within %ds", s.cfg.RPOTargetSec), "not tracked — replication ended at cutover"),
+			{Name: fullName, OK: allFull, Detail: fullDetail, Group: "migration"},
+		}
 	}
+
 	return []api.ValidationCheck{
 		// Pre-migration: environment/connectivity readiness while replicating.
 		first,
