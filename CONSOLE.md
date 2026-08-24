@@ -37,6 +37,89 @@ For the manual/CLI workflow instead, see [`GETTING_STARTED.md`](docs/GETTING_STA
 
 ---
 
+## Choosing a migration method
+
+The console offers exactly **two** migration methods, picked from one selector
+on the New-migration form (§4). Both are **block-for-block** copies — the
+exact disk contents, not just files — replicated continuously (an initial full
+sync, then deltas every ~60s), and both convert the boot image for Linode at
+cutover (virtio drivers, GRUB/initramfs, network, serial console) and
+**validate it is bootable before you're asked to power off the source**. Both
+carry over the source's users, passwords and SSH keys, and both cap a
+migration at **8 disks** (Linode device slots `sda`–`sdh`). Where they differ:
+
+| | **Disk boot** *(default)* | **Volume boot** |
+|---|---|---|
+| Boot disk lives on | the new Linode's own **local NVMe disk** (free with the plan) | a **Block Storage volume**, cloned into a launchable image volume at cutover |
+| Data disks live on | **Block Storage volumes**, attached at `sdb`, `sdc`, … | **Block Storage volumes**, attached at `sdb`, `sdc`, … |
+| Cutover's last step | **Manual**: the new Linode boots into Rescue Mode and you paste a one-line copy command into its Lish console | **Automated**: the appliance clones the volumes and launches the instance — no operator step |
+| Size ceiling | **Yes** — the plan's local disk must fit the boot disk (the console only offers plans that do) | **None** — Block Storage is sized to the data, independent of any plan |
+| Ongoing cost | Boot disk free with the plan; only data volumes billed | Every disk billed as Block Storage, ≈ **$0.10/GB-month** |
+| Max disks | 8 (boot disk + up to 7 data disks) | 8 |
+
+**The practical difference that matters most:** disk-boot's cutover needs one
+manual paste into the instance's Lish console (see §7, step 3); volume-boot's
+cutover is fully hands-off. In exchange, disk boot is usually cheaper to run
+(no volume cost for the boot disk) and gives the boot disk faster local
+storage — but only if a plan's local disk is big enough to hold it; volume
+boot has no such ceiling. See **"Block Storage to provision"** below for the
+storage-sizing math (peak/settled GB) behind each method, and **"Sizing
+local-disk boot"** in §4 for how the plan-fit constraint plays out in practice.
+
+### The process, step by step
+
+Both methods share the same create → enroll → replicate → cutover → close
+flow (§4–§7); only the two starred steps differ.
+
+**Disk boot (default):**
+1. Create the migration, choosing **Linode local disk** as the method, and add
+   one disk row per source disk (§4).
+2. ★ Pick a **plan whose local disk fits the boot disk** — the console only
+   lists plans that do, and names a bigger one if your first choice is too
+   small.
+3. Run the generated enrollment command on the source (§5); the agent
+   replicates every disk to the appliance.
+4. Watch replication and validation in the console (§6).
+5. Cut over (§7): stop the source, click **Cutover instance** — the appliance
+   takes a final pass and validates the converted boot image while the source
+   is still running.
+6. ★ Power off the source, click **Launch instance**: the new Linode boots
+   into **Rescue Mode** and the card shows a one-line copy command — paste it
+   into the instance's **Lish console**. The image streams onto the local
+   disk with live progress; the instance powers itself off and the appliance
+   boots it from the local disk automatically.
+7. Remove the source agent and **Close** the migration (§7).
+
+**Volume boot:**
+1. Create the migration, choosing **separate Block Storage volume** as the
+   method, and add one disk row per source disk (§4). No plan-fit constraint —
+   pick any plan.
+2. Run the generated enrollment command on the source (§5); the agent
+   replicates every disk to its own Block Storage volume.
+3. Watch replication and validation in the console (§6).
+4. Cut over (§7): stop the source, click **Cutover instance** — the appliance
+   takes a final pass and validates the converted boot image while the source
+   is still running.
+5. Power off the source, click **Launch instance**: the appliance **clones
+   every volume** into a launchable image volume and boots a new Linode from
+   them — no Rescue Mode, no manual step.
+6. Remove the source agent and **Close** the migration (§7).
+
+### Guidance
+
+- **Disk boot (default)** suits most servers: cheaper to run and faster
+  storage, at the cost of one manual Lish paste at cutover and needing a plan
+  whose local disk fits the boot disk.
+- **Volume boot** suits: a boot disk too large for any reasonable plan;
+  wanting a fully hands-off cutover with no Lish step; or wanting to keep the
+  volumes themselves as reusable artifacts.
+
+Not sure which applies to a given server? The **Source check** (§3.5) reports
+a verdict — Supported / Supported with cautions / Not supported — for each
+method against that specific source, before you commit to either.
+
+---
+
 ## Prerequisites — sizing the replication server
 
 One appliance migrates **many servers (and many disks) in parallel** — each
@@ -366,11 +449,10 @@ receives it as well.
 ## 4. Create a migration (single or multi-disk)
 
 > **Migration method.** The **New migration** form offers two **block**
-> methods from one selector: **Linode local disk** (the default — the boot disk
-> streams onto the new Linode's own NVMe disk at no extra cost; any further
-> disks become attached Block Storage volumes) and **separate Block Storage
-> volume** (every disk becomes its own Block Storage volume). Both take the
-> same disk rows below.
+> methods from one selector: **Linode local disk** (the default) and
+> **separate Block Storage volume**. Both take the same disk rows below; see
+> **"Choosing a migration method"** above for the full comparison and how to
+> decide.
 
 Click **New migration**, enter a **Name** and
 **hostname**, then **add one disk row per source disk** (device + size in GB). The **first row is the boot disk**

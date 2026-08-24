@@ -16,8 +16,10 @@ console never needs inbound access to your sources.
 
 | Method | What moves | Best for |
 |---|---|---|
-| **Disk boot** *(default)* | Every disk, block for block: the **boot disk** onto the new Linode's own **local NVMe disk**, any further disks onto Block Storage volumes attached to it | Most servers: no separate volume cost for the boot disk, fast local storage |
-| **Volume boot** | Every disk, **block for block**, onto Block Storage volumes cloned into launchable image volumes | Exact disk-level replicas, multi-disk servers, keeping volumes as artifacts |
+| **Disk boot** *(default)* | Every disk, block for block: the **boot disk** onto the new Linode's own **local NVMe disk**, any further disks onto Block Storage volumes attached to it | Most servers: no separate volume cost for the boot disk, fast local storage — cutover needs one manual Lish paste, and the plan's disk must fit the boot disk |
+| **Volume boot** | Every disk, **block for block**, onto Block Storage volumes cloned into launchable image volumes | No plan-size ceiling, fully automated cutover, keeping volumes as reusable artifacts |
+
+Full side-by-side comparison and step-by-step process for each: [`CONSOLE.md`](CONSOLE.md#choosing-a-migration-method).
 
 ## Quick start
 
