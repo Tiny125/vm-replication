@@ -119,26 +119,50 @@ func TestConsoleCutoverNamingFields(t *testing.T) {
 	}
 }
 
-// The create card must offer both remaining (block) methods from ONE selector,
-// defaulting to local-disk boot, and post boot_target:mth. The file-transfer
-// method (its OS-image dropdown, used-storage field, and images endpoint) must
-// be gone entirely.
-func TestConsoleMigrationMethodSelector(t *testing.T) {
-	for _, want := range []string{
-		`id="m_method"`,   // single method selector
-		`value="volume"`,  // block volume option
-		`value="disk"`,    // block disk option
-		"boot_target:mth", // create posts the chosen method
-	} {
-		if !strings.Contains(consoleHTML, want) {
-			t.Errorf("create card should support the method selector (missing %q)", want)
-		}
+// Product decision: Linode's own Backups service, Images, and cross-DC
+// migration don't work with Block Storage volumes, so a volume-boot machine
+// sits outside Linode's lifecycle tooling for its whole life. The console
+// therefore now offers ONLY local-disk boot from the create form — but the
+// underlying code path (api.BootTargetVolume, the HTTP API, and rendering of
+// pre-existing volume-boot migrations) stays fully intact so the method can be
+// re-enabled later purely by editing code. This test asserts the create-form
+// side of that: exactly one method, and it posts boot_target:'disk'.
+func TestConsoleOffersOnlyDiskBootMethod(t *testing.T) {
+	i := strings.Index(consoleHTML, `id="m_method"`)
+	if i < 0 {
+		t.Fatal("console must define the m_method element")
 	}
-	// disk must be the default selected option (its <option> carries selected).
-	if !strings.Contains(consoleHTML, `value="disk" selected`) {
-		t.Error("local-disk boot must be the default selected method")
+	end := strings.Index(consoleHTML[i:], "</select>")
+	if end < 0 {
+		t.Fatal("m_method must be a <select> (a real DOM element with a .value, even though it now offers no choice) so method()/createMig need no change to re-enable volume boot later")
 	}
-	// The removed file-transfer method must leave no trace in the create form.
+	block := consoleHTML[i : i+end]
+	if n := strings.Count(block, "<option"); n != 1 {
+		t.Errorf("m_method must offer exactly one <option>, found %d — the console must offer only local-disk boot", n)
+	}
+	if !strings.Contains(block, `value="disk"`) {
+		t.Error("the one offered method must be value=\"disk\" (local-disk boot)")
+	}
+	if !strings.Contains(block, "selected") {
+		t.Error("the single disk option must be selected")
+	}
+	if strings.Contains(block, `value="volume"`) {
+		t.Error("the create-form selector must not offer boot_target=\"volume\" any more — volume boot is no longer offered in the console")
+	}
+	// Disabled (or otherwise non-interactive) so a single-item dropdown doesn't
+	// invite a click that does nothing — see the comment above the element.
+	if !strings.Contains(block, "disabled") {
+		t.Error("with nothing to choose, m_method should be visually non-interactive (disabled), not a live one-item dropdown")
+	}
+	if !strings.Contains(consoleHTML, "boot_target:mth") {
+		t.Error("create must still post the chosen method as boot_target")
+	}
+}
+
+// The removed file-transfer method (from an earlier change) must still leave
+// no trace in the create form — unrelated to this change, but worth guarding
+// in the same place since it touches the same form.
+func TestConsoleNoFileTransferTraces(t *testing.T) {
 	for _, gone := range []string{
 		`value="file"`, "m_osimage", "m_used", "os_image:",
 		"/api/v1/linode/images", "loadImages", "fileFields",
@@ -147,6 +171,50 @@ func TestConsoleMigrationMethodSelector(t *testing.T) {
 		if strings.Contains(consoleHTML, gone) {
 			t.Errorf("console still references removed file-transfer piece %q", gone)
 		}
+	}
+}
+
+// Creating a migration from the console must always send boot_target:'disk' —
+// method() reads the (now fixed, single-option) m_method element, so this
+// checks the plumbing stays wired from element to request.
+func TestConsoleCreateSendsDiskBootTarget(t *testing.T) {
+	methodFn := extractJSFunc(t, "function method(){")
+	if !strings.Contains(methodFn, "$('m_method')") {
+		t.Error("method() should still read the m_method element, not a hardcoded literal — that's what makes re-enabling volume boot later a pure HTML change")
+	}
+	createFn := extractJSFunc(t, "async function createMig(")
+	if !strings.Contains(createFn, "boot_target:mth") {
+		t.Error("createMig must send boot_target computed from method()")
+	}
+	if !strings.Contains(createFn, "mth=method()") && !strings.Contains(createFn, "mth = method()") {
+		t.Error("createMig must derive mth from method()")
+	}
+}
+
+// A migration created (e.g. in earlier testing) before the console stopped
+// OFFERING volume boot can still exist in the database with
+// boot_target:"volume". The detail view must keep recognizing it as a
+// supported method — with its own banner — not fall into the "unsupported
+// migration method" branch reserved for genuinely removed methods (like the
+// old file-transfer method), and the cutover dialog's volume-naming field
+// must still work for it.
+func TestConsoleRendersExistingVolumeBootMigration(t *testing.T) {
+	js := extractJSFunc(t, "function migCard(")
+	if !strings.Contains(js, `m.boot_target===''||m.boot_target==='volume'`) {
+		t.Error("migCard must still explicitly recognize boot_target 'volume' as a known, supported method")
+	}
+	if !strings.Contains(js, "Boot: separate Block Storage volume") {
+		t.Error("migCard must still render the volume-boot banner for existing volume-boot migrations")
+	}
+	// vol_name is used by BOTH volume boot (naming the boot volume) and
+	// multi-disk local-disk boot (naming the data volumes) — it must not have
+	// been removed while stripping volume-boot-only controls.
+	startJS := extractJSFunc(t, "async function startMig(")
+	if !strings.Contains(startJS, "id:'vol_name'") {
+		t.Error("cutover dialog must still offer vol_name — used by volume boot AND multi-disk local-disk boot")
+	}
+	if !strings.Contains(startJS, "!disk||nDisks>1") {
+		t.Error("vol_name must still be shown for volume boot (!disk) or multi-disk local-disk boot (nDisks>1)")
 	}
 }
 

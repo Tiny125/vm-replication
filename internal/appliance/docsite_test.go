@@ -9,8 +9,10 @@ import (
 // The documentation site must be served at /documentation WITHOUT a console
 // session (it's the public how-to guide reached at https://<ip>:<port>/documentation),
 // and must cover the full console journey: install, sign-in, the Linode API
-// token, and creating a migration with each of the two remaining (block)
-// methods.
+// token, and creating a migration. The guide now documents ONLY local-disk
+// boot (product decision: volume boot no longer offered in the console — see
+// TestDocsGuideIsSingleMethod below), even though the underlying code and API
+// still support it.
 func TestDocsSiteServed(t *testing.T) {
 	s := &Server{}
 	rr := httptest.NewRecorder()
@@ -25,7 +27,7 @@ func TestDocsSiteServed(t *testing.T) {
 	for _, want := range []string{
 		// Core journey sections.
 		"Install the replication server", "Sign in", "Linode API token",
-		"Create a migration", "Volume boot", "Disk boot",
+		"Create a migration", "Disk boot",
 		"Enroll the source server", "Start replication", "Cutover",
 		"Troubleshooting",
 		// Screenshots are embedded and referenced.
@@ -50,6 +52,30 @@ func TestDocsSiteServed(t *testing.T) {
 	for _, banned := range []string{"⚡", "🚀", "📘", "💡"} {
 		if strings.Contains(body, banned) {
 			t.Errorf("documentation must not use icons/emoji (found %q)", banned)
+		}
+	}
+}
+
+// The in-app guide must read as SINGLE-METHOD documentation: no "Volume
+// boot" section/heading, no two-method comparison table, no "choose a
+// migration method" section, and no leftover "both methods"/"either
+// method"/"the two methods" phrasing or dangling #choose-method /
+// #volume-boot cross-references. This is a console/documentation change, not
+// a code-removal — the volume-boot API and code path are untouched and
+// covered separately (see TestCreateMigrationAcceptsVolumeBootTarget in
+// boot_target_test.go).
+func TestDocsGuideIsSingleMethod(t *testing.T) {
+	s := &Server{}
+	rr := httptest.NewRecorder()
+	s.handleDocs(rr, httptest.NewRequest("GET", "/documentation", nil))
+	body := rr.Body.String()
+	for _, gone := range []string{
+		"Volume boot", "volume-boot", "Choose a migration method",
+		"choose-method", "both methods", "either method", "the two methods",
+		"two block-for-block migration methods", "two remaining",
+	} {
+		if strings.Contains(body, gone) {
+			t.Errorf("documentation should read as single-method (disk boot only) — still contains %q", gone)
 		}
 	}
 }
