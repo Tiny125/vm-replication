@@ -12,9 +12,8 @@ import (
 
 func boolp(b bool) *bool { return &b }
 
-// A healthy Ubuntu source must pass all three methods, with the matching
-// Linode image recommended for file transfer and "not applicable" wording for
-// the block methods (they boot the migrated disk itself).
+// A healthy Ubuntu source must pass both remaining methods (volume and disk
+// boot).
 func TestAssessHealthyUbuntu(t *testing.T) {
 	r := api.SourceCheckReport{
 		Hostname: "web01", OSID: "ubuntu", OSVersion: "24.04", OSPretty: "Ubuntu 24.04 LTS",
@@ -24,16 +23,13 @@ func TestAssessHealthyUbuntu(t *testing.T) {
 		UsedBytes: 4 << 30, DataPortOK: boolp(true),
 	}
 	a := assessSource(r)
+	if len(a.Methods) != 2 {
+		t.Fatalf("assessment has %d methods, want 2 (volume, disk) now that file transfer is removed", len(a.Methods))
+	}
 	for _, m := range a.Methods {
 		if m.Verdict != "ok" {
 			t.Errorf("method %s verdict %q (reasons %v), want ok", m.Method, m.Verdict, m.Reasons)
 		}
-	}
-	if img := methodByName(t, a, "file").RecommendedImage; img != "linode/ubuntu24.04" {
-		t.Errorf("file recommended image %q, want linode/ubuntu24.04", img)
-	}
-	if methodByName(t, a, "volume").RecommendedImage != "" {
-		t.Error("block methods must not recommend an image (destination boots the migrated disk)")
 	}
 }
 
@@ -48,8 +44,8 @@ func TestAssessARMFailsAllMethods(t *testing.T) {
 	}
 }
 
-// A LUKS-encrypted root cannot be converted to boot on Linode: the block
-// methods must fail, but file transfer (which copies the mounted files) is ok.
+// A LUKS-encrypted root cannot be converted to boot on Linode: both remaining
+// (block) methods must fail.
 func TestAssessLUKSRoot(t *testing.T) {
 	r := api.SourceCheckReport{
 		OSID: "debian", OSVersion: "12", Arch: "x86_64", HasSystemd: true,
@@ -61,9 +57,6 @@ func TestAssessLUKSRoot(t *testing.T) {
 	}
 	if v := methodByName(t, a, "disk").Verdict; v != "fail" {
 		t.Errorf("disk on LUKS root: %q, want fail", v)
-	}
-	if v := methodByName(t, a, "file").Verdict; v == "fail" {
-		t.Errorf("file on LUKS root must not fail (it copies mounted files), got %q", v)
 	}
 }
 
@@ -91,22 +84,6 @@ func TestAssessRootFilesystems(t *testing.T) {
 	}
 }
 
-// SELinux enforcing: the file method does not preserve contexts/xattrs, so it
-// must WARN (with the block methods unaffected).
-func TestAssessSELinuxEnforcing(t *testing.T) {
-	r := api.SourceCheckReport{
-		OSID: "almalinux", OSVersion: "9", Arch: "x86_64", HasSystemd: true,
-		RootFS: "xfs", SELinux: "enforcing", DataPortOK: boolp(true),
-	}
-	a := assessSource(r)
-	if v := methodByName(t, a, "file").Verdict; v != "warn" {
-		t.Errorf("file with SELinux enforcing: %q, want warn", v)
-	}
-	if v := methodByName(t, a, "volume").Verdict; v != "ok" {
-		t.Errorf("volume with SELinux enforcing: %q, want ok", v)
-	}
-}
-
 // A blocked data port must warn on every method — replication cannot start
 // until TCP 5000–5100 is reachable.
 func TestAssessBlockedDataPort(t *testing.T) {
@@ -122,7 +99,7 @@ func TestAssessBlockedDataPort(t *testing.T) {
 }
 
 // Disks over the 10 TiB Block Storage limit: volume boot fails, disk boot
-// warns (needs a plan with that much local disk), file transfer unaffected.
+// warns (needs a plan with that much local disk).
 func TestAssessHugeDisk(t *testing.T) {
 	r := api.SourceCheckReport{
 		OSID: "ubuntu", OSVersion: "22.04", Arch: "x86_64", HasSystemd: true, RootFS: "ext4",
@@ -135,37 +112,12 @@ func TestAssessHugeDisk(t *testing.T) {
 	if v := methodByName(t, a, "disk").Verdict; v != "warn" {
 		t.Errorf("disk with 11TiB disk: %q, want warn", v)
 	}
-	if v := methodByName(t, a, "file").Verdict; v != "ok" {
-		t.Errorf("file with 11TiB disk: %q, want ok", v)
-	}
-}
-
-// Image recommendations map the source distro/version to the closest Linode
-// image, with a sensible fallback when unknown.
-func TestRecommendedImages(t *testing.T) {
-	for _, tc := range []struct{ id, ver, want string }{
-		{"ubuntu", "24.04", "linode/ubuntu24.04"},
-		{"ubuntu", "22.04", "linode/ubuntu22.04"},
-		{"debian", "12", "linode/debian12"},
-		{"almalinux", "9", "linode/almalinux9"},
-		{"rocky", "8", "linode/rocky8"},
-		{"fedora", "40", "linode/fedora40"},
-		{"centos", "7", "linode/centos7"},
-		{"rhel", "9", "linode/almalinux9"},      // closest free rebuild
-		{"sles", "15.5", "linode/opensuse15.6"}, // SLES → openSUSE Leap (shared codebase)
-		{"amzn", "2023", "linode/almalinux9"},   // Amazon Linux is RHEL-family
-		{"weirdos", "1", ""},                    // unknown → pick manually
-	} {
-		if got := recommendedImage(tc.id, tc.ver); got != tc.want {
-			t.Errorf("recommendedImage(%s,%s) = %q, want %q", tc.id, tc.ver, got, tc.want)
-		}
-	}
 }
 
 // Azure's ephemeral resource disk (temporary storage mounted at /mnt) must not
-// be block-migrated: the block methods warn about it (file transfer never
-// copies /mnt), and an oversized EPHEMERAL disk must NOT trip the 10 TiB
-// volume-size failure — it isn't part of the migration.
+// be block-migrated: the block methods warn about it, and an oversized
+// EPHEMERAL disk must NOT trip the 10 TiB volume-size failure — it isn't part
+// of the migration.
 func TestAssessAzureEphemeralDisk(t *testing.T) {
 	r := api.SourceCheckReport{
 		OSID: "ubuntu", OSVersion: "20.04", Arch: "x86_64", HasSystemd: true,
@@ -194,39 +146,6 @@ func TestAssessAzureEphemeralDisk(t *testing.T) {
 		if !found {
 			t.Errorf("%s: expected an ephemeral-disk caution, got %v", m, got.Reasons)
 		}
-	}
-	if v := methodByName(t, a, "file").Verdict; v != "ok" {
-		t.Errorf("file with ephemeral disk: %q, want ok (file never copies /mnt)", v)
-	}
-}
-
-// Approximate image recommendations must carry an honest note: Amazon Linux
-// has no Linode image (AlmaLinux is RHEL-family but NOT drop-in); RHEL maps to
-// its binary-compatible rebuild; SLES maps to openSUSE. Exact matches carry no
-// note.
-func TestRecommendedImageNotes(t *testing.T) {
-	for _, tc := range []struct {
-		id      string
-		wantSub string // substring of the note; "" = no note
-	}{
-		{"amzn", "not a drop-in"},
-		{"rhel", "binary-compatible"},
-		{"sles", "openSUSE"},
-		{"ubuntu", ""},
-		{"debian", ""},
-	} {
-		got := recommendedImageNote(tc.id)
-		if tc.wantSub == "" && got != "" {
-			t.Errorf("recommendedImageNote(%s) = %q, want empty", tc.id, got)
-		}
-		if tc.wantSub != "" && !strings.Contains(got, tc.wantSub) {
-			t.Errorf("recommendedImageNote(%s) = %q, want substring %q", tc.id, got, tc.wantSub)
-		}
-	}
-	// The note reaches the file method's assessment.
-	a := assessSource(api.SourceCheckReport{OSID: "amzn", OSVersion: "2", Arch: "x86_64", HasSystemd: true, RootFS: "xfs", DataPortOK: boolp(true)})
-	if n := methodByName(t, a, "file").RecommendedImageNote; !strings.Contains(n, "not a drop-in") {
-		t.Errorf("file assessment note for amzn = %q", n)
 	}
 }
 
@@ -298,25 +217,24 @@ func TestSourceCheckRoundTrip(t *testing.T) {
 	rr = httptest.NewRecorder()
 	s.handleSourceCheckStatus(rr, httptest.NewRequest("GET", "/api/v1/sourcecheck/"+created.Token, nil))
 	_ = json.Unmarshal(rr.Body.Bytes(), &st)
-	if st.Status != "done" || st.Assessment == nil || len(st.Assessment.Methods) != 3 {
+	if st.Status != "done" || st.Assessment == nil || len(st.Assessment.Methods) != 2 {
 		t.Fatalf("post-report status %+v", st)
 	}
 }
 
 // The check script must be self-sufficient: it prints the FULL assessment in
-// the source server's own terminal (facts, per-method verdicts, recommended
-// image) BEFORE attempting to deliver the report — so the operator still gets
-// the result when the network to the migration instance is not accessible —
-// and on delivery failure it prints a prominent note saying exactly that.
+// the source server's own terminal (facts, per-method verdicts) BEFORE
+// attempting to deliver the report — so the operator still gets the result
+// when the network to the migration instance is not accessible — and on
+// delivery failure it prints a prominent note saying exactly that.
 func TestSourceCheckScriptPrintsLocalResult(t *testing.T) {
 	for _, want := range []string{
-		"SOURCE CHECK RESULT",              // the local result banner
-		"recommended destination OS image", // image recommendation printed locally
-		"NOT SUPPORTED",                    // local verdict labels exist
-		"VERDICT:",                         // bottom-line verdict
-		"could NOT be delivered",           // the offline note…
-		"is not accessible",                // …says the network to the instance is blocked
-		"printed above is complete",        // …and that the local result still stands
+		"SOURCE CHECK RESULT",       // the local result banner
+		"NOT SUPPORTED",             // local verdict labels exist
+		"VERDICT:",                  // bottom-line verdict
+		"could NOT be delivered",    // the offline note…
+		"is not accessible",         // …says the network to the instance is blocked
+		"printed above is complete", // …and that the local result still stands
 	} {
 		if !strings.Contains(sourceCheckScript, want) {
 			t.Errorf("check script missing local-result piece %q", want)

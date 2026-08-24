@@ -229,9 +229,8 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
   </div>
   <div class="navgroup"><div class="gtitle">Create a migration</div>
     <a href="#choose-method">Choose a migration method</a>
-    <a href="#file-transfer">File transfer (default)</a>
+    <a href="#disk-boot">Disk boot (default)</a>
     <a href="#volume-boot">Volume boot</a>
-    <a href="#disk-boot">Disk boot</a>
   </div>
   <div class="navgroup"><div class="gtitle">Run the migration</div>
     <a href="#enroll">Enroll the source server</a>
@@ -253,18 +252,17 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
 <h2>Introduction</h2>
 <p>The <b>replication server</b> (a small Linode you create once) hosts the migration console. From the console you register each <b>source server</b>, copy one generated command onto it, and drive the whole migration — replication, validation, cutover — from the browser. Data flows from the source over <b>mutually-authenticated TLS</b>; nothing is ever pulled from the destination side.</p>
 <div class="codeblock"><pre>source server ──(agent, one-line install)──► replication server (console) ──► destination on Linode</pre></div>
-<p>Three migration methods are available from the same console. <b>File transfer is the default</b> and the right choice for most Linux servers:</p>
+<p>Two block-for-block migration methods are available from the same console. <b>Disk boot is the default</b> and the right choice for most Linux servers:</p>
 <table>
 <tr><th>Method</th><th>What moves</th><th>Destination</th><th>Best for</th></tr>
-<tr><td><b>File transfer</b> (default)</td><td>Only the <b>used files</b> (a mostly-empty 80&nbsp;GB disk copies its ~4&nbsp;GB)</td><td>A brand-new Linode running an OS image you pick</td><td>Most servers. Cheapest and usually fastest; no boot/partition concerns.</td></tr>
+<tr><td><b>Disk boot</b> (default)</td><td>Every disk, block for block</td><td>The new Linode's own <b>local NVMe disk</b></td><td>Disk-level replica without a separate volume (faster disk, no volume cost).</td></tr>
 <tr><td><b>Volume boot</b></td><td>Every disk, <b>block for block</b></td><td>Block Storage volume(s) cloned into launchable image volumes</td><td>Exact disk-level replicas; multi-disk servers; keeping volumes as artifacts.</td></tr>
-<tr><td><b>Disk boot</b></td><td>Every disk, block for block</td><td>The new Linode's own <b>local NVMe disk</b></td><td>Disk-level replica without a separate volume (faster disk, no volume cost).</td></tr>
 </table>
 </section>
 
 <section id="install">
 <h2>Install the replication server</h2>
-<p>You need one Linode to act as the replication server. A <b>2&nbsp;GB shared plan</b> is enough for file transfers and 1–3 concurrent block disks (see <code>CONSOLE.md</code> in the repository for detailed sizing).</p>
+<p>You need one Linode to act as the replication server. A <b>2&nbsp;GB shared plan</b> is enough for 1–3 concurrent block disks (see <code>CONSOLE.md</code> in the repository for detailed sizing).</p>
 <ol class="steps">
 <li>Create a Linode (Ubuntu or Debian recommended) and SSH in as <b>root</b>.</li>
 <li>Clone the repository and run the installer — it bootstraps everything it needs (Go toolchain, build tools) on a bare server:
@@ -302,60 +300,57 @@ sudo scripts/install-replication-server.sh</pre><button class="copy" onclick="cp
 
 <section id="api-token">
 <h2>Add your Linode API token</h2>
-<p>The token lets the console act on your Linode account: launch the file-transfer destination, provision replication volumes, clone disks, and launch instances at cutover. <b>The file-transfer method requires it</b> (the OS image and plan lists come from the Linode API); the block methods need it for everything past evaluation.</p>
+<p>The token lets the console act on your Linode account: provision replication volumes, clone disks, and launch the cutover instance. Both migration methods need it for everything past evaluation.</p>
 <ol class="steps">
 <li>Sign in to <a href="https://cloud.linode.com/profile/tokens" target="_blank" rel="noopener">Linode Cloud Manager → Profile → API Tokens</a> and create a <b>Personal Access Token</b> with scopes:
 <table>
 <tr><th>Scope</th><th>Access</th><th>Used for</th></tr>
-<tr><td>Linodes</td><td>Read/Write</td><td>launching the destination or cutover instance</td></tr>
-<tr><td>Volumes</td><td>Read/Write</td><td>replication + image volumes (block methods)</td></tr>
-<tr><td>Images</td><td>Read/Write</td><td>the OS image list, disk-boot conversion</td></tr>
+<tr><td>Linodes</td><td>Read/Write</td><td>launching the cutover instance</td></tr>
+<tr><td>Volumes</td><td>Read/Write</td><td>replication + image volumes</td></tr>
+<tr><td>Images</td><td>Read/Write</td><td>disk-boot conversion</td></tr>
 <tr><td>Object Storage</td><td>Read/Write</td><td>optional audit logs</td></tr>
 </table></li>
 <li>Paste the token into the <b>Linode automation</b> card and press <span class="btn-demo plain">Save</span>:
 <figure><img src="/documentation/img/settings-token.png" alt="The Linode automation card"><figcaption>The token is stored encrypted at rest (AES-256-GCM) and only ever sent to api.linode.com.</figcaption></figure></li>
 </ol>
-<div class="adm warn"><span class="t">Warning</span>Without a token, the <b>Destination OS image</b> dropdown on the New-migration form stays empty ("add a Linode token in Settings to load OS images") and a file-transfer migration cannot be created.</div>
+<div class="adm warn"><span class="t">Warning</span>Without a token, disk boot cannot size a plan and a migration cannot be created — add one in the <b>Linode automation</b> card first.</div>
 </section>
 
 <section id="source-check">
 <h2>Check the source first</h2>
-<p>Before creating a migration, run the <b>Source check</b> (its own tab in the console header) — a <b>read-only pre-migration assessment</b> that tells you whether a server can migrate, <b>which of the three methods it supports</b>, and which <b>destination OS image</b> to pick.</p>
+<p>Before creating a migration, run the <b>Source check</b> (its own tab in the console header) — a <b>read-only pre-migration assessment</b> that tells you whether a server can migrate and <b>which of the two methods it supports</b>.</p>
 <ol class="steps">
 <li>Open the <b>Source check</b> tab and press <span class="btn-demo primary">Generate check command</span>.</li>
 <li>Run the shown one-line command on the <b>source server</b> as root (it is valid for 30 minutes). The command only <b>reads</b> system facts — OS, CPU architecture, disk layout, filesystems, SELinux, and live network reachability of the replication port — sends one report back, and exits. <b>Nothing is installed</b>, so there is nothing to remove afterwards.</li>
 <li>The tab updates by itself when the report arrives:</li>
 </ol>
-<figure><img src="/documentation/img/source-check.png" alt="A completed source check"><figcaption>A completed check: source facts, a verdict per migration method (Supported / Supported with cautions / Not supported) with the reasons, and the recommended destination OS image for file transfer.</figcaption></figure>
-<div class="adm tip"><span class="t">Tip</span>Run this on every server you plan to migrate, before anything else. A "Not supported" verdict (for example a LUKS-encrypted root for the block methods) tells you up front to use a different method — instead of finding out at cutover.</div>
+<figure><img src="/documentation/img/source-check.png" alt="A completed source check"><figcaption>A completed check: source facts and a verdict per migration method (Supported / Supported with cautions / Not supported) with the reasons.</figcaption></figure>
+<div class="adm tip"><span class="t">Tip</span>Run this on every server you plan to migrate, before anything else. A "Not supported" verdict (for example a LUKS-encrypted root) tells you up front to use a different method — instead of finding out at cutover.</div>
 <div class="adm"><span class="t">Note</span>The full result is also printed <b>in the source server's own terminal</b>. If the source cannot reach the replication server, the terminal result still appears in full, with a note that the network to the migration instance is not accessible — fix the ports (console port + TCP 5000–5100), then re-run so the console receives it too.</div>
 </section>
 
 <section id="source-details">
 <h2>Find your source details</h2>
 <p>The form needs a few facts about the source. Expand <b>How do I find the source details?</b> at the top of the New-migration form and run the copyable command on your source server — it prints everything the form asks for:</p>
-<figure><img src="/documentation/img/source-helper.png" alt="The source-details helper"><figcaption>Hostname, reachable IP, OS (match it to the destination image), used storage in GB (sizes the plan for file transfer), and every real data disk (for the block methods).</figcaption></figure>
+<figure><img src="/documentation/img/source-helper.png" alt="The source-details helper"><figcaption>Hostname, reachable IP, OS, and every real data disk to add as a row on the New-migration form.</figcaption></figure>
 </section>
 
 <section id="choose-method">
 <h2>Choose a migration method</h2>
-<p>The <span class="field">Migration method</span> selector on the New-migration form switches the whole flow. The fields below it change with the method:</p>
-<figure><img src="/documentation/img/method-selector.png" alt="The migration-method selector"><figcaption>File transfer is pre-selected. The two block methods are in the same dropdown.</figcaption></figure>
+<p>The <span class="field">Migration method</span> selector on the New-migration form switches the whole flow. Both methods take the same source-disk rows; only the plan sizing and the cutover's last step differ:</p>
+<figure><img src="/documentation/img/method-selector.png" alt="The migration-method selector"><figcaption>Disk boot is pre-selected (the default). Volume boot is the other option in the same dropdown.</figcaption></figure>
+<figure><img src="/documentation/img/new-migration.png" alt="The New-migration form"><figcaption>The New-migration form: source disks and plan.</figcaption></figure>
 </section>
 
-<section id="file-transfer">
-<h2>File transfer (default)</h2>
-<p>Copies the source's <b>used files</b> straight onto a brand-new Linode running a clean OS image you pick. Only used data moves, the destination is a first-class Linode (native disk, Backups supported), and there are no partition/bootloader concerns.</p>
-<figure><img src="/documentation/img/new-migration.png" alt="The New-migration form in file-transfer mode"><figcaption>The file-transfer form: OS image, used storage, and plan.</figcaption></figure>
+<section id="disk-boot">
+<h2>Disk boot (default)</h2>
+<p>Replicates every disk <b>block for block</b>; the destination boots from its own <b>local NVMe disk</b> — no separate volume is kept, so it's usually the cheaper and faster choice. Pick a plan whose local disk fits the <b>boot disk</b> (any further disks become Block Storage volumes attached to the same instance).</p>
 <ol class="steps">
-<li>Fill in <span class="field">Name</span>, <span class="field">Source hostname</span>, and <span class="field">Source IP address</span>.</li>
-<li>Pick the <span class="field">Destination OS image</span> that matches the source's OS (the helper printed it — e.g. Ubuntu 24.04 → <code>linode/ubuntu24.04</code>).</li>
-<li>Enter <span class="field">Used storage on the source (GB)</span> from the helper, and pick a <span class="field">Linode plan</span> whose disk comfortably fits that used size (the form suggests the fit).</li>
-<li>Press <span class="btn-demo primary">Create migration</span>.</li>
-<li>On the new card, press <span class="btn-demo primary">Create destination instance</span>: give the destination a name and a <b>root password</b> (so you can log into it later). The card walks through <i>launching → installing the file receiver → ready</i>. <span class="btn-demo disabled">Start replication</span> stays disabled until the destination is confirmed ready.</li>
-<li><a href="#enroll">Enroll the source</a>, then press <span class="btn-demo primary">Start replication</span> — the agent copies your files straight into the destination, with delta passes keeping it current.</li>
+<li>Select <span class="field">Migration method</span> → <b>Block: Linode local disk (NVMe, default)</b>.</li>
+<li>Add <b>one disk row per whole source disk</b> (e.g. <code>/dev/sda</code>, 25&nbsp;GB — use whole disks, not partitions). The disk holding <code>/</code> must be the <b>first row</b> (it becomes the boot disk). Round sizes up.</li>
+<li>Pick a plan, then press <span class="btn-demo primary">Create migration</span>.</li>
+<li><a href="#enroll">Enroll</a>, <a href="#replicate">start replication</a>, and <a href="#cutover">cut over</a> — at cutover the boot image is converted and <b>validated before you power off the source</b>. The last step differs from volume boot: the new Linode boots into <b>Rescue Mode</b> and the card shows a <b>one-line copy command</b>; paste it in the instance's Lish console and the image streams onto the local disk, then the instance boots from it automatically.</li>
 </ol>
-<div class="adm"><span class="t">Note</span>If the automatic receiver install stalls (some images/regions lack cloud-init), the card shows a <b>manual install command</b> — open the destination's Lish console, log in as root with the password you set, and paste it. Start replication unlocks as soon as the receiver answers.</div>
 </section>
 
 <section id="volume-boot">
@@ -365,16 +360,7 @@ sudo scripts/install-replication-server.sh</pre><button class="copy" onclick="cp
 <li>Select <span class="field">Migration method</span> → <b>Block: separate Block Storage volume</b>.</li>
 <li>Add <b>one disk row per whole source disk</b> (e.g. <code>/dev/sda</code>, 25&nbsp;GB — use whole disks, not partitions). The disk holding <code>/</code> must be the <b>first row</b>. Round sizes up.</li>
 <li>Pick a plan, then press <span class="btn-demo primary">Create migration</span>. The appliance provisions one replication volume per disk (watch the <b>Storage provisioned</b> check turn green).</li>
-<li><a href="#enroll">Enroll</a>, <a href="#replicate">start replication</a>, and <a href="#cutover">cut over</a> — at cutover the boot image is converted and <b>validated before you power off the source</b>.</li>
-</ol>
-</section>
-
-<section id="disk-boot">
-<h2>Disk boot</h2>
-<p>Same block-for-block replication, but the destination boots from its own <b>local NVMe disk</b> — no separate volume is kept. Pick a plan whose disk fits the summed disk sizes.</p>
-<ol class="steps">
-<li>Select <span class="field">Migration method</span> → <b>Block: Linode local disk (NVMe)</b>, add the disk rows, create, enroll, replicate.</li>
-<li>Cutover differs in one step: the appliance boots the new Linode into <b>Rescue Mode</b> and the card shows a <b>one-line copy command</b>. Open the instance's Lish console, paste the line, and watch the image stream onto the local disk — the instance then boots from it automatically.</li>
+<li><a href="#enroll">Enroll</a>, <a href="#replicate">start replication</a>, and <a href="#cutover">cut over</a> — at cutover the boot image is converted and <b>validated before you power off the source</b>, then cloned and the new Linode launched from it.</li>
 </ol>
 </section>
 
@@ -391,10 +377,10 @@ sudo scripts/install-replication-server.sh</pre><button class="copy" onclick="cp
 
 <section id="replicate">
 <h2>Start replication and monitor</h2>
-<p>Press <span class="btn-demo primary">Start replication</span> (enabled once the agent is connected — and, for file transfer, once the destination is ready). Confirm the dialog and watch:</p>
+<p>Press <span class="btn-demo primary">Start replication</span> (enabled once the agent is connected). Confirm the dialog and watch:</p>
 <ul>
-<li><b>Progress</b> — live percentage and transfer rate for block syncs; "copying files" with bytes-on-wire for file transfer.</li>
-<li><b>Validation checks</b> — <b>Initial full sync complete</b> (or <b>Initial file copy complete</b>) is the gate that enables cutover. The pre-migration checks (agent connection, replication lag) track environment readiness while replicating.</li>
+<li><b>Progress</b> — live percentage and transfer rate for the initial full sync.</li>
+<li><b>Validation checks</b> — <b>Initial full sync complete</b> is the gate that enables cutover. The pre-migration checks (agent connection, replication lag) track environment readiness while replicating.</li>
 <li><b>RPO</b> — how old the last completed sync is. After the baseline, delta passes run every ~60&nbsp;s, so the copy stays current.</li>
 </ul>
 <p>You can <span class="btn-demo danger">Pause replication</span> at any time; <span class="btn-demo primary">Resume replication</span> continues with an incremental delta — never a full re-copy.</p>
@@ -404,9 +390,9 @@ sudo scripts/install-replication-server.sh</pre><button class="copy" onclick="cp
 <h2>Cut over</h2>
 <p>When the baseline is done, <span class="btn-demo primary">Cutover instance</span> enables. Cutover is guided in <b>three steps</b>, and the card tells you exactly when it is safe to power off the source:</p>
 <ol class="steps">
-<li><b>Stop replication &amp; prepare (this button).</b> For the block methods the appliance takes one final consistent pass (the source root is briefly remounted read-only), then <b>converts the boot image and validates it is bootable — before you power anything off</b>. If validation fails, the cutover aborts with the reason and the source keeps running. If the source is already powered off or idle, tick <i>"skip the read-only snapshot"</i> in the dialog. File transfer simply finishes its last copy pass.</li>
+<li><b>Stop replication &amp; prepare (this button).</b> The appliance takes one final consistent pass (the source root is briefly remounted read-only), then <b>converts the boot image and validates it is bootable — before you power anything off</b>. If validation fails, the cutover aborts with the reason and the source keeps running. If the source is already powered off or idle, tick <i>"skip the read-only snapshot"</i> in the dialog.</li>
 <li><b>Power off the source</b> — only when the card shows <i>"it is now safe to power off the source server."</i></li>
-<li><b>Launch.</b> Press <span class="btn-demo primary">Launch instance</span>: volume boot clones the validated image and boots a new Linode from it; disk boot streams the image in Rescue Mode (one paste); file transfer <b>reboots the already-populated destination</b> into your migrated system.</li>
+<li><b>Launch.</b> Press <span class="btn-demo primary">Launch instance</span>: volume boot clones the validated image and boots a new Linode from it; disk boot streams the image in Rescue Mode (one paste).</li>
 </ol>
 <div class="adm tip"><span class="t">Tip</span>Before starting the cutover, stop the source's databases/heavy writers and let the RPO lag drop to ~0 so the final pass is small and current.</div>
 </section>
@@ -415,7 +401,7 @@ sudo scripts/install-replication-server.sh</pre><button class="copy" onclick="cp
 <h2>Finish and clean up</h2>
 <ol class="steps">
 <li>When the card shows the green completion banner, press <span class="btn-demo done">Migration complete — remove source agent</span> and run the shown one-liner on the source to uninstall the agent.</li>
-<li>Press <span class="btn-demo danger">Close migration</span> to clear the card. Your migrated Linode is kept, untouched; volume boot also removes the appliance's temporary replication volume.</li>
+<li>Press <span class="btn-demo danger">Close migration</span> to clear the card. Your migrated Linode is kept, untouched; the appliance's temporary replication volume is removed.</li>
 </ol>
 </section>
 
@@ -433,9 +419,8 @@ sudo scripts/install-replication-server.sh</pre><button class="copy" onclick="cp
 <h2>Troubleshooting</h2>
 <table>
 <tr><th>Symptom</th><th>Cause and fix</th></tr>
-<tr><td>The <b>Destination OS image</b> dropdown says "add a Linode token"</td><td>No API token is saved. Add one in the <b>Linode automation</b> card (<a href="#api-token">guide</a>).</td></tr>
+<tr><td>Local-disk boot rejects the plan / can't size it</td><td>No API token is saved, or the token lacks the Linodes scope. Add/fix it in the <b>Linode automation</b> card (<a href="#api-token">guide</a>).</td></tr>
 <tr><td>Status stays <span class="pill-demo bad">connection failed</span> after enrolling</td><td>The source can't reach TCP 5000–5100 on the replication server — open the range in every firewall in the path. The agent retries every 60&nbsp;s on its own.</td></tr>
-<tr><td>File transfer: destination stuck "installing the file receiver"</td><td>The image/region lacks cloud-init/Metadata support. Use the <b>manual install command</b> shown on the card (Lish, as root). Start replication unlocks when the receiver answers.</td></tr>
 <tr><td>Cutover fails with "the converted disk has no root/OS filesystem"</td><td>Either the wrong source device was selected (run <code>findmnt -no SOURCE /</code> on the source and migrate that whole disk), or the copy is incomplete/inconsistent — the message on the card gives the exact remedy. The failure now happens <b>before</b> you power off the source.</td></tr>
 <tr><td>The source-details helper lists many <code>/dev/nbdN</code> "disks"</td><td>Harmless kernel network-block-device placeholders (the helper filters them out on current builds). Only migrate real disks such as <code>/dev/sda</code>.</td></tr>
 <tr><td>Where are the logs?</td><td>Each card's <b>Activity log</b> (Expand for full history); on the replication server, <code>journalctl -u applianced -f</code>; on the source, <code>journalctl -u vmrepl-agent -n 50</code>.</td></tr>

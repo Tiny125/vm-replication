@@ -233,8 +233,8 @@ func assessSource(r api.SourceCheckReport) api.SourceAssessment {
 	}
 	newVB := func() *vb { return &vb{verdict: "ok"} }
 
-	file, vol, dsk := newVB(), newVB(), newVB()
-	all := []*vb{file, vol, dsk}
+	vol, dsk := newVB(), newVB()
+	all := []*vb{vol, dsk}
 
 	if !archOK {
 		for _, v := range all {
@@ -257,36 +257,30 @@ func assessSource(r api.SourceCheckReport) api.SourceAssessment {
 		}
 	}
 
-	// File transfer specifics: it copies files, so disk layout/encryption don't
-	// matter — but metadata that isn't copied does.
-	if strings.EqualFold(r.SELinux, "enforcing") {
-		worsen(file, "warn", "SELinux is enforcing: file copy does not preserve SELinux contexts/xattrs — plan `touch /.autorelabel` on the destination, or prefer a block method")
-	}
-
-	// Block-method specifics: the disk must be convertible to boot on Linode.
-	blockPair := []*vb{vol, dsk}
+	// Both remaining methods are block methods: the disk must be convertible to
+	// boot on Linode.
 	switch {
 	case r.RootOnLUKS:
-		for _, v := range blockPair {
-			worsen(v, "fail", "the root filesystem is LUKS-encrypted — the block image cannot be converted to boot on Linode; use file transfer")
+		for _, v := range all {
+			worsen(v, "fail", "the root filesystem is LUKS-encrypted — the block image cannot be converted to boot on Linode")
 		}
 	case r.RootFS == "":
-		for _, v := range blockPair {
+		for _, v := range all {
 			worsen(v, "warn", "the root filesystem type could not be determined — boot conversion is unverified")
 		}
 	case convertibleRootFS[strings.ToLower(r.RootFS)]:
 		// fully supported
 	case strings.EqualFold(r.RootFS, "btrfs"):
-		for _, v := range blockPair {
-			worsen(v, "warn", "btrfs root: the boot conversion cannot check/repair btrfs, so a bootable result is not guaranteed — file transfer is safer")
+		for _, v := range all {
+			worsen(v, "warn", "btrfs root: the boot conversion cannot check/repair btrfs, so a bootable result is not guaranteed")
 		}
 	default: // zfs, nfs, overlay, …
-		for _, v := range blockPair {
-			worsen(v, "fail", r.RootFS+" root cannot be converted to boot on Linode — use file transfer")
+		for _, v := range all {
+			worsen(v, "fail", r.RootFS+" root cannot be converted to boot on Linode")
 		}
 	}
 	if r.RootOnRAID {
-		for _, v := range blockPair {
+		for _, v := range all {
 			worsen(v, "warn", "root on software RAID: the destination has a single virtual disk, so the array is flattened — verify the result boots before decommissioning the source")
 		}
 	}
@@ -294,9 +288,8 @@ func assessSource(r api.SourceCheckReport) api.SourceAssessment {
 		if d.Ephemeral {
 			// A cloud scratch disk (Azure's temporary "resource disk"): its contents
 			// are discarded by the provider, so it must NOT be part of a block
-			// migration — and it doesn't count against any size limit. File transfer
-			// is unaffected (it never copies /mnt).
-			for _, v := range blockPair {
+			// migration — and it doesn't count against any size limit.
+			for _, v := range all {
 				worsen(v, "warn", fmt.Sprintf("disk %s looks like the cloud's ephemeral/resource disk (temporary storage mounted at /mnt) — do NOT add it to a block migration; its contents are provider-discarded scratch space", d.Name))
 			}
 			continue
@@ -308,89 +301,10 @@ func assessSource(r api.SourceCheckReport) api.SourceAssessment {
 	}
 
 	a.Methods = []api.MethodAssessment{
-		{Method: "file", Verdict: file.verdict, Reasons: file.reasons,
-			RecommendedImage: recommendedImage(r.OSID, r.OSVersion), RecommendedImageNote: recommendedImageNote(r.OSID)},
 		{Method: "volume", Verdict: vol.verdict, Reasons: vol.reasons},
 		{Method: "disk", Verdict: dsk.verdict, Reasons: dsk.reasons},
 	}
 	return a
-}
-
-// recommendedImageNote qualifies APPROXIMATE image recommendations so the
-// operator knows when the mapped image is not the same OS as the source.
-func recommendedImageNote(osID string) string {
-	switch strings.ToLower(strings.TrimSpace(osID)) {
-	case "amzn":
-		return "Amazon Linux has no Linode image; AlmaLinux is RHEL-family but not a drop-in replacement — validate your application stack on it, or use a block method to keep the exact OS"
-	case "rhel", "redhat":
-		return "Linode has no RHEL images; AlmaLinux is the binary-compatible rebuild of the same major version"
-	case "sles", "sled", "suse":
-		return "SUSE Linux Enterprise has no Linode image; openSUSE Leap shares its codebase but is not identical — validate, or use a block method to keep the exact OS"
-	default:
-		return ""
-	}
-}
-
-// recommendedImage maps a source distro/version to the closest Linode image
-// for the file-transfer destination. Empty means "no close match — pick
-// manually in the dropdown".
-func recommendedImage(osID, version string) string {
-	id := strings.ToLower(strings.TrimSpace(osID))
-	major := version
-	if i := strings.Index(version, "."); i > 0 && id != "ubuntu" {
-		major = version[:i]
-	}
-	switch id {
-	case "ubuntu":
-		switch {
-		case strings.HasPrefix(version, "24.04"), strings.HasPrefix(version, "24.10"):
-			return "linode/ubuntu24.04"
-		case strings.HasPrefix(version, "22"):
-			return "linode/ubuntu22.04"
-		case strings.HasPrefix(version, "20"):
-			return "linode/ubuntu20.04"
-		default:
-			return "linode/ubuntu24.04"
-		}
-	case "debian":
-		switch major {
-		case "12":
-			return "linode/debian12"
-		case "11":
-			return "linode/debian11"
-		default:
-			return "linode/debian12"
-		}
-	case "almalinux":
-		return "linode/almalinux" + orDefault(major, "9")
-	case "rocky":
-		return "linode/rocky" + orDefault(major, "9")
-	case "rhel", "redhat":
-		// No RHEL images on Linode: AlmaLinux is the closest binary-compatible rebuild.
-		return "linode/almalinux" + orDefault(major, "9")
-	case "centos":
-		if major == "7" {
-			return "linode/centos7"
-		}
-		return "linode/centos-stream" + orDefault(major, "9")
-	case "fedora":
-		return "linode/fedora" + orDefault(major, "40")
-	case "opensuse", "opensuse-leap", "sles", "sled", "suse":
-		// SUSE Linux Enterprise (common on Azure for SAP) shares its codebase with
-		// openSUSE Leap, which is the closest Linode image.
-		return "linode/opensuse15.6"
-	case "arch":
-		return "linode/arch"
-	case "alpine":
-		return "linode/alpine3.20"
-	case "gentoo":
-		return "linode/gentoo"
-	case "amzn":
-		// Amazon Linux is RHEL-family; AlmaLinux 9 is the closest match.
-		return "linode/almalinux9"
-	default:
-		return ""
-	}
 }
 
 func humanGB(b int64) string { return fmt.Sprintf("%d GB", (b+(1<<30)-1)>>30) }
@@ -495,37 +409,36 @@ REPORT="{
 # terminal even when the report cannot reach the console. Mirrors the core
 # rules of the appliance's assessment (which stays authoritative when online).
 # ---------------------------------------------------------------------------
-FILE_V=ok; VOL_V=ok; DSK_V=ok
-FILE_N=""; VOL_N=""; DSK_N=""
-worsen(){ # worsen <FILE|VOL|DSK> <warn|fail> <note>
+VOL_V=ok; DSK_V=ok
+VOL_N=""; DSK_N=""
+worsen(){ # worsen <VOL|DSK> <warn|fail> <note>
   local cur; eval "cur=\$${1}_V"
   if [ "$2" = fail ]; then eval "${1}_V=fail"
   elif [ "$cur" = ok ]; then eval "${1}_V=warn"; fi
   eval "${1}_N=\"\${${1}_N}     - $3\n\""
 }
 if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "amd64" ]; then
-  for m in FILE VOL DSK; do worsen $m fail "CPU is $ARCH - only x86_64 servers can migrate"; done
+  for m in VOL DSK; do worsen $m fail "CPU is $ARCH - only x86_64 servers can migrate"; done
 fi
-[ -n "${ID:-}" ] || for m in FILE VOL DSK; do worsen $m warn "OS could not be identified (/etc/os-release missing)"; done
+[ -n "${ID:-}" ] || for m in VOL DSK; do worsen $m warn "OS could not be identified (/etc/os-release missing)"; done
 if [ "$HAS_SYSTEMD" != "true" ]; then
-  for m in FILE VOL DSK; do worsen $m warn "no systemd: the replication agent must be scheduled manually"; done
+  for m in VOL DSK; do worsen $m warn "no systemd: the replication agent must be scheduled manually"; done
 fi
 if [ "$PORT_OK" = "false" ]; then
-  for m in FILE VOL DSK; do worsen $m warn "replication port TCP $PROBE_PORT blocked - open 5000-5100 (source to appliance)"; done
+  for m in VOL DSK; do worsen $m warn "replication port TCP $PROBE_PORT blocked - open 5000-5100 (source to appliance)"; done
 fi
-[ "$SELINUX" = "enforcing" ] && worsen FILE warn "SELinux enforcing: file copy does not preserve contexts - plan /.autorelabel or use a block method"
 if [ "$LUKS" = "true" ]; then
-  worsen VOL fail "root is LUKS-encrypted - the block image cannot boot on Linode; use file transfer"
-  worsen DSK fail "root is LUKS-encrypted - the block image cannot boot on Linode; use file transfer"
+  worsen VOL fail "root is LUKS-encrypted - the block image cannot boot on Linode"
+  worsen DSK fail "root is LUKS-encrypted - the block image cannot boot on Linode"
 else
   case "$ROOTFS" in
     ext2|ext3|ext4|xfs) : ;;
-    btrfs) worsen VOL warn "btrfs root: boot conversion is unvalidated - file transfer is safer"
-           worsen DSK warn "btrfs root: boot conversion is unvalidated - file transfer is safer" ;;
+    btrfs) worsen VOL warn "btrfs root: boot conversion is unvalidated"
+           worsen DSK warn "btrfs root: boot conversion is unvalidated" ;;
     "")    worsen VOL warn "root filesystem type unknown - boot conversion unverified"
            worsen DSK warn "root filesystem type unknown - boot conversion unverified" ;;
-    *)     worsen VOL fail "$ROOTFS root cannot be converted to boot on Linode - use file transfer"
-           worsen DSK fail "$ROOTFS root cannot be converted to boot on Linode - use file transfer" ;;
+    *)     worsen VOL fail "$ROOTFS root cannot be converted to boot on Linode"
+           worsen DSK fail "$ROOTFS root cannot be converted to boot on Linode" ;;
   esac
 fi
 if [ "$RAID" = "true" ]; then
@@ -540,22 +453,6 @@ if [ -n "$EPHDISKS" ]; then
   worsen VOL warn "disk(s)$EPHDISKS = the cloud's ephemeral/resource disk (temporary storage at /mnt) - do NOT add to a block migration"
   worsen DSK warn "disk(s)$EPHDISKS = the cloud's ephemeral/resource disk (temporary storage at /mnt) - do NOT add to a block migration"
 fi
-# Recommended destination image for file transfer (closest Linode image).
-REC=""; MAJ="${VERSION_ID%%%%.*}"
-case "${ID:-}" in
-  ubuntu) case "${VERSION_ID:-}" in 24*) REC=linode/ubuntu24.04;; 22*) REC=linode/ubuntu22.04;; 20*) REC=linode/ubuntu20.04;; *) REC=linode/ubuntu24.04;; esac;;
-  debian) case "$MAJ" in 11) REC=linode/debian11;; *) REC=linode/debian12;; esac;;
-  almalinux) REC=linode/almalinux${MAJ:-9};;
-  rocky) REC=linode/rocky${MAJ:-9};;
-  rhel|redhat) REC=linode/almalinux${MAJ:-9};;
-  centos) [ "$MAJ" = "7" ] && REC=linode/centos7 || REC=linode/centos-stream${MAJ:-9};;
-  fedora) REC=linode/fedora${MAJ:-40};;
-  opensuse|opensuse-leap) REC=linode/opensuse15.6;;
-  arch) REC=linode/arch;;
-  alpine) REC=linode/alpine3.20;;
-  gentoo) REC=linode/gentoo;;
-  amzn) REC=linode/almalinux9;;
-esac
 label(){ case "$1" in ok) echo "SUPPORTED";; warn) echo "SUPPORTED WITH CAUTIONS";; *) echo "NOT SUPPORTED";; esac; }
 USED_GB=$(( (USED + 1073741823) / 1073741824 ))
 echo
@@ -563,26 +460,18 @@ echo "==================== SOURCE CHECK RESULT ===================="
 echo " OS:        ${PRETTY_NAME:-unknown} ($ARCH, kernel $KERNEL)"
 echo " Root:      ${ROOTFS:-unknown} on ${ROOTSRC:-unknown}$( [ "$LVM" = true ] && echo ' (LVM)')$( [ "$LUKS" = true ] && echo ' (LUKS)')$( [ "$RAID" = true ] && echo ' (RAID)')"
 echo " systemd:   $( [ "$HAS_SYSTEMD" = true ] && echo present || echo 'NOT FOUND')     SELinux: ${SELINUX:-n/a}"
-echo " Used:      ${USED_GB} GB (size a file-transfer plan by this)"
+echo " Used:      ${USED_GB} GB"
 case "$PORT_OK" in
   true)  echo " Network:   replication port TCP $PROBE_PORT reachable";;
   false) echo " Network:   replication port TCP $PROBE_PORT BLOCKED - open 5000-5100";;
   *)     echo " Network:   replication ports not tested - ensure TCP 5000-5100 is open";;
 esac
 echo
-echo " File transfer : $(label $FILE_V)"
-[ -n "$REC" ] && echo "     recommended destination OS image: $REC" || echo "     recommended destination OS image: no close match - pick manually"
-case "${ID:-}" in
-  amzn) echo "     note: Amazon Linux has no Linode image - AlmaLinux is RHEL-family but not a drop-in; validate your stack, or use a block method to keep the exact OS";;
-  rhel|redhat) echo "     note: AlmaLinux is the binary-compatible rebuild of RHEL (same major version)";;
-  sles|sled|suse) echo "     note: openSUSE Leap shares the SUSE codebase but is not identical - validate, or use a block method";;
-esac
-[ -n "$FILE_N" ] && printf '%%b' "$FILE_N"
 echo " Volume boot   : $(label $VOL_V)   (destination boots your migrated disk)"
 [ -n "$VOL_N" ] && printf '%%b' "$VOL_N"
 echo " Disk boot     : $(label $DSK_V)   (destination boots your migrated disk)"
 [ -n "$DSK_N" ] && printf '%%b' "$DSK_N"
-if [ "$FILE_V" = fail ] && [ "$VOL_V" = fail ] && [ "$DSK_V" = fail ]; then
+if [ "$VOL_V" = fail ] && [ "$DSK_V" = fail ]; then
   echo " VERDICT: this server cannot migrate with any method (see reasons above)."
 else
   echo " VERDICT: this server can migrate - use a supported method above."

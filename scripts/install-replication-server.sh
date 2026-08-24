@@ -277,7 +277,7 @@ if [ ! -f "$ENVFILE" ]; then
 fi
 install -m 0755 "$ROOT/bin/applianced" /usr/local/bin/applianced
 install -m 0755 "$ROOT/bin/agent" "$OPT/agent"                  # served to sources
-install -m 0755 "$ROOT/bin/receiver" "$OPT/receiver"            # served to file-transfer destinations
+install -m 0755 "$ROOT/bin/receiver" "$OPT/receiver"            # standalone receiver, for manual/testing use
 install -m 0755 "$ROOT/scripts/machine-convert.sh" "$OPT/machine-convert.sh"
 
 # --- certificates (CA + receiver + agent), receiver SAN = public host ---
@@ -309,7 +309,6 @@ ExecStart=/usr/local/bin/applianced \\
   -cert $ETC/receiver.crt -key $ETC/receiver.key -ca $ETC/ca.crt \\
   -agent-cert $ETC/agent.crt -agent-key $ETC/agent.key \\
   -agent-binary $OPT/agent \\
-  -receiver-binary $OPT/receiver \\
   -convert-script $OPT/machine-convert.sh
 Restart=on-failure
 RestartSec=3

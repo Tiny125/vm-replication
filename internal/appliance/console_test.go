@@ -52,73 +52,6 @@ func TestConsoleRendersCutoverCopyCommand(t *testing.T) {
 	}
 }
 
-// The Start-replication confirmation must be method-aware. File transfer copies
-// FILES onto a launched destination — it must NOT tell the operator "the agent
-// streams every block" (that's the block-method wording and confused users into
-// thinking no destination existed). The file variant must mention launching the
-// destination and copying files.
-func TestConsoleStartDialogIsMethodAware(t *testing.T) {
-	js := extractJSFunc(t, "async function startReplication(")
-	// It must branch on the migration's method.
-	if !strings.Contains(js, "boot_target") {
-		t.Error("startReplication must pick its wording from the migration's boot_target")
-	}
-	// File-transfer wording present…
-	for _, want := range []string{"launches the destination", "used files"} {
-		if !strings.Contains(js, want) {
-			t.Errorf("file-transfer Start dialog missing %q", want)
-		}
-	}
-	// …and the block wording still present for block methods.
-	if !strings.Contains(js, "streams every block") {
-		t.Error("block-method Start dialog should keep its 'streams every block' wording")
-	}
-}
-
-// The file-transfer flow must render file-appropriate wording (not block-method
-// vocabulary) across the card: the completion banner, the guided-cutover freeze
-// and awaiting-cutover banners, and the action-button tooltips all carry a
-// file-specific branch. This guards the message sweep so block wording can't
-// silently creep back into the file path.
-func TestConsoleFileFlowMessagesAreMethodAware(t *testing.T) {
-	for _, want := range []string{
-		"Your files were copied onto Linode",       // file completion banner branch
-		"Finishing the last file-copy pass",        // file freeze banner
-		"the copied files are held for launch",     // file awaiting-cutover banner
-		"reboots the already-launched destination", // file cutover button tooltip
-		"initial file copy complete",               // file validation-check explainer
-	} {
-		if !strings.Contains(consoleHTML, want) {
-			t.Errorf("file-transfer flow missing method-aware wording %q", want)
-		}
-	}
-}
-
-// The file-transfer flow must render the explicit "Create destination instance"
-// step: a destPanel that keys off dest_state, a createDest() that collects a name
-// + root password and POSTs to /destination, and a Start button whose disabled
-// title points the operator at the destination step.
-func TestConsoleDestinationStep(t *testing.T) {
-	for _, want := range []string{
-		"function destPanel(",         // the destination status panel
-		"v.dest_state",                // it keys off the destination state
-		"Create destination instance", // the button label
-		"async function createDest(",  // the create action
-		"/destination",                // POSTs to the new endpoint
-		"root_password:r.d_pw",        // sends the operator's root password
-		"dest_manual_cmd",             // renders the manual-install fallback
-		"the destination is ready",    // Start tooltip mentions destination readiness
-	} {
-		if !strings.Contains(consoleHTML, want) {
-			t.Errorf("destination step missing %q", want)
-		}
-	}
-	// The card poller must rebuild when the destination status changes.
-	if !strings.Contains(consoleHTML, "card.dataset.dest") {
-		t.Error("card must track dest_state so the panel + Start gate update live")
-	}
-}
-
 // The guided cutover must tell the operator, ON THE CARD, when it is safe to
 // power off the source: a "keep the source running" banner while step 1's
 // freeze/convert/validate runs (cutover_freezing), then a "safe to power off the
@@ -139,28 +72,25 @@ func TestConsoleCutoverGuidance(t *testing.T) {
 	}
 }
 
-// The guided cutover of a BLOCK migration must take a consistent final pass by
-// default (skip_snapshot=false → the appliance's existing remount-ro/LVM quiesce
-// runs), with an opt-out checkbox for an already-powered-off source. File
-// transfer must be untouched: it keeps skip_snapshot=true and has no checkbox.
-// This is the fix for the "converted disk has no root filesystem" fsck failure
-// caused by cloning a live, inconsistent block image.
+// The guided cutover must take a consistent final pass by default
+// (skip_snapshot=false → the appliance's existing remount-ro/LVM quiesce runs),
+// with an opt-out checkbox for an already-powered-off source. This is the fix
+// for the "converted disk has no root filesystem" fsck failure caused by
+// cloning a live, inconsistent block image.
 func TestConsoleBlockCutoverQuiesces(t *testing.T) {
 	js := extractJSFunc(t, "async function startMig(")
-	// Block methods get the opt-out checkbox (guarded by !file) …
-	if !strings.Contains(js, "if(!file)opts.checkboxes") || !strings.Contains(js, "skip_snap") {
-		t.Error("block cutover must offer a skip-the-snapshot opt-out checkbox")
+	if !strings.Contains(js, "checkboxes:[{id:'skip_snap'") {
+		t.Error("cutover must offer a skip-the-snapshot opt-out checkbox")
 	}
-	// … and send skip_snapshot method-aware: true for file, the checkbox for block.
-	if !strings.Contains(js, "file?true:!!r.skip_snap") {
-		t.Error("skip_snapshot must be true for file and the checkbox value for block methods")
+	if !strings.Contains(js, "skipSnap=!!r.skip_snap") {
+		t.Error("skip_snapshot must come from the checkbox value")
 	}
 	if !strings.Contains(js, "skip_snapshot:skipSnap") {
 		t.Error("cutover must post the computed skip_snapshot value")
 	}
-	// The dialog must mention the read-only quiesce so the block flow is honest.
+	// The dialog must mention the read-only quiesce so the flow is honest.
 	if !strings.Contains(js, "read-only") {
-		t.Error("cutover dialog should describe the read-only quiesce for block methods")
+		t.Error("cutover dialog should describe the read-only quiesce")
 	}
 	// A busy root must not dead-end the cutover: the dialog promises the
 	// automatic fallback to the crash-consistent data (fsck-repaired, validated
@@ -170,28 +100,6 @@ func TestConsoleBlockCutoverQuiesces(t *testing.T) {
 	}
 	if strings.Contains(js, "the cutover fails fast and asks you to stop them") {
 		t.Error("the old fail-fast wording must be gone — the cutover no longer aborts on a busy root")
-	}
-}
-
-// File-transfer cutover only reboots the destination that was already created
-// (and named/credentialed) at "Create destination instance" — so its cutover
-// dialog must show NONE of the instance-name / volume-name / root-password /
-// SSH-key fields (those only apply to the block methods, which create the
-// instance at cutover). Guards a stress-test regression where file showed a
-// "New volume name" field for a method that has no volume.
-func TestConsoleFileCutoverOmitsBlockFields(t *testing.T) {
-	js := extractJSFunc(t, "async function startMig(")
-	if !strings.Contains(js, "if(!file){") {
-		t.Error("cutover dialog must gate its optional fields behind !file")
-	}
-	// The vol_name field must stay gated: never for file (no volume exists), and
-	// for local-disk boot only when there are DATA disks to clone into volumes.
-	if !strings.Contains(js, "if(!disk||nDisks>1)fields.push({id:'vol_name'") {
-		t.Error("vol_name must be offered for volume boot and for multi-disk local-disk boot, but not for file or single-disk local boot")
-	}
-	// The credential note (access) must be suppressed for file.
-	if !strings.Contains(js, "html:how+(file?'':access)+prep") {
-		t.Error("the root-password note must be suppressed for the file cutover dialog")
 	}
 }
 
@@ -211,29 +119,52 @@ func TestConsoleCutoverNamingFields(t *testing.T) {
 	}
 }
 
-// The create card must offer all three methods from ONE selector, defaulting to
-// file transfer, and file mode must expose the OS-image dropdown + used-storage
-// field and post boot_target:'file' with os_image.
+// The create card must offer both remaining (block) methods from ONE selector,
+// defaulting to local-disk boot, and post boot_target:mth. The file-transfer
+// method (its OS-image dropdown, used-storage field, and images endpoint) must
+// be gone entirely.
 func TestConsoleMigrationMethodSelector(t *testing.T) {
 	for _, want := range []string{
-		`id="m_method"`,         // single method selector
-		`value="file"`,          // file option
-		`value="volume"`,        // block volume option
-		`value="disk"`,          // block disk option
-		"m_osimage",             // destination OS image dropdown
-		"m_used",                // used-storage input (file mode)
-		"boot_target:mth",       // create posts the chosen method
-		"os_image:",             // create posts the OS image
-		"/api/v1/linode/images", // images are loaded for the dropdown
-		"loadImages",            // image loader
+		`id="m_method"`,   // single method selector
+		`value="volume"`,  // block volume option
+		`value="disk"`,    // block disk option
+		"boot_target:mth", // create posts the chosen method
 	} {
 		if !strings.Contains(consoleHTML, want) {
 			t.Errorf("create card should support the method selector (missing %q)", want)
 		}
 	}
-	// File must be the default selected option (its <option> carries selected).
-	if !strings.Contains(consoleHTML, `value="file" selected`) {
-		t.Error("file transfer must be the default selected method")
+	// disk must be the default selected option (its <option> carries selected).
+	if !strings.Contains(consoleHTML, `value="disk" selected`) {
+		t.Error("local-disk boot must be the default selected method")
+	}
+	// The removed file-transfer method must leave no trace in the create form.
+	for _, gone := range []string{
+		`value="file"`, "m_osimage", "m_used", "os_image:",
+		"/api/v1/linode/images", "loadImages", "fileFields",
+		"function destPanel(", "async function createDest(", "/destination",
+	} {
+		if strings.Contains(consoleHTML, gone) {
+			t.Errorf("console still references removed file-transfer piece %q", gone)
+		}
+	}
+}
+
+// A migration row can still carry a boot_target the console no longer
+// supports (e.g. 'file', from before the file-transfer method was removed —
+// the column stays on old databases). The card must show that raw value
+// plainly in the method banner instead of silently mislabeling it as one of
+// the current methods, and it must not crash rendering the rest of the card.
+func TestConsoleUnknownBootTargetDegradesGracefully(t *testing.T) {
+	js := extractJSFunc(t, "function migCard(")
+	if !strings.Contains(js, "m.boot_target===''||m.boot_target==='volume'") {
+		t.Error("migCard must recognize the known boot targets ('' and 'volume') explicitly, not just fall through")
+	}
+	if !strings.Contains(js, "Unsupported migration method") {
+		t.Error("migCard must show a distinct banner for an unrecognized/legacy boot_target, naming it")
+	}
+	if !strings.Contains(js, "Unsupported migration method: '+esc(m.boot_target)") {
+		t.Error("the unsupported-method banner must render the RAW boot_target value (escaped), not hide it")
 	}
 }
 

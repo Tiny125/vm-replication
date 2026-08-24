@@ -1,7 +1,6 @@
 package appliance
 
 import (
-	"strings"
 	"testing"
 	"time"
 
@@ -78,23 +77,3 @@ func TestMigrationFinished(t *testing.T) {
 		}
 	}
 }
-
-// F-09. The appliance must turn the agent's skipped-filesystem report into a
-// warning that names the paths. This is the message standing between an
-// operator and powering off the only machine that still has their data.
-func TestSkippedMountsWarningNamesPaths(t *testing.T) {
-	w := skippedMountsWarning([]string{"srv/appdata", "var/lib/mysql"})
-	for _, want := range []string{"/srv/appdata", "/var/lib/mysql", "NOT copied"} {
-		if !contains(w, want) {
-			t.Errorf("warning must mention %q, got: %s", want, w)
-		}
-	}
-	if skippedMountsWarning(nil) != "" {
-		t.Error("no skipped mounts must produce no warning — the happy path stays quiet")
-	}
-	if skippedMountsWarning([]string{}) != "" {
-		t.Error("an empty slice must produce no warning")
-	}
-}
-
-func contains(s, sub string) bool { return strings.Contains(s, sub) }

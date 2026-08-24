@@ -200,7 +200,9 @@ CREATE INDEX IF NOT EXISTS idx_audit_migration ON audit_log(migration_id, id);
 		`ALTER TABLE migrations ADD COLUMN replication_enabled INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE migrations ADD COLUMN enrolled_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE migration_disks ADD COLUMN agent_connected_at INTEGER NOT NULL DEFAULT 0`,
-		// File-transfer method: the launched destination's OS image id.
+		// os_image held the launched destination's OS image id for the file-transfer
+		// method, which has been removed. The column is kept (no destructive schema
+		// migration) but the appliance no longer reads or writes it.
 		`ALTER TABLE migrations ADD COLUMN os_image TEXT NOT NULL DEFAULT ''`,
 	} {
 		_, _ = s.db.Exec(stmt)

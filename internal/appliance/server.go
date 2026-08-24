@@ -27,7 +27,7 @@ import (
 // Config configures the appliance server.
 type Config struct {
 	Store             *store.Store
-	DataDir           string          // file-fallback volumes + manifests live here
+	DataDir           string          // fallback volumes + manifests live here
 	PublicHost        string          // IP/DNS that source agents reach this server at
 	ConsolePort       int             // for building enrollment URLs
 	Scheme            string          // "https" (default) or "http" for enrollment URLs
@@ -40,8 +40,7 @@ type Config struct {
 	AgentKey          string          // agent.key handed to sources
 	CACert            string          // ca.crt handed to sources
 	AgentBinary       string          // path to the linux/amd64 agent binary to serve
-	ReceiverBinary    string          // path to the linux/amd64 receiver binary (for the file-transfer destination)
-	ApplianceLinodeID int64           // this server's Linode id (0 = file fallback)
+	ApplianceLinodeID int64           // this server's Linode id (0 = no Linode automation)
 	RPOTargetSec      int             // lag threshold for the "ready to migrate" gate
 	ConvertScript     string          // path to machine-convert.sh (empty = skip convert)
 }
@@ -89,25 +88,9 @@ type Server struct {
 	// freeze) is currently running, so the console can tell the operator to keep
 	// the source running until the card says to power it off.
 	cutoverFreezing sync.Map
-	// File-transfer cutover delivery (token -> *fileDelivery); see file_delivery.go.
-	fileDeliveries sync.Map
-	// Direct file transfer: migrationID -> *fileDest (the launched destination the
-	// agent streams straight into); see file_direct.go.
-	fileDests sync.Map
-	// Direct file transfer: diskID -> *directPass, the agent-reported copy passes
-	// that are the ONLY completion signal in direct mode; see file_direct.go.
-	// In-memory by design: full_sync_done is monotonic in the store, so a restart
-	// can at worst re-credit one already-recorded pass.
 	// Host specs of the appliance itself, read once in New(); see health.go.
-	vcpus        int
-	memBytes     int64
-	directPasses sync.Map
-	// Token-gated bootstrap for the destination's receiver install (token ->
-	// *destBootstrap); see file_direct.go.
-	destBootstraps sync.Map
-	// destProbe is the destination-receiver readiness check (file transfer; see
-	// watchFileDest/tlsProbeDest); tests inject it to avoid real network I/O.
-	destProbe func(addr string) bool
+	vcpus    int
+	memBytes int64
 	// linodeBase overrides the Linode API base URL (tests point it at a fake
 	// server); empty uses the real API.
 	linodeBase string
@@ -175,15 +158,6 @@ func (s *Server) routes() {
 	// instance downloading these has no console session).
 	s.mux.HandleFunc("GET /cutover/copy.sh", s.handleCutoverScript)
 	s.mux.HandleFunc("GET /cutover/image", s.handleCutoverImage)
-	s.mux.HandleFunc("GET /cutover/files.tar", s.handleCutoverTar)
-	s.mux.HandleFunc("GET /cutover/done", s.handleCutoverDone)
-	// Direct file transfer: the launched destination bootstraps its receiver from
-	// these (token-gated) during first boot.
-	s.mux.HandleFunc("GET /dest/receiver", s.handleDestReceiver)
-	s.mux.HandleFunc("GET /dest/cert", s.handleDestCert)
-	// Manual receiver-install fallback (token-gated): the operator pastes this in
-	// the destination's Lish console if cloud-init didn't auto-install the receiver.
-	s.mux.HandleFunc("GET /dest/install.sh", s.handleDestInstall)
 
 	// Source check (pre-migration assessment): the script + its report endpoint
 	// are token-gated and unauthenticated (they run on the source server).
@@ -198,7 +172,6 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /api/v1/migrations/{id}/events", s.auth(s.handleMigrationEvents))
 	s.mux.Handle("DELETE /api/v1/migrations/{id}", s.auth(s.handleDeleteMigration))
 	s.mux.Handle("POST /api/v1/migrations/{id}/close", s.auth(s.handleCloseMigration))
-	s.mux.Handle("POST /api/v1/migrations/{id}/destination", s.auth(s.handleCreateDestination))
 	s.mux.Handle("POST /api/v1/migrations/{id}/replicate", s.auth(s.handleStartReplication))
 	s.mux.Handle("POST /api/v1/migrations/{id}/pause", s.auth(s.handlePauseReplication))
 	s.mux.Handle("POST /api/v1/migrations/{id}/start", s.auth(s.handleStartMigration))
@@ -208,7 +181,6 @@ func (s *Server) routes() {
 	s.mux.Handle("POST /api/v1/sourcecheck", s.auth(s.handleSourceCheckCreate))
 	s.mux.Handle("GET /api/v1/sourcecheck/{token}", s.auth(s.handleSourceCheckStatus))
 	s.mux.Handle("GET /api/v1/linode/plans", s.auth(s.handleLinodePlans))
-	s.mux.Handle("GET /api/v1/linode/images", s.auth(s.handleLinodeImages))
 	s.mux.Handle("GET /api/v1/settings", s.auth(s.handleGetSettings))
 	s.mux.Handle("POST /api/v1/settings/linode-token", s.auth(s.handleSetLinodeToken))
 	s.mux.Handle("DELETE /api/v1/settings/linode-token", s.auth(s.handleDeleteLinodeToken))
@@ -629,8 +601,4 @@ func (s *Server) StartActiveReceivers() {
 				"the appliance service restarted — receivers are back up and replication continues. A copy pass that was in flight was discarded whole (never applied half-way) and the agent retries within ~60s.")
 		}
 	}
-	// File transfer: destination tracking is in-memory, so rebuild the readiness
-	// watches for already-launched destinations (otherwise a restart would leave
-	// Start replication locked forever even with the receiver up).
-	s.resumeFileDestWatches()
 }

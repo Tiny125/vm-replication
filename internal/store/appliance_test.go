@@ -54,6 +54,38 @@ func TestLinodeTokenRoundTrip(t *testing.T) {
 	}
 }
 
+// A migration created with no boot_target must default to disk boot (the
+// local Linode disk) — the file-transfer method that used to be the implicit
+// default has been removed, and disk boot replaces it as the default.
+func TestCreateMigrationDefaultsToDiskBoot(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	m, _, err := st.CreateMigration(ctx, api.CreateMigrationRequest{
+		Name: "web02", SourceHostname: "web02",
+		Devices: []api.DeviceSpec{{Device: "/dev/sda", SizeBytes: 80 << 30}},
+		// BootTarget deliberately left empty.
+	})
+	if err != nil {
+		t.Fatalf("CreateMigration: %v", err)
+	}
+	if m.BootTarget != api.BootTargetDisk {
+		t.Errorf("BootTarget = %q, want %q (the default)", m.BootTarget, api.BootTargetDisk)
+	}
+
+	// An explicit volume boot_target is honoured, not overridden by the default.
+	m2, _, err := st.CreateMigration(ctx, api.CreateMigrationRequest{
+		Name: "web03", SourceHostname: "web03", BootTarget: api.BootTargetVolume,
+		Devices: []api.DeviceSpec{{Device: "/dev/sda", SizeBytes: 80 << 30}},
+	})
+	if err != nil {
+		t.Fatalf("CreateMigration (volume): %v", err)
+	}
+	if m2.BootTarget != api.BootTargetVolume {
+		t.Errorf("BootTarget = %q, want %q (explicit)", m2.BootTarget, api.BootTargetVolume)
+	}
+}
+
 func TestMigrationLifecycle(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()

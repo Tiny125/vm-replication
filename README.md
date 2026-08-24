@@ -12,13 +12,12 @@ console never needs inbound access to your sources.
 
 ![The migration console](internal/appliance/docsimg/console-overview.png)
 
-## Three migration methods, one console
+## Two migration methods, one console
 
 | Method | What moves | Best for |
 |---|---|---|
-| **File transfer** *(default)* | Only the **used files**, copies only the used storage onto a brand-new Linode running an OS image you pick | Most servers: cheapest, usually fastest, no partition/bootloader concerns |
+| **Disk boot** *(default)* | Every disk, block for block: the **boot disk** onto the new Linode's own **local NVMe disk**, any further disks onto Block Storage volumes attached to it | Most servers: no separate volume cost for the boot disk, fast local storage |
 | **Volume boot** | Every disk, **block for block**, onto Block Storage volumes cloned into launchable image volumes | Exact disk-level replicas, multi-disk servers, keeping volumes as artifacts |
-| **Disk boot** | Every disk, block for block: the **boot disk** onto the new Linode's own **local NVMe disk**, any further disks onto Block Storage volumes attached to it | Whole multi-disk servers where the boot disk should sit on fast local storage at no extra cost |
 
 ## Quick start
 
@@ -47,12 +46,12 @@ The same content in Markdown: [`CONSOLE.md`](CONSOLE.md).
 
 ## Why it's safe
 
-- **Verified transfer** — every block/file is SHA-256 checked on arrival; the
+- **Verified transfer** — every block is SHA-256 checked on arrival; the
   receiver syncs to disk before acknowledging; delta passes apply atomically
   (an interrupted pass is discarded whole, never half-applied).
-- **Validated cutover** — for the block methods the boot image is converted and
-  **validated as bootable before you're asked to power off the source**; a
-  problem surfaces while the source still runs, so you lose no uptime.
+- **Validated cutover** — the boot image is converted and **validated as
+  bootable before you're asked to power off the source**; a problem surfaces
+  while the source still runs, so you lose no uptime.
 - **Gated, guided flow** — replication starts only when you click Start; the
   cutover is a guided three-step flow that tells you exactly when it is safe to
   power the source off.
@@ -94,7 +93,6 @@ Prefer to drive the agent and receiver by hand (no console)? See
 |---|---|
 | **`https://<your-server>:8080/documentation`** | the full console guide with screenshots (served by the appliance) |
 | [`CONSOLE.md`](CONSOLE.md) | the same console guide in Markdown, plus sizing and deep detail |
-| [`docs/FILE-MIGRATION.md`](docs/FILE-MIGRATION.md) | the file-transfer method's architecture |
 | [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) | supported sources, prerequisites, limits |
 | [`docs/CLOUD-COMPAT.md`](docs/CLOUD-COMPAT.md) | per-cloud notes (AWS, GCP, Azure, …) |
 | [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) | manual/CLI workflow |
@@ -119,8 +117,8 @@ Prefer to drive the agent and receiver by hand (no console)? See
 
 ### Limitations & roadmap
 
-Crash-consistent by default (block methods quiesce the source read-only at
-cutover; use `--snapshot lvm` for app-consistency in the CLI workflow). The
+Crash-consistent by default (cutover quiesces the source read-only;
+use `--snapshot lvm` for app-consistency in the CLI workflow). The
 `hashdiff` CBT backend rescans the disk each cycle (use `--cbt dmera` for
 low-RPO). Roadmap: resume mid-stream, dedup + zstd/LZ4 transport, parallel
 streams, automated reverse-sync rollback — see

@@ -331,9 +331,8 @@ Singapore appliance gets a Singapore bucket). Override with the
 ## 3.5 Check the source first (Source check tab)
 
 Before creating a migration, run the **Source check** — a **read-only
-pre-migration assessment** that tells you whether a server can migrate, **which
-of the three methods it supports**, and which **destination OS image** to pick
-for file transfer.
+pre-migration assessment** that tells you whether a server can migrate and
+**which of the two methods it supports**.
 
 1. Open the **Source check** tab and click **Generate check command**.
 2. Run the shown one-liner on the **source server** as root (valid for 30
@@ -343,23 +342,17 @@ for file transfer.
    connects back to a temporary probe port on the appliance). It sends one
    report and exits — **nothing is installed**, so there is nothing to remove.
 3. The tab updates itself when the report arrives: source facts as ✔/✘ checks,
-   plus a verdict per method — **Supported**, **Supported with cautions** (with
-   the exact reasons, e.g. *SELinux enforcing: file copy does not preserve
-   contexts*), or **Not supported** (e.g. *LUKS-encrypted root cannot be
-   converted — use file transfer*) — and the recommended Linode image
-   (e.g. Ubuntu 24.04 source → `linode/ubuntu24.04`).
+   plus a verdict per method — **Supported**, **Supported with cautions**, or
+   **Not supported** (e.g. *LUKS-encrypted root cannot be converted to boot on
+   Linode*) — with the exact reasons.
 
 What it evaluates: x86_64 requirement (hard fail otherwise), distro/version
 recognition, systemd presence (the agent installs as a systemd timer),
-convertible root filesystem for the block methods (ext2/3/4/XFS supported; LVM
-fine; btrfs cautioned; ZFS/LUKS refused), software-RAID caution, the 10 TiB
-Block Storage per-volume limit, SELinux mode for file transfer, **cloud
-ephemeral disks** (Azure's temporary resource disk at `/mnt` is flagged
-"do not block-migrate" and excluded from size checks), and data-plane
-reachability (TCP 5000–5100). Approximate image recommendations carry an
-honest note — e.g. Amazon Linux → AlmaLinux is RHEL-family but **not a
-drop-in**; RHEL → AlmaLinux is the binary-compatible rebuild; SLES → openSUSE
-Leap shares the codebase.
+convertible root filesystem (ext2/3/4/XFS supported; LVM fine; btrfs cautioned;
+ZFS/LUKS refused), software-RAID caution, the 10 TiB Block Storage per-volume
+limit, **cloud ephemeral disks** (Azure's temporary resource disk at `/mnt` is
+flagged "do not block-migrate" and excluded from size checks), and data-plane
+reachability (TCP 5000–5100).
 
 **Works offline too.** The script prints the **full result in the source
 server's own terminal** before delivering it, so even when the network to the
@@ -372,20 +365,14 @@ receives it as well.
 
 ## 4. Create a migration (single or multi-disk)
 
-> **Migration method.** The **New migration** form offers three methods from one
-> selector: **File transfer** (the default — copies only used files onto a fresh
-> Linode you pick an OS image for) and the two **block** methods (separate Block
-> Storage volume, or Linode local disk). The disk rows below apply to the **block**
-> methods. For **File transfer** you instead pick a **destination OS image** + plan
-> and, after creating the migration, use the card's **Create destination instance**
-> step (name it + set a root password) — **Start replication** unlocks only once
-> that destination's file receiver is confirmed ready (with a manual-install
-> fallback if cloud-init can't reach it; the console **keeps watching
-> indefinitely** and unlocks Start whenever the receiver answers — even from a
-> manual Lish install done much later). See
-> [`docs/FILE-MIGRATION.md`](docs/FILE-MIGRATION.md) for the full file-transfer flow.
+> **Migration method.** The **New migration** form offers two **block**
+> methods from one selector: **Linode local disk** (the default — the boot disk
+> streams onto the new Linode's own NVMe disk at no extra cost; any further
+> disks become attached Block Storage volumes) and **separate Block Storage
+> volume** (every disk becomes its own Block Storage volume). Both take the
+> same disk rows below.
 
-For the **block** methods: click **New migration**, enter a **Name** and
+Click **New migration**, enter a **Name** and
 **hostname**, then **add one disk row per source disk** (device + size in GB). The **first row is the boot disk**
 (the one whose partitions include the root filesystem `/`); additional rows are
 data disks. A server with everything on one disk just has a single row.
@@ -413,13 +400,15 @@ data disks are listed.
 Use the **whole disks** (e.g. `/dev/sda`, `/dev/sdb`), not partitions. For LVM,
 if a volume group spans multiple disks, add **all** of its member disks.
 
-**Boot target & plan.** Choose how the cutover instance boots — a **separate
-Block Storage volume** (default) or the Linode's **local disk** — and pick the
+**Boot target & plan.** Choose how the cutover instance boots — the Linode's
+**local disk** (default) or a **separate Block Storage volume** — and pick the
 **Linode plan** (Shared or Dedicated). The form lists each plan's vCPU/RAM/disk
 and price; for the volume option it also shows the estimated monthly Block
 Storage cost (≈ $0.10/GB) and an estimated total. For local-disk boot only
-plans whose disk fits your data are offered (single-disk migrations only). The
-launched instance uses this plan at cutover.
+plans whose local disk fits your **boot disk** are offered — any further disks
+become attached Block Storage volumes, so a multi-disk source is not
+constrained by the plan's disk size. The launched instance uses this plan at
+cutover.
 
 > **Sizing local-disk boot.** The whole source disk is copied, so the plan's
 > local disk has to hold all of it — not just the used part. A stock 50 GB
@@ -483,23 +472,6 @@ retry with:
 sudo systemctl start vmrepl-agent.service
 ```
 
-**File transfer: "the copy seems to be running but *Initial file copy complete*
-never turns green."** That check is driven by the source agent's report of a
-finished pass, so work back along that chain:
-
-1. On the **source**, `journalctl -u vmrepl-agent -f` — you want a
-   `file pass complete: N entries, … on wire` line. If you only ever see
-   `streaming files directly to the destination`, the pass has not finished yet
-   (large sources take a while); if it errors, fix that first.
-2. On the **destination**, `systemctl status vmrepl-receiver` must be
-   `active (running)` and `ss -lntp | grep 5999` must show it listening.
-3. If the card says the agent is an **older build that cannot confirm the copy**,
-   re-run the enrollment one-liner on the source (no re-copy — the delta
-   checkpoint is kept).
-
-Re-running the enrollment one-liner is also safe at any time — it stops the
-previous agent and replaces it atomically.
-
 ### Wrong-disk & stale-agent protection
 
 Every agent session is checked at the handshake, before it can show as
@@ -548,50 +520,16 @@ right after the appliance was updated/restarted).
 Each migration shows aggregate progress and a **per-disk table** (expand
 **Disks**), plus a checklist that requires **all disks**:
 - ✔ Agent connected — _N/N disks checked in_
-- ✔ Initial full sync complete — _N/N disks baselined_ (block methods)
-- ✔ **Initial file copy complete** — _files copied_ (file transfer)
+- ✔ Initial full sync complete — _N/N disks baselined_
 - ✔ Replication lag within target — _worst lag across disks_
-- ✔ Storage provisioned — _N/N volumes ready_ (block methods) / ✔ Destination ready (file transfer)
+- ✔ Storage provisioned — _N/N volumes ready_
 
 When all checks pass, run **Pre-migration assessment**; on success the **Cutover
 instance** button enables.
 
-### File transfer: the copy is complete when the AGENT says so
-
-In file transfer the agent streams your files **straight into the destination
-Linode** — the data never passes through the replication server. So the console
-cannot see the copy finish by watching its own receiver; it learns that a pass
-finished from the **source agent**, which reports each completed pass on its
-next check-in.
-
-Two consequences worth knowing:
-
-- **"Initial file copy complete" turns green up to ~60 s after the copy actually
-  ends** — the agent reports on its next tick. It is deliberately late rather
-  than early: the check going green means a pass that walked your **whole**
-  source tree has been confirmed delivered.
-- **While the first pass is still running** the check stays amber and says
-  _"first copy pass streaming to the destination (N min so far) — it must finish
-  before cutover"_. On a large source that can be hours. That is the copy
-  working, not a stall — watch **transferred / speed** on the card, and
-  `journalctl -u vmrepl-agent -f` on the source for `file pass complete` lines.
-
-If the check instead says **"the source agent is an older build that cannot
-confirm the copy finished"**, re-run the enrollment one-liner on the source. It
-updates the agent in place — **nothing is re-copied**, the delta checkpoint is
-kept. If it says **"the last pass ended early"**, the agent hit an error partway
-through the walk; it retries automatically every ~60 s, and cutover needs one
-complete pass.
-
 ---
 
 ## 7. Cut over the instance
-
-> **File transfer — never power the source off before the check is green.** The
-> **Initial file copy complete** check is the *only* signal that your files
-> actually reached the destination; the copy runs source→destination, so the
-> card cannot infer it any other way. **Cutover instance** stays disabled until a
-> complete pass is confirmed. Wait for the green tick, then follow the steps.
 
 Cutover is **three steps: freeze the image, power off the source, launch** (the same for volume-boot and
 local-disk boot):
