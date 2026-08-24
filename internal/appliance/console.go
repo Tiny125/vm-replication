@@ -362,17 +362,35 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
       <input id="m_ip" placeholder="e.g. 172.236.148.63">
       <label style="margin-top:14px">Migration method</label>
       <div class="row">
-        <div><select id="m_method" onchange="methodChanged()">
-          <option value="disk" selected>Block: Linode local disk (NVMe, default)</option>
-          <option value="volume">Block: separate Block Storage volume</option>
-        </select></div>
+        <!-- Local-disk boot is the ONLY migration method this console offers
+             (product decision: Linode's own Backups service, Images, and
+             cross-datacentre migration don't work with Block Storage volumes,
+             so a volume-boot machine sits outside Linode's lifecycle tooling
+             for its whole life — see CONSOLE.md). The volume-boot code path
+             (api.BootTargetVolume) is fully retained: the HTTP API still
+             accepts it and a pre-existing volume-boot migration still renders
+             normally below (see migCard) — it just isn't offered here.
+             m_method stays a real <select> (one real <option>, disabled)
+             rather than plain text or a hidden input, so method()/createMig
+             need no change and re-enabling volume boot later is a one-line
+             HTML diff: drop the disabled attribute, add back the volume
+             option. It's disabled rather than left enabled with one choice
+             so it doesn't invite a click that does nothing. -->
+        <div style="display:flex;align-items:center;gap:2px">
+          <select id="m_method" disabled style="flex:1">
+            <option value="disk" selected>Local disk (NVMe boot)</option>
+          </select>
+          <span class="info" data-tip="This console currently offers local-disk boot only. Block Storage volume boot still works underneath (the API accepts it and existing volume-boot migrations keep working) but is not offered here, because it sits outside Linode's own Backups/Images/cross-datacentre tooling.">i</span>
+        </div>
         <div><select id="m_planclass" onchange="reloadPlanOptions()">
           <option value="shared">Shared CPU</option>
           <option value="dedicated">Dedicated CPU</option>
         </select></div>
       </div>
 
-      <!-- Source disks (both methods are block methods). -->
+      <!-- Source disks: the first row becomes the destination's local boot
+           disk; any further rows become Block Storage volumes attached to
+           the same instance. -->
       <div id="diskFields">
         <label style="margin-top:12px">Source disks (first = boot disk)</label>
         <div id="disks"></div>
@@ -527,10 +545,16 @@ function renderSourceCheck(st){
   h+='<div class="muted" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin:10px 0 4px">Source facts</div>';
   for(const c of (a.checks||[]))
     h+='<div style="font-size:13px;margin:2px 0"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>';
-  // Per-method verdicts.
-  h+='<div class="muted" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin:14px 0 4px">Migration methods</div>';
+  // Per-method verdicts. The API still returns a verdict for every method it
+  // knows how to assess, but the console shows only the ones it can actually
+  // create — a "Supported" verdict for a method missing from the create form
+  // is a dead end for the operator. OFFERED is the single place to change if a
+  // method is re-enabled.
+  const OFFERED=['disk'];
+  const shown=(a.methods||[]).filter(m=>OFFERED.indexOf(m.method)>=0);
+  h+='<div class="muted" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin:14px 0 4px">Migration method</div>';
   h+='<table><tr><th>Method</th><th>Verdict</th><th>Notes</th></tr>';
-  for(const m of (a.methods||[])){
+  for(const m of shown){
     const v=V[m.verdict]||V.warn;
     h+='<tr><td><b>'+esc(MNAME[m.method]||m.method)+'</b></td>'+
        '<td><span class="pill '+v[0]+'">'+v[1]+'</span></td>'+
@@ -538,10 +562,10 @@ function renderSourceCheck(st){
   }
   h+='</table>';
   // Bottom line.
-  const okAny=(a.methods||[]).some(m=>m.verdict!=='fail');
+  const okAny=shown.some(m=>m.verdict!=='fail');
   h+=okAny
-    ?'<div class="resultbox ok" style="margin-top:10px"><b>✔ This server can migrate.</b> Use a supported method above — then create the migration on the Migrations tab.</div>'
-    :'<div class="resultbox bad" style="margin-top:10px"><b>✘ This server cannot migrate with any method.</b> See the notes above for the blocking reasons.</div>';
+    ?'<div class="resultbox ok" style="margin-top:10px"><b>✔ This server can migrate.</b> Create the migration on the Migrations tab.</div>'
+    :'<div class="resultbox bad" style="margin-top:10px"><b>✘ This server cannot be migrated.</b> See the notes above for the blocking reasons.</div>';
   if(rep.used_bytes>0)h+='<div class="muted" style="font-size:12.5px;margin-top:8px">Used storage on the source: <b>'+fmtBytes(rep.used_bytes)+'</b>. '+
     ((rep.disks&&rep.disks.length)?('Disks: '+rep.disks.map(d=>esc(d.name)+' ('+fmtBytes(d.size_bytes)+(d.ephemeral?' — ephemeral, exclude':'')+')').join(', ')+' — block methods replicate these whole (never the ephemeral ones).'):'')+'</div>';
   $('srcOut').innerHTML=h;
@@ -681,12 +705,18 @@ function bootDiskGB(){const i=document.querySelector('#disks .d_size');const v=i
 // become Block Storage volumes, so they are billed but do not size the plan.
 function dataDiskGB(){return Math.max(0,totalDiskGB()-bootDiskGB());}
 function diskSizeChanged(){reloadPlanOptions();}
-// method returns the selected migration method ('volume'|'disk'). disk (local
-// NVMe) is the default.
+// method returns the migration method backing the create form. The console
+// only OFFERS local-disk boot now — m_method is a disabled single-option
+// select — so this always returns 'disk' in practice. It still reads the DOM
+// (rather than being a hardcoded literal) so the 'volume' branches below stay
+// live dead code: re-enabling volume boot later only needs the <select> to
+// gain the option back (see the comment above it), not a JS change here.
 function method(){return $('m_method')?$('m_method').value:'disk';}
 // sizeGBForPlan returns the GB the plan's LOCAL DISK must fit: the boot disk
 // alone (local-disk boot — the data disks become volumes), or the summed disk
-// sizes (volume boot, where nothing uses the plan's disk).
+// sizes (volume boot, where nothing uses the plan's disk). The volume branch
+// is currently unreachable from the UI (method() only ever returns 'disk')
+// but is kept working for the same re-enablement reason as method() above.
 function sizeGBForPlan(){return method()==='disk'?bootDiskGB():totalDiskGB();}
 // methodChanged toggles the per-method help text and reloads the plan list.
 function methodChanged(){
@@ -1137,15 +1167,20 @@ function migCard(v){
   }
 
   // Method header banner: distinct colours so the method is obvious at a glance
-  // (green = local disk, blue = separate volume). A migration created before a
-  // now-removed method (e.g. the old file-transfer method) can still carry that
-  // raw boot_target in the database — show it plainly instead of guessing which
-  // current method it resembles, and skip method-specific controls for it.
+  // (green = local disk, blue = separate volume). 'volume' is still a fully
+  // RECOGNIZED boot_target here — the console just no longer lets you CREATE
+  // one (product decision: Linode's Backups/Images/cross-DC tooling doesn't
+  // cover Block Storage volumes; see CONSOLE.md) — so a pre-existing
+  // volume-boot migration (e.g. from earlier testing) keeps rendering exactly
+  // as before. A migration created before a method that was removed ENTIRELY
+  // (e.g. the old file-transfer method) can still carry that raw boot_target
+  // in the database — show it plainly instead of guessing which current
+  // method it resembles, and skip method-specific controls for it.
   h+=(m.boot_target==='disk')
     ? '<div class="banner ok" style="margin:0 0 10px"><b>Boot: Linode local disk</b>'+((m.linode_type)?(' — '+esc((m.plan_class||'')+' plan '+m.linode_type)):'')+(((m.disks||[]).length>1)?(' + '+((m.disks||[]).length-1)+' data volume(s) attached'):'')+'</div>'
     : (m.boot_target===''||m.boot_target==='volume')
     ? '<div class="banner info" style="margin:0 0 10px"><b>Boot: separate Block Storage volume</b>'+((m.linode_type)?(' — plan '+esc(m.linode_type)):'')+'</div>'
-    : '<div class="banner warn" style="margin:0 0 10px"><b>Unsupported migration method: '+esc(m.boot_target)+'</b> — this migration was created with a method that has since been removed from the console. It cannot be started, replicated or cut over from here; delete it and re-create it with a current method (Local disk or Block Storage volume).</div>';
+    : '<div class="banner warn" style="margin:0 0 10px"><b>Unsupported migration method: '+esc(m.boot_target)+'</b> — this migration was created with a method that has since been removed from the console. It cannot be started, replicated or cut over from here; delete it and re-create it with the current method (Local disk).</div>';
 
   h+='<table style="margin-bottom:4px"><tr><th>Migration</th><th>Source &rarr; Appliance'+statusLegend()+'</th><th>Disks</th><th>Progress</th><th>RPO</th></tr><tr>'+
     '<td><b>#'+m.id+'</b> '+esc(m.name)+'<br><span class="muted">'+esc(m.source_ip||m.source_hostname||'-')+'</span></td>'+

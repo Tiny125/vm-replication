@@ -1,9 +1,16 @@
 # Cloud-Source Compatibility: AWS EC2, Azure VM, GCP Compute Engine
 
 A deep validation of migrating **AWS EC2**, **Azure Virtual Machines**, and
-**GCP Compute Engine** Linux servers to Linode with this tool — for **both**
-boot methods (separate Block Storage **volume boot** and Linode local **disk
-boot**).
+**GCP Compute Engine** Linux servers to Linode with this tool.
+
+> **Console note.** The console now offers only **disk boot** (Linode's own
+> local NVMe disk) — volume boot (booting from a separate Block Storage
+> volume) was dropped from the console and the operator-facing guides because
+> Linode's Backups service, Images, and cross-datacentre migration don't work
+> with Block Storage volumes. The code path is retained and still fully
+> functional, so this validation doc keeps its volume-boot findings for
+> whoever re-enables it; treat the **disk-boot** rows as the ones that matter
+> for the console as it ships today.
 
 **Methodology & confidence.** This is a code-path validation: every claim about
 the tool's behavior was verified against the actual replication/cutover code

@@ -300,6 +300,11 @@ func assessSource(r api.SourceCheckReport) api.SourceAssessment {
 		}
 	}
 
+	// Both verdicts are computed and returned: the volume-boot assessment logic
+	// is retained for whoever re-enables the method, and keeping it in the API
+	// response is what keeps that logic under test. The CONSOLE decides which
+	// of these to show — it renders only methods it can actually create, so an
+	// operator is never handed a verdict for a method the form does not offer.
 	a.Methods = []api.MethodAssessment{
 		{Method: "volume", Verdict: vol.verdict, Reasons: vol.reasons},
 		{Method: "disk", Verdict: dsk.verdict, Reasons: dsk.reasons},

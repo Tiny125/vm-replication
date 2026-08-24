@@ -116,6 +116,31 @@ func TestCreateMigrationRejectsRemovedFileMethod(t *testing.T) {
 	}
 }
 
+// Product decision: the console no longer OFFERS volume boot (Linode's
+// Backups/Images/cross-DC tooling doesn't cover Block Storage volumes), but
+// the code path is deliberately kept so it can be re-enabled later by editing
+// code alone. The HTTP API must therefore still ACCEPT boot_target:"volume"
+// and create the migration normally — it must not 400.
+func TestCreateMigrationAcceptsVolumeBootTarget(t *testing.T) {
+	s := bootTargetTestServer(t)
+	rr := createMigration(t, s, api.CreateMigrationRequest{
+		Name: "web02", SourceHostname: "web02.prod", SourceIP: "203.0.113.21",
+		Devices:    []api.DeviceSpec{{Device: "/dev/sda", SizeBytes: 20 << 30}},
+		BootTarget: api.BootTargetVolume,
+	})
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create with boot_target=volume: status %d, want %d — the volume-boot code path must remain fully functional even though the console no longer offers it. body: %s",
+			rr.Code, http.StatusCreated, rr.Body.String())
+	}
+	var view api.MigrationView
+	if err := json.Unmarshal(rr.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if view.Migration.BootTarget != api.BootTargetVolume {
+		t.Errorf("BootTarget = %q, want %q", view.Migration.BootTarget, api.BootTargetVolume)
+	}
+}
+
 // An unknown boot_target (neither a current nor a recognizably-removed
 // method) still gets the generic, accurate error.
 func TestCreateMigrationRejectsUnknownBootTarget(t *testing.T) {
