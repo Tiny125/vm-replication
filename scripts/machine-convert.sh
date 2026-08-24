@@ -369,6 +369,44 @@ shrink_decision() {
   echo shrink
 }
 
+# detect_bootloader ROOT -> "grub2" | "none"
+#
+# Inspects the MOUNTED image root ($1) and reports whether it carries a
+# usable, self-contained bootloader: BOTH a GRUB config (RHEL-family:
+# boot/grub2/grub.cfg, Debian/Ubuntu: boot/grub/grub.cfg) AND at least one
+# kernel image (boot/vmlinuz-*) must be present.
+#
+# This replaces an assumption this script used to make: "no partition table
+# means no bootloader, so boot with the Linode kernel instead". That
+# assumption is FALSE. Queried live via the API (2026-08), Linode's OWN
+# CentOS Stream 9 and Ubuntu 24.04 images are PARTITIONLESS (root filesystem
+# directly on /dev/sda, no partition table) yet both boot via Linode's
+# `linode/grub2` kernel — which reads boot/grub2/grub.cfg straight off the
+# root filesystem; no on-disk MBR bootloader is required for that. A migrated
+# CentOS Stream 9 instance was booted with `linode/latest-64bit` (the Linode
+# kernel) instead of its own, purely because its root happened to be
+# partitionless: the machine came up with SELinux silently DISABLED even
+# though /etc/selinux/config still said `enforcing`, because the Linode
+# kernel has no matching policy/modules for that distro. Partitioning tells
+# you nothing about whether a bootloader is usable — so detect the actual
+# files instead of inferring from layout.
+detect_bootloader() {
+  local root="$1" k
+  if [ ! -f "$root/boot/grub2/grub.cfg" ] && [ ! -f "$root/boot/grub/grub.cfg" ]; then
+    echo none
+    return 0
+  fi
+  # A glob loop (not `ls`) so a non-match leaves the literal pattern in $k
+  # instead of erroring — safe under `set -e`/`set -u` and with no kernels.
+  for k in "$root"/boot/vmlinuz-*; do
+    if [ -e "$k" ]; then
+      echo grub2
+      return 0
+    fi
+  done
+  echo none
+}
+
 # Test hook: sourcing with VMREPL_CONVERT_LIB=1 loads the helper functions above
 # without running the conversion (no root, block device, traps or mounts), so
 # scripts/machine-convert-test.sh can exercise them in isolation.
@@ -604,9 +642,11 @@ if [ -z "$ROOT_PART" ]; then
   exit 1
 fi
 log "Root filesystem: $ROOT_PART (partitioned=$PARTITIONED)"
-# Emit a machine-readable layout marker so the caller can pick the right Linode
-# boot kernel/root_device (a partitionless disk boots via the Linode kernel; a
-# partitioned disk boots via GRUB2 once we reinstall it below).
+# Emit a machine-readable layout marker. NOTE: the caller must NOT use this
+# alone to pick the boot kernel — partitioning says nothing about whether the
+# image has a usable bootloader (see the vmrepl-bootloader marker below and
+# detect_bootloader's comment). It is still useful for vmrepl-root below,
+# where a partitioned root really does need a partition-numbered root_device.
 if [ "$PARTITIONED" -eq 1 ]; then
   echo "vmrepl-layout: partitioned"
 else
@@ -639,6 +679,15 @@ if grep -qE '^\S+\s+/boot\s' "$MNT/etc/fstab"; then
     mount "$BOOT_DEV" "$MNT/boot" 2>/dev/null || true
   fi
 fi
+# Emit a machine-readable bootloader marker, checked AFTER /boot is mounted (a
+# separate /boot partition only applies to a partitioned root, but check here
+# regardless so the same code path covers both layouts). This is what the
+# caller now uses to pick the boot kernel — see detect_bootloader's comment
+# for why partitioning alone (vmrepl-layout above) is the wrong signal. Kept in
+# a variable too, so the GRUB step inside the chroot (below) knows whether a
+# bootloader was actually there BEFORE we start rebuilding grub.cfg.
+BOOTLOADER="$(detect_bootloader "$MNT")"
+echo "vmrepl-bootloader: $BOOTLOADER"
 # Make sure every pseudo-filesystem mount point exists as a directory first, so
 # the binds/mounts below can't fail with "mount point is not a directory" on a
 # source whose /dev, /proc, /sys or /run came across missing or as a stray file.
@@ -682,6 +731,7 @@ set -euo pipefail
 # etc. fail with "command not found" (exit 127), aborting the conversion.
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ROOT_UUID="$ROOT_UUID"
+BOOTLOADER="$BOOTLOADER"
 log() { echo "   [chroot] \$*"; }
 
 # 1) DNS so package tooling works inside the chroot.
@@ -713,27 +763,46 @@ elif command -v dracut >/dev/null 2>&1; then
   dracut -f --kver "\$KVER" || true
 fi
 
-# 4) Bootloader. A PARTITIONLESS whole-disk filesystem has no partition table to
-#    install GRUB into; it boots via the Linode-supplied kernel instead, so skip
-#    GRUB entirely here. For a PARTITIONED disk, reinstall GRUB and (re)generate
-#    its config so Linode's "GRUB 2" mode works — and VERIFY grub.cfg so we fail
-#    loudly instead of silently leaving a disk that drops to a "grub>" prompt.
-if [ "$PARTITIONED" = "1" ]; then
-  DISK="\$(lsblk -no pkname "\$(findmnt -no SOURCE /)" 2>/dev/null | head -1)"
-  [ -n "\$DISK" ] && DISK="/dev/\$DISK" || DISK="$DEV"
-  PTTYPE="\$(blkid -s PTTYPE -o value "\$DISK" 2>/dev/null || true)"
-  log "Boot disk \$DISK (partition table: \${PTTYPE:-unknown})"
+# 4) Bootloader. The image now boots via Linode's `linode/grub2` kernel
+#    whenever BOOTLOADER=grub2 (a usable grub.cfg + kernel was found before we
+#    started — see detect_bootloader), REGARDLESS of partitioning: Linode's own
+#    CentOS Stream 9 / Ubuntu 24.04 images are partitionless yet boot exactly
+#    this way, because linode/grub2 reads boot/grub2|grub/grub.cfg straight off
+#    the root filesystem. So grub.cfg must be (re)generated in BOTH layouts —
+#    it has to pick up the serial-console/virtio GRUB_CMDLINE_LINUX changes
+#    from step 2 above, or the migrated instance loses its Lish console output
+#    and predictable interface naming — and VERIFIED, so we fail loudly instead
+#    of silently leaving a disk that drops to a "grub>" prompt.
+#
+#    The MBR/BIOS install step (`grub-install`/`grub2-install`) is NOT the same
+#    thing: it writes a boot record into a partition table, which only exists
+#    for a PARTITIONED disk. A partitionless device has no partition table to
+#    write one into, and Linode's own partitionless images don't have one
+#    either (verified live via the API: source-centos and source-xacct both
+#    report root_device=/dev/sda with kernel=linode/grub2, and boot with no
+#    MBR bootloader present) — so MBR install stays partitioned-only.
+if [ "\$BOOTLOADER" = "grub2" ]; then
   INSTALL=""; GCFG=""; MK=""
-  if command -v grub-install >/dev/null 2>&1; then
-    INSTALL="grub-install"; GCFG="/boot/grub/grub.cfg"
+  if command -v grub-install >/dev/null 2>&1 || command -v grub-mkconfig >/dev/null 2>&1 || command -v update-grub >/dev/null 2>&1; then
+    GCFG="/boot/grub/grub.cfg"
+    command -v grub-install >/dev/null 2>&1 && INSTALL="grub-install"
     if command -v update-grub >/dev/null 2>&1; then MK="update-grub"; else MK="grub-mkconfig -o \$GCFG"; fi
-  elif command -v grub2-install >/dev/null 2>&1; then
-    INSTALL="grub2-install"; GCFG="/boot/grub2/grub.cfg"; MK="grub2-mkconfig -o \$GCFG"
+  elif command -v grub2-install >/dev/null 2>&1 || command -v grub2-mkconfig >/dev/null 2>&1; then
+    GCFG="/boot/grub2/grub.cfg"; MK="grub2-mkconfig -o \$GCFG"
+    command -v grub2-install >/dev/null 2>&1 && INSTALL="grub2-install"
   fi
-  if [ -n "\$INSTALL" ]; then
+  if [ "$PARTITIONED" = "1" ] && [ -n "\$INSTALL" ]; then
+    DISK="\$(lsblk -no pkname "\$(findmnt -no SOURCE /)" 2>/dev/null | head -1)"
+    [ -n "\$DISK" ] && DISK="/dev/\$DISK" || DISK="$DEV"
+    PTTYPE="\$(blkid -s PTTYPE -o value "\$DISK" 2>/dev/null || true)"
+    log "Boot disk \$DISK (partition table: \${PTTYPE:-unknown})"
     log "Installing GRUB (BIOS/i386-pc) to \$DISK"
     \$INSTALL --target=i386-pc --recheck "\$DISK" 2>&1 | sed 's/^/   [grub] /' || \
       log "WARNING: grub-install failed (a GPT disk needs a small BIOS-boot/bios_grub partition for BIOS GRUB)"
+  elif [ "$PARTITIONED" != "1" ]; then
+    log "partitionless whole-disk filesystem — no MBR to install GRUB into (Linode's own partitionless images work the same way). Regenerating grub.cfg only, skipping grub-install."
+  fi
+  if [ -n "\$MK" ]; then
     log "Generating \$GCFG"
     \$MK 2>&1 | sed 's/^/   [grub] /' || true
     if [ -s "\$GCFG" ] && grep -qE '^[[:space:]]*(linux|linux16|menuentry)' "\$GCFG"; then
@@ -743,10 +812,10 @@ if [ "$PARTITIONED" = "1" ]; then
       exit 3
     fi
   else
-    log "no grub-install found — relying on the Linode kernel to boot the root filesystem"
+    log "WARNING: a grub.cfg was detected before conversion, but no grub-mkconfig/update-grub tool was found in the chroot to regenerate it; leaving the existing grub.cfg as-is (it will lack the serial-console/virtio cmdline changes)"
   fi
 else
-  log "partitionless whole-disk filesystem — booting via the Linode kernel; skipping GRUB install"
+  log "no bootloader detected on the image (vmrepl-bootloader: none) — relying on the Linode kernel to boot the root filesystem; skipping GRUB entirely"
 fi
 
 # 5) Network: reset to DHCP on eth0 and REMOVE the source's network config so it
