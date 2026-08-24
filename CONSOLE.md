@@ -56,15 +56,6 @@ the plan-fit constraint (the plan's local disk must fit the boot disk) plays
 out in practice, and **"Block Storage to provision"** below for the
 storage-sizing math.
 
-> **Note for anyone re-enabling volume boot.** An earlier version of this
-> console also offered booting from a separate Block Storage volume
-> (`boot_target: "volume"`); it was dropped from the console because Linode's
-> Backups service, Images, and cross-datacentre migration don't work with
-> Block Storage volumes, so a volume-boot machine falls outside Linode's own
-> lifecycle tooling for its whole life. The code path, and the HTTP API's
-> support for it, are still fully intact — only the console UI and this guide
-> stopped offering it — so it can be turned back on by editing code alone.
-
 ### The process, step by step
 
 1. Create the migration and add one disk row per source disk (§4).

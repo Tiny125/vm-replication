@@ -545,10 +545,16 @@ function renderSourceCheck(st){
   h+='<div class="muted" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin:10px 0 4px">Source facts</div>';
   for(const c of (a.checks||[]))
     h+='<div style="font-size:13px;margin:2px 0"><span class="'+(c.ok?'y">✔':'x">✘')+'</span> '+esc(c.name)+' <span class="muted">— '+esc(c.detail)+'</span></div>';
-  // Per-method verdicts.
-  h+='<div class="muted" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin:14px 0 4px">Migration methods</div>';
+  // Per-method verdicts. The API still returns a verdict for every method it
+  // knows how to assess, but the console shows only the ones it can actually
+  // create — a "Supported" verdict for a method missing from the create form
+  // is a dead end for the operator. OFFERED is the single place to change if a
+  // method is re-enabled.
+  const OFFERED=['disk'];
+  const shown=(a.methods||[]).filter(m=>OFFERED.indexOf(m.method)>=0);
+  h+='<div class="muted" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin:14px 0 4px">Migration method</div>';
   h+='<table><tr><th>Method</th><th>Verdict</th><th>Notes</th></tr>';
-  for(const m of (a.methods||[])){
+  for(const m of shown){
     const v=V[m.verdict]||V.warn;
     h+='<tr><td><b>'+esc(MNAME[m.method]||m.method)+'</b></td>'+
        '<td><span class="pill '+v[0]+'">'+v[1]+'</span></td>'+
@@ -556,10 +562,10 @@ function renderSourceCheck(st){
   }
   h+='</table>';
   // Bottom line.
-  const okAny=(a.methods||[]).some(m=>m.verdict!=='fail');
+  const okAny=shown.some(m=>m.verdict!=='fail');
   h+=okAny
-    ?'<div class="resultbox ok" style="margin-top:10px"><b>✔ This server can migrate.</b> Use a supported method above — then create the migration on the Migrations tab.</div>'
-    :'<div class="resultbox bad" style="margin-top:10px"><b>✘ This server cannot migrate with any method.</b> See the notes above for the blocking reasons.</div>';
+    ?'<div class="resultbox ok" style="margin-top:10px"><b>✔ This server can migrate.</b> Create the migration on the Migrations tab.</div>'
+    :'<div class="resultbox bad" style="margin-top:10px"><b>✘ This server cannot be migrated.</b> See the notes above for the blocking reasons.</div>';
   if(rep.used_bytes>0)h+='<div class="muted" style="font-size:12.5px;margin-top:8px">Used storage on the source: <b>'+fmtBytes(rep.used_bytes)+'</b>. '+
     ((rep.disks&&rep.disks.length)?('Disks: '+rep.disks.map(d=>esc(d.name)+' ('+fmtBytes(d.size_bytes)+(d.ephemeral?' — ephemeral, exclude':'')+')').join(', ')+' — block methods replicate these whole (never the ephemeral ones).'):'')+'</div>';
   $('srcOut').innerHTML=h;

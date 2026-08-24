@@ -347,3 +347,27 @@ func extractJSFunc(t *testing.T, header string) string {
 	}
 	return rest[:end]
 }
+
+// The console offers local-disk boot only, so the Source check tab must not
+// hand the operator a verdict for a method the create form does not offer.
+// "Volume boot: Supported" beside a form with no volume option is a dead end —
+// it reads as a recommendation the product then refuses to honour.
+//
+// The API deliberately still RETURNS every verdict it can compute (that is what
+// keeps the volume-boot assessment logic under test); the filtering is the
+// console's job, so re-enabling a method is a one-line change to OFFERED.
+func TestConsoleSourceCheckShowsOnlyOfferedMethods(t *testing.T) {
+	js := extractJSFunc(t, "function renderSourceCheck(")
+	if !strings.Contains(js, "const OFFERED=['disk']") {
+		t.Error("the source-check table must filter verdicts to the methods the console can create")
+	}
+	if !strings.Contains(js, "const shown=(a.methods||[]).filter(") {
+		t.Error("the rendered rows must come from the filtered set, not the raw API list")
+	}
+	// The bottom-line verdict must agree with the filtered table: if it still
+	// consulted every method, a source that only volume boot could handle would
+	// say "can migrate" above a table showing no usable method.
+	if !strings.Contains(js, "const okAny=shown.some(") {
+		t.Error("the overall verdict must be computed from the shown methods, not all of them")
+	}
+}

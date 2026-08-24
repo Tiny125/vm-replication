@@ -164,3 +164,36 @@ docs/
   DESIGN.md           this document
   CUTOVER.md          step-by-step migration runbook
 ```
+
+## Retained but not offered: volume boot
+
+The codebase supports a second block migration method, `boot_target: "volume"`,
+which boots the migrated machine from a Block Storage volume rather than the
+instance's own local disk. **It is fully implemented and the HTTP API still
+accepts it, but the console does not offer it.**
+
+It was withdrawn from the console because three of Linode's own lifecycle
+features do not reach Block Storage:
+
+- the **Backups** service does not back up Block Storage volumes, even when
+  attached — so a volume-boot machine's root filesystem cannot be backed up by
+  the platform at all;
+- **Images** are captured from a Compute Instance's local disk, and capture
+  explicitly excludes Block Storage volumes;
+- volumes are **region-locked** and cannot be migrated between data centres,
+  so a volume-boot machine cannot follow a normal region migration.
+
+Local plan storage is also the faster tier. A volume-boot machine therefore
+runs correctly but sits outside Linode's normal management tooling for its
+whole life, which is not a sensible default for a migration product.
+
+What is still wired up, for whoever re-enables it:
+
+- `api.BootTargetVolume` and the whole `finalizeVolume` cutover path;
+- `handleCreateMigration` accepts `boot_target: "volume"` and returns 201;
+- `assessSource` still computes a volume-boot verdict, and the API still
+  returns it — that is what keeps the logic under test.
+
+Re-enabling is a console-side change: add the `volume` option back to the
+method `<select>` in `console.go` (and drop its `disabled` attribute), and add
+`'volume'` to the `OFFERED` list that filters the Source check's method table.
