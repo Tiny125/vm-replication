@@ -1352,7 +1352,9 @@ func (s *Server) takeCutoverConvert(migID int64) (convertOutcome, bool) {
 // canceled=true if the run was cancelled (the caller should return). It never
 // fails the migration itself — the caller decides (fail fast in phase 1, or the
 // existing best-effort handling in phase 2). kernel/rootDevice default to the
-// GRUB2 path; a partitionless whole-disk root switches to a Linode kernel.
+// GRUB2 path; the actual kernel choice is made by decideBootKernel from what
+// the convert script reports about the image (see its comment: partitioning
+// alone is NOT a reliable signal for this).
 func (s *Server) convertBootDisk(ctx context.Context, m api.Migration, req api.FinalizeRequest) (convertOutcome, bool) {
 	sctx := s.ctx
 	co := convertOutcome{kernel: "linode/grub2", rootDevice: "/dev/sda"}
@@ -1385,11 +1387,9 @@ func (s *Server) convertBootDisk(ctx context.Context, m api.Migration, req api.F
 	if ctx.Err() != nil {
 		return co, true
 	}
-	if strings.Contains(string(out), "vmrepl-layout: wholedisk") {
-		// Partitionless filesystem: no on-disk bootloader, so boot with a Linode
-		// kernel that mounts the whole volume as root.
-		co.kernel = "linode/latest-64bit"
-	}
+	// See decideBootKernel: the choice is driven by whether the image actually
+	// carries a usable bootloader (vmrepl-bootloader), not by partitioning.
+	co.kernel = decideBootKernel(string(out))
 	// Use the exact root device the convert script detected (e.g. /dev/sda1 for a
 	// partitioned disk) — booting a partitioned disk with root_device /dev/sda
 	// panics with "unable to mount root fs".
@@ -2551,6 +2551,47 @@ func convertField(out, key string) string {
 		}
 	}
 	return ""
+}
+
+// decideBootKernel (F-19) picks the Linode boot kernel from machine-convert.sh's
+// output. It used to be inferred from partitioning alone ("wholedisk" =>
+// Linode kernel), on the assumption that a partitionless filesystem has no
+// on-disk bootloader. That assumption is FALSE for Linode's own images:
+// queried live via the API, Linode's stock CentOS Stream 9 and Ubuntu 24.04
+// images are BOTH partitionless (root filesystem directly on /dev/sda, no
+// partition table) yet BOTH boot via `linode/grub2` — which reads
+// boot/grub2/grub.cfg (or boot/grub/grub.cfg) straight off the root
+// filesystem; no on-disk MBR bootloader is required. Booting a migrated
+// partitionless image with `linode/latest-64bit` instead runs the machine on
+// Linode's OWN kernel rather than its own — which silently disabled SELinux on
+// a migrated CentOS Stream 9 instance even though /etc/selinux/config still
+// said "enforcing" (no matching policy/modules for that distro), and loses any
+// other distro-specific kernel modules the same way.
+//
+// So the decision is now driven by whether the image actually carries a
+// usable bootloader — the `vmrepl-bootloader:` marker machine-convert.sh
+// emits after inspecting the mounted image root (see detect_bootloader in
+// scripts/machine-convert.sh) — not by partitioning:
+//
+//   - vmrepl-bootloader: grub2  -> linode/grub2         (own kernel, any layout)
+//   - vmrepl-bootloader: none   -> linode/latest-64bit  (no usable bootloader)
+//   - marker absent             -> OLD behaviour (wholedisk => latest-64bit),
+//     for back-compat with a convert script from before this marker existed;
+//     an appliance running a stale script must not regress to something worse.
+func decideBootKernel(out string) string {
+	switch convertField(out, "vmrepl-bootloader:") {
+	case "grub2":
+		return "linode/grub2"
+	case "none":
+		return "linode/latest-64bit"
+	}
+	// Marker absent: a pre-F-19 convert script. Fall back to the old rule so a
+	// stale appliance/script pairing keeps its previous (safe-if-suboptimal)
+	// behaviour instead of picking a kernel it never validated.
+	if strings.Contains(out, "vmrepl-layout: wholedisk") {
+		return "linode/latest-64bit"
+	}
+	return "linode/grub2"
 }
 
 // oneLine collapses whitespace/newlines to single spaces and caps the length,

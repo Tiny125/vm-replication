@@ -376,4 +376,40 @@ strip_migrated_agent "$IMG" >/dev/null || fail "strip_migrated_agent must be ide
 #      live receiver's TLS material mid-migration.
 strip_migrated_agent "" 2>/dev/null && fail "strip_migrated_agent must refuse an empty root"
 strip_migrated_agent "/" 2>/dev/null && fail "strip_migrated_agent must refuse / (that is the appliance itself)"
+
+# 17) F-19: detect_bootloader must decide from the ACTUAL files on the mounted
+#     image root, not from partitioning — a stock Linode CentOS/Ubuntu image is
+#     partitionless yet still boots via GRUB (see the comment on the function).
+
+# RHEL layout: boot/grub2/grub.cfg + a kernel image -> usable.
+mkdir -p "$WORK/rhel/boot/grub2"
+: > "$WORK/rhel/boot/grub2/grub.cfg"
+: > "$WORK/rhel/boot/vmlinuz-5.14.0-697.el9.x86_64"
+[ "$(detect_bootloader "$WORK/rhel")" = grub2 ] \
+  || fail "RHEL layout (boot/grub2/grub.cfg + vmlinuz) must be detected as grub2"
+
+# Debian/Ubuntu layout: boot/grub/grub.cfg + a kernel image -> usable.
+mkdir -p "$WORK/deb/boot/grub"
+: > "$WORK/deb/boot/grub/grub.cfg"
+: > "$WORK/deb/boot/vmlinuz-6.8.0-49-generic"
+[ "$(detect_bootloader "$WORK/deb")" = grub2 ] \
+  || fail "Debian layout (boot/grub/grub.cfg + vmlinuz) must be detected as grub2"
+
+# Config present but no kernel image -> none (nothing to boot).
+mkdir -p "$WORK/nokernel/boot/grub2"
+: > "$WORK/nokernel/boot/grub2/grub.cfg"
+[ "$(detect_bootloader "$WORK/nokernel")" = none ] \
+  || fail "a grub.cfg with no vmlinuz-* must be detected as none"
+
+# Kernel present but no grub config -> none (nothing to boot it with).
+mkdir -p "$WORK/nocfg/boot"
+: > "$WORK/nocfg/boot/vmlinuz-5.14.0-697.el9.x86_64"
+[ "$(detect_bootloader "$WORK/nocfg")" = none ] \
+  || fail "a vmlinuz-* with no grub.cfg must be detected as none"
+
+# Empty image -> none.
+mkdir -p "$WORK/empty"
+[ "$(detect_bootloader "$WORK/empty")" = none ] \
+  || fail "an empty image must be detected as none"
+
 echo "machine-convert-test: all tests passed"
