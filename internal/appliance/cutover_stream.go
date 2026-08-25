@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/tiny125/vm-replication/internal/blockdiff"
 )
 
 // Disk-boot cutover, image streaming ("Variant B").
@@ -222,6 +224,15 @@ func (s *Server) handleCutoverImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
+	// Drop the kernel's cached pages for this device before reading a byte.
+	// machine-convert.sh mounted this same volume and rewrote it (chroot, GRUB,
+	// fstab, agent removal); a page cached from before those writes would be
+	// streamed to the destination in their place, producing a boot image that
+	// silently lacks the conversion. Non-fatal by design — a stale read is a
+	// risk, refusing to stream is a certain failure.
+	if ierr := blockdiff.InvalidatePageCache(f); ierr != nil {
+		log.Printf("appliance: cutover image stream for migration %d: could not drop cached pages for %s (%v) — the streamed image may be stale", st.migID, st.path, ierr)
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", st.bytes))
 	if _, err := io.CopyN(w, f, st.bytes); err != nil {

@@ -43,6 +43,21 @@ var invalidatePageCacheFn = invalidatePageCache
 // invalidating the page cache here, right after open and before any reads,
 // covers every pass; there is no separate longer-lived handle that would need
 // its own periodic invalidation.
+// InvalidatePageCache drops the kernel's cached pages for an already-open
+// block device, so subsequent reads come from the disk rather than from
+// possibly-stale cache.
+//
+// Exported for callers outside this package that stream a block device the
+// appliance has just written through a MOUNTED filesystem — notably the
+// cutover image stream, which sends a replication volume immediately after
+// machine-convert.sh has mounted and rewritten it. A stale page there ships a
+// boot image missing the conversion's changes.
+//
+// Returns an error only when the cache could not be dropped at all. Callers
+// should log and continue rather than abort: a stale read is a risk, but
+// refusing to proceed is a certainty.
+func InvalidatePageCache(f *os.File) error { return invalidatePageCacheFn(f) }
+
 func OpenDeviceRead(path string) (*Device, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {

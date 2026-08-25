@@ -275,3 +275,41 @@ func TestCutoverHandlers(t *testing.T) {
 		t.Fatalf("script bad token: status %d, want 403", rr.Code)
 	}
 }
+
+// F-22, appliance side. machine-convert.sh MOUNTS the replication volume and
+// rewrites it heavily — chroot, GRUB, fstab, stripping the source's agent —
+// and then this handler streams that same device to the destination with a
+// plain buffered read.
+//
+// Reads of a block device come from the kernel's page cache for that device,
+// which can hold pages predating the convert's writes. Streaming those would
+// ship a boot image missing the very changes that make it bootable, and the
+// copy would report success. The agent-side read path had exactly this defect
+// (F-22: a file arrived with its final chunk stale, and the stale hash was
+// then recorded so no later pass ever corrected it).
+//
+// So the handler must invalidate the device's cached pages before streaming.
+func TestCutoverImageStreamInvalidatesPageCacheFirst(t *testing.T) {
+	src, err := os.ReadFile("cutover_stream.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	i := strings.Index(s, "func (s *Server) handleCutoverImage")
+	if i < 0 {
+		t.Fatal("handleCutoverImage not found")
+	}
+	body := s[i:]
+	if end := strings.Index(body, "\nfunc "); end > 0 {
+		body = body[:end]
+	}
+	if !strings.Contains(body, "InvalidatePageCache") {
+		t.Error("handleCutoverImage streams the replication volume with a buffered read but never drops the device's cached pages — a stale page here ships a boot image missing the convert's changes")
+	}
+	// It must not be fatal: a device that refuses the ioctl (or a plain file
+	// image in the fallback path) must still stream rather than fail cutover.
+	if strings.Contains(body, "InvalidatePageCache") &&
+		strings.Contains(body, "writeErr(w, http.StatusInternalServerError, \"cannot invalidate") {
+		t.Error("a failed cache invalidation must be logged and streamed anyway, not turned into a cutover failure")
+	}
+}
