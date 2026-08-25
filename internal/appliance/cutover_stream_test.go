@@ -1,9 +1,12 @@
 package appliance
 
 import (
+	"bytes"
+	"fmt"
 	"io"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -74,22 +77,158 @@ func TestRescueCopyScriptAndCmd(t *testing.T) {
 	script := s.rescueCopyScript("tok123", 5<<30)
 	for _, want := range []string{
 		"/cutover/image?token=tok123", // streams the image from the appliance
-		"dd of=/dev/sda",              // onto the rescue'd instance's local disk
+		"dd of=$TARGET",               // onto the disk select_target_disk chose
 		"status=progress",             // live progress in the Lish session
 		"conv=fsync",
-		"resize2fs",  // grow the (whole-disk ext) root to fill the local disk
-		"poweroff",   // the "copy done" signal the appliance waits for
-		"/dev/sda ]", // sanity check the target disk exists before writing
+		"resize2fs",                   // grow the (whole-disk ext) root to fill the local disk
+		"poweroff",                    // the "copy done" signal the appliance waits for
+		"select_target_disk",          // F-23: identify the disk by properties, not by name
+		"TARGET=$(select_target_disk", // capture its choice before streaming
+		"|| exit 1",                   // an ambiguous/no-match selection must abort, not guess
 		"sha256//PINPINPIN",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("copy script should contain %q; script:\n%s", want, script)
 		}
 	}
+	// F-23: the fixed migration must never hardcode a device node — the whole
+	// point is that Finnix does not reliably put the local disk at /dev/sda.
+	if strings.Contains(script, "of=/dev/sda") {
+		t.Error("copy script must not hardcode dd of=/dev/sda (F-23: Finnix does not reliably enumerate the local disk there)")
+	}
 	// dd must be fed by the download — never run against an empty stdin.
-	if !strings.Contains(script, "| dd of=/dev/sda") {
+	if !strings.Contains(script, "| dd of=$TARGET") {
 		t.Error("the image download must pipe straight into dd")
 	}
+}
+
+// TestSelectTargetDisk exercises the select_target_disk shell function
+// (embedded verbatim in the rescue copy script as selectTargetDiskFunc)
+// standalone, against a fake `lsblk`, covering the F-23 selection rules:
+// whole disk, writable, size within tolerance of the expected byte count —
+// and that ambiguous or empty results fail loudly instead of guessing.
+func TestSelectTargetDisk(t *testing.T) {
+	const expect = 26843545600 // bytes; arbitrary "the image is this big"
+	const tol = 2097152        // 2 MiB, matching rescueCopyScript's tolerance
+
+	tests := []struct {
+		name       string
+		lsblk      string // fake `lsblk -bdno NAME,SIZE,RO` output
+		expect     int64
+		tol        int64
+		wantStdout string // exact stdout on success ("" when a failure is expected)
+		wantErr    bool
+		wantStderr []string // substrings that must appear in stderr on failure
+	}{
+		{
+			name: "single writable whole disk of the right size wins",
+			lsblk: "sda 0 1\n" + // unused rescue slot: zero-byte, read-only
+				"sdb 0 1\n" + // another unused slot
+				fmt.Sprintf("sdc %d 0\n", expect) + // the actual target
+				"sr0 0 1\n" + // optical drive
+				"zram0 4294967296 0", // zram: writable, but excluded by name
+			expect: expect, tol: tol,
+			wantStdout: "/dev/sdc",
+		},
+		{
+			name:   "within-tolerance rounding still matches",
+			lsblk:  fmt.Sprintf("sdg %d 0", expect+1048576), // 1 MiB over, still <= 2 MiB tolerance
+			expect: expect, tol: tol,
+			wantStdout: "/dev/sdg",
+		},
+		{
+			name:   "outside tolerance is not a match",
+			lsblk:  fmt.Sprintf("sdg %d 0", expect+3145728), // 3 MiB over > 2 MiB tolerance
+			expect: expect, tol: tol,
+			wantErr:    true,
+			wantStderr: []string{"found 0", "/dev/sdg"},
+		},
+		{
+			name: "read-only devices are excluded, so no match",
+			lsblk: fmt.Sprintf("sda %d 1\n", expect) + // right size, but RO — the exact F-23 symptom
+				fmt.Sprintf("sdg %d 1", expect),
+			expect: expect, tol: tol,
+			wantErr:    true,
+			wantStderr: []string{"found 0", "/dev/sda", "/dev/sdg", "ro=1"},
+		},
+		{
+			name: "two writable disks of the right size is ambiguous",
+			lsblk: fmt.Sprintf("sdb %d 0\n", expect) +
+				fmt.Sprintf("sdc %d 0", expect),
+			expect: expect, tol: tol,
+			wantErr:    true,
+			wantStderr: []string{"found 2", "/dev/sdb", "/dev/sdc"},
+		},
+		{
+			name:   "no disks at all",
+			lsblk:  "",
+			expect: expect, tol: tol,
+			wantErr:    true,
+			wantStderr: []string{"found 0"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, err := runSelectTargetDisk(t, tc.lsblk, tc.expect, tc.tol)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want a failure, got success with stdout %q", stdout)
+				}
+				for _, want := range tc.wantStderr {
+					if !strings.Contains(stderr, want) {
+						t.Errorf("stderr should contain %q; stderr:\n%s", want, stderr)
+					}
+				}
+				if stdout != "" {
+					t.Errorf("stdout on failure = %q, want empty (must never guess)", stdout)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("select_target_disk failed: %v; stderr:\n%s", err, stderr)
+			}
+			if stdout != tc.wantStdout {
+				t.Errorf("stdout = %q, want %q", stdout, tc.wantStdout)
+			}
+		})
+	}
+}
+
+// runSelectTargetDisk runs the real select_target_disk shell function (lifted
+// verbatim from selectTargetDiskFunc, the exact text embedded in the rescue
+// copy script) under /bin/sh, backed by a fake `lsblk` that prints lsblkOut
+// regardless of arguments. It returns stdout, stderr, and the run error (nil
+// on exit 0).
+func runSelectTargetDisk(t *testing.T, lsblkOut string, expect, tol int64) (stdout, stderr string, err error) {
+	t.Helper()
+	dir := t.TempDir()
+
+	// Fake lsblk: select_target_disk always invokes it as
+	// "lsblk -bdno NAME,SIZE,RO" and reads its stdout; the fake ignores the
+	// arguments and just prints the canned listing for this case.
+	fakeLsblk := "#!/bin/sh\ncat <<'LSBLK_EOF'\n" + lsblkOut + "\nLSBLK_EOF\n"
+	if werr := os.WriteFile(filepath.Join(dir, "lsblk"), []byte(fakeLsblk), 0o755); werr != nil {
+		t.Fatalf("write fake lsblk: %v", werr)
+	}
+
+	// Driver script: the function under test plus one call to it with the
+	// arguments under test — this is exactly what rescueCopyScript's
+	// "TARGET=$(select_target_disk %d %d)" does.
+	driver := "#!/bin/sh\nset -e\n" + selectTargetDiskFunc +
+		fmt.Sprintf("\nselect_target_disk %d %d\n", expect, tol)
+	driverPath := filepath.Join(dir, "select.sh")
+	if werr := os.WriteFile(driverPath, []byte(driver), 0o755); werr != nil {
+		t.Fatalf("write driver script: %v", werr)
+	}
+
+	cmd := exec.Command("sh", driverPath)
+	cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"))
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err = cmd.Run()
+	return strings.TrimRight(outBuf.String(), "\n"), errBuf.String(), err
 }
 
 func TestCutoverHandlers(t *testing.T) {
@@ -127,7 +266,7 @@ func TestCutoverHandlers(t *testing.T) {
 	// Script: good token → the copy script; bad token → 403.
 	rr = httptest.NewRecorder()
 	s.handleCutoverScript(rr, httptest.NewRequest("GET", "/cutover/copy.sh?token="+tok, nil))
-	if rr.Code != 200 || !strings.Contains(rr.Body.String(), "dd of=/dev/sda") {
+	if rr.Code != 200 || !strings.Contains(rr.Body.String(), "dd of=$TARGET") {
 		t.Fatalf("script: status %d, body should be the copy script", rr.Code)
 	}
 	rr = httptest.NewRecorder()
