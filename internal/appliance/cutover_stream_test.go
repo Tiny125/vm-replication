@@ -107,15 +107,48 @@ func TestRescueCopyScriptAndCmd(t *testing.T) {
 // standalone, against a fake `lsblk`, covering the F-23 selection rules:
 // whole disk, writable, size within tolerance of the expected byte count —
 // and that ambiguous or empty results fail loudly instead of guessing.
+// The destination's local disk is created at the PLAN's size, while the image
+// streamed onto it is the SOURCE disk's size. Those are deliberately different
+// — a 24.5 GiB source image is written onto a 25 GiB nanode disk — so the disk
+// is normally LARGER than the image and a near-equality match rejects it.
+//
+// Measured live: the selector found zero candidates and refused to proceed,
+// listing "/dev/sda size=26826768384 ro=0" against an expected 26289897472 —
+// a 512 MiB gap, far outside any sane tolerance. The correct rule is that the
+// disk must be big enough to HOLD the image, not the same size as it.
+func TestSelectTargetDiskAcceptsADiskLargerThanTheImage(t *testing.T) {
+	// Exactly the live case that failed.
+	const image = 26289897472 // 24.5 GiB source image
+	out, stderr, err := runSelectTargetDisk(t,
+		"loop0 511930368 1\nsda 26826768384 0\nsdb 0 1\nsdc 0 1\nsr0 660602880 0\nzram0 507510784 0\n",
+		image)
+	if err != nil {
+		t.Fatalf("a 25 GiB writable disk must be accepted for a 24.5 GiB image; got error. stderr:\n%s", stderr)
+	}
+	if got := strings.TrimSpace(out); got != "/dev/sda" {
+		t.Errorf("selected %q, want /dev/sda", got)
+	}
+}
+
+// A disk SMALLER than the image can never hold it, so it must never be chosen.
+func TestSelectTargetDiskRejectsADiskTooSmall(t *testing.T) {
+	const image = 26289897472
+	_, stderr, err := runSelectTargetDisk(t, "sda 10737418240 0\n", image)
+	if err == nil {
+		t.Error("a disk smaller than the image must be rejected, not written to")
+	}
+	if !strings.Contains(stderr, "26289897472") {
+		t.Errorf("the failure must state the size it needed; got:\n%s", stderr)
+	}
+}
+
 func TestSelectTargetDisk(t *testing.T) {
 	const expect = 26843545600 // bytes; arbitrary "the image is this big"
-	const tol = 2097152        // 2 MiB, matching rescueCopyScript's tolerance
 
 	tests := []struct {
 		name       string
 		lsblk      string // fake `lsblk -bdno NAME,SIZE,RO` output
 		expect     int64
-		tol        int64
 		wantStdout string // exact stdout on success ("" when a failure is expected)
 		wantErr    bool
 		wantStderr []string // substrings that must appear in stderr on failure
@@ -127,19 +160,20 @@ func TestSelectTargetDisk(t *testing.T) {
 				fmt.Sprintf("sdc %d 0\n", expect) + // the actual target
 				"sr0 0 1\n" + // optical drive
 				"zram0 4294967296 0", // zram: writable, but excluded by name
-			expect: expect, tol: tol,
+			expect:     expect,
 			wantStdout: "/dev/sdc",
 		},
 		{
-			name:   "within-tolerance rounding still matches",
-			lsblk:  fmt.Sprintf("sdg %d 0", expect+1048576), // 1 MiB over, still <= 2 MiB tolerance
-			expect: expect, tol: tol,
+			// The normal shape: the plan's disk is bigger than the source image.
+			name:       "a disk comfortably larger than the image matches",
+			lsblk:      fmt.Sprintf("sdg %d 0", expect+536870912), // 512 MiB larger
+			expect:     expect,
 			wantStdout: "/dev/sdg",
 		},
 		{
-			name:   "outside tolerance is not a match",
-			lsblk:  fmt.Sprintf("sdg %d 0", expect+3145728), // 3 MiB over > 2 MiB tolerance
-			expect: expect, tol: tol,
+			name:       "a disk too small to hold the image is rejected",
+			lsblk:      fmt.Sprintf("sdg %d 0", expect-1), // one byte short
+			expect:     expect,
 			wantErr:    true,
 			wantStderr: []string{"found 0", "/dev/sdg"},
 		},
@@ -147,7 +181,7 @@ func TestSelectTargetDisk(t *testing.T) {
 			name: "read-only devices are excluded, so no match",
 			lsblk: fmt.Sprintf("sda %d 1\n", expect) + // right size, but RO — the exact F-23 symptom
 				fmt.Sprintf("sdg %d 1", expect),
-			expect: expect, tol: tol,
+			expect:     expect,
 			wantErr:    true,
 			wantStderr: []string{"found 0", "/dev/sda", "/dev/sdg", "ro=1"},
 		},
@@ -155,14 +189,14 @@ func TestSelectTargetDisk(t *testing.T) {
 			name: "two writable disks of the right size is ambiguous",
 			lsblk: fmt.Sprintf("sdb %d 0\n", expect) +
 				fmt.Sprintf("sdc %d 0", expect),
-			expect: expect, tol: tol,
+			expect:     expect,
 			wantErr:    true,
 			wantStderr: []string{"found 2", "/dev/sdb", "/dev/sdc"},
 		},
 		{
-			name:   "no disks at all",
-			lsblk:  "",
-			expect: expect, tol: tol,
+			name:       "no disks at all",
+			lsblk:      "",
+			expect:     expect,
 			wantErr:    true,
 			wantStderr: []string{"found 0"},
 		},
@@ -170,7 +204,7 @@ func TestSelectTargetDisk(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			stdout, stderr, err := runSelectTargetDisk(t, tc.lsblk, tc.expect, tc.tol)
+			stdout, stderr, err := runSelectTargetDisk(t, tc.lsblk, tc.expect)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("want a failure, got success with stdout %q", stdout)
@@ -200,7 +234,7 @@ func TestSelectTargetDisk(t *testing.T) {
 // copy script) under /bin/sh, backed by a fake `lsblk` that prints lsblkOut
 // regardless of arguments. It returns stdout, stderr, and the run error (nil
 // on exit 0).
-func runSelectTargetDisk(t *testing.T, lsblkOut string, expect, tol int64) (stdout, stderr string, err error) {
+func runSelectTargetDisk(t *testing.T, lsblkOut string, expect int64) (stdout, stderr string, err error) {
 	t.Helper()
 	dir := t.TempDir()
 
@@ -213,10 +247,10 @@ func runSelectTargetDisk(t *testing.T, lsblkOut string, expect, tol int64) (stdo
 	}
 
 	// Driver script: the function under test plus one call to it with the
-	// arguments under test — this is exactly what rescueCopyScript's
-	// "TARGET=$(select_target_disk %d %d)" does.
+	// argument under test — this is exactly what rescueCopyScript's
+	// "TARGET=$(select_target_disk %d)" does.
 	driver := "#!/bin/sh\nset -e\n" + selectTargetDiskFunc +
-		fmt.Sprintf("\nselect_target_disk %d %d\n", expect, tol)
+		fmt.Sprintf("\nselect_target_disk %d\n", expect)
 	driverPath := filepath.Join(dir, "select.sh")
 	if werr := os.WriteFile(driverPath, []byte(driver), 0o755); werr != nil {
 		t.Fatalf("write driver script: %v", werr)
