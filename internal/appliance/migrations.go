@@ -1916,11 +1916,60 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		s.fail(m.ID, "create boot config: "+err.Error())
 		return
 	}
-	if err := retryBusy(ctx, func() error { return cl.Boot(ctx, inst.ID, bootCfg) }); err != nil {
+	// The config above is what ATTACHES the data volumes, and that attach is
+	// asynchronous — booting immediately races it and Linode rejects the boot
+	// (F-25). Wait for every volume to report itself attached to this instance
+	// first. Best-effort: if the wait times out we still try to boot, because a
+	// slow attach is a worse reason to abandon a completed copy than a boot
+	// that might yet succeed.
+	if len(dataClones) > 0 {
+		waitCtx, cancelWait := context.WithTimeout(ctx, volumeAttachWait)
+		for {
+			if volumesAttachedTo(dataClones, inst.ID, func(id int64) (int64, error) {
+				v, verr := cl.GetVolume(ctx, id)
+				if verr != nil {
+					return 0, verr
+				}
+				return v.LinodeID, nil
+			}) {
+				break
+			}
+			select {
+			case <-waitCtx.Done():
+				log.Printf("appliance: migration %d: data volumes did not report attached within %s; booting anyway", m.ID, volumeAttachWait)
+			case <-time.After(3 * time.Second):
+				continue
+			}
+			break
+		}
+		cancelWait()
+	}
+
+	// Retry an immediate boot failure. retryBusy does not cover this: Linode
+	// reports it asynchronously as a failed boot event, not as a busy error.
+	var bootErr error
+	for attempt := 1; attempt <= bootAttachRetries; attempt++ {
+		bootErr = retryBusy(ctx, func() error { return cl.Boot(ctx, inst.ID, bootCfg) })
+		if bootErr == nil {
+			break
+		}
 		if canceled() {
 			return
 		}
-		s.fail(m.ID, "boot from local disk: "+err.Error())
+		log.Printf("appliance: migration %d: boot attempt %d/%d failed: %v", m.ID, attempt, bootAttachRetries, bootErr)
+		if attempt < bootAttachRetries {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(bootAttachDelay):
+			}
+		}
+	}
+	if bootErr != nil {
+		if canceled() {
+			return
+		}
+		s.fail(m.ID, "boot from local disk: "+bootErr.Error())
 		return
 	}
 	if err := cl.WaitInstanceStatus(ctx, inst.ID, "running", 10*time.Minute); err != nil {
