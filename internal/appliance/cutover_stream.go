@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/tiny125/vm-replication/internal/blockdiff"
 )
 
 // Disk-boot cutover, image streaming ("Variant B").
@@ -94,28 +96,102 @@ func (s *Server) cutoverCopyCmd(token string) string {
 		s.curlPinFlag(), s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort, token)
 }
 
+// selectTargetDiskFunc is the POSIX-sh disk-selection logic used by the
+// rescue copy script below. F-23: Finnix does not reliably enumerate the
+// destination's local disk as /dev/sda — on the same migration, consecutive
+// rescue boots put it at /dev/sdb and then /dev/sdg, with the unused slots
+// showing up as zero-byte, read-only devices ahead of it. Hardcoding any node
+// name is therefore not a fix; instead we identify the disk by its
+// properties: it must be a whole disk that is writable and whose size is
+// close to the image the appliance is about to stream (the appliance already
+// knows that byte count exactly).
+//
+// Defined as its own shell function with no fmt.Sprintf placeholders inside
+// it (the numeric arguments are passed in as positional parameters at call
+// time), so cutover_stream_test.go can lift this exact text out, drop it into
+// a standalone script alongside a fake `lsblk`, and exercise the selection
+// logic directly — without having to string-match the assembled script or
+// stand up a real rescue environment.
+const selectTargetDiskFunc = `
+# select_target_disk EXPECT_BYTES TOLERANCE_BYTES
+#
+# Finds the one local disk to write the migrated image onto, using
+# "lsblk -bdno NAME,SIZE,RO" (byte-exact sizes, no header row; -d already
+# restricts the listing to whole disks, never partitions).
+#
+# A candidate must be:
+#   - not sr*/zram*/loop* (optical/zram/loop devices lsblk -d can still list)
+#   - writable (RO == 0)
+#   - within TOLERANCE_BYTES of EXPECT_BYTES (Linode disk sizes are rounded to
+#     a whole MB, so an exact byte match is not expected)
+#
+# On exactly one candidate: prints "/dev/NAME" on stdout and returns 0.
+# On zero or more than one candidate: prints nothing on stdout, prints every
+# disk seen (name, size, ro) plus what was being looked for on stderr, and
+# returns 1. It never guesses.
+select_target_disk() {
+  expect=$1
+  tol=$2
+  selected=""
+  count=0
+  seen=""
+  while read -r name size ro; do
+    [ -n "$name" ] || continue
+    seen="$seen
+  /dev/$name size=$size ro=$ro"
+    case "$name" in
+      sr*|zram*|loop*) continue ;;
+    esac
+    [ "$ro" = "0" ] || continue
+    diff=$((size - expect))
+    [ "$diff" -ge 0 ] || diff=$((0 - diff))
+    [ "$diff" -le "$tol" ] || continue
+    selected="/dev/$name"
+    count=$((count + 1))
+  done <<EOF
+$(lsblk -bdno NAME,SIZE,RO)
+EOF
+  if [ "$count" -ne 1 ]; then
+    echo "vmrepl-cutover: could not identify the target disk - looking for exactly one writable whole disk within ${tol} bytes of ${expect} bytes, found ${count}. Disks seen:${seen}" >&2
+    return 1
+  fi
+  echo "$selected"
+  return 0
+}
+`
+
 // rescueCopyScript is the script that command downloads and runs inside the
 // Finnix rescue environment. It must stay /bin/sh-compatible.
 func (s *Server) rescueCopyScript(token string, bytes int64) string {
 	imageURL := fmt.Sprintf("%s://%s:%d/cutover/image?token=%s", s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort, token)
+	// TOLERANCE_BYTES: Linode disk sizes are rounded to a whole MB, so a
+	// freshly created disk can legitimately land up to just under 1 MiB away
+	// from the image byte count; 2 MiB gives that a little headroom without
+	// being loose enough to risk matching the wrong disk.
 	return fmt.Sprintf(`#!/bin/sh
 # vm-replication disk-boot cutover: stream the migrated image onto this
-# instance's local disk (/dev/sda), grow the root, and power off. Run this in
-# the RESCUE MODE Lish console of the cutover instance — nowhere else.
+# instance's local disk, grow the root, and power off. Run this in the RESCUE
+# MODE Lish console of the cutover instance — nowhere else.
+#
+# The local disk is NOT assumed to be /dev/sda: Finnix does not reliably
+# enumerate it there (see F-23), so it is identified below by its properties
+# (writable whole disk, size matching the image) instead of by name.
 set -e
-[ -b /dev/sda ] || { echo "vmrepl-cutover: /dev/sda not found - run this inside the RESCUE MODE cutover instance"; exit 1; }
-echo "vmrepl-cutover: streaming %s onto /dev/sda from the appliance (live progress below)..."
-curl -fsSN %s'%s' | dd of=/dev/sda bs=4M conv=fsync status=progress
+%s
+TARGET=$(select_target_disk %d 2097152) || exit 1
+echo "vmrepl-cutover: selected $TARGET as the target disk (writable whole disk, size within tolerance of the %s image)"
+echo "vmrepl-cutover: streaming %s onto $TARGET from the appliance (live progress below)..."
+curl -fsSN %s'%s' | dd of=$TARGET bs=4M conv=fsync status=progress
 sync
 # Grow a whole-disk ext root to fill the local disk (offline; no-op otherwise).
 if command -v resize2fs >/dev/null 2>&1; then
-  e2fsck -fy /dev/sda >/dev/null 2>&1 || true
-  resize2fs /dev/sda >/dev/null 2>&1 || true
+  e2fsck -fy $TARGET >/dev/null 2>&1 || true
+  resize2fs $TARGET >/dev/null 2>&1 || true
 fi
 echo "vmrepl-cutover: copy complete - powering off; the appliance now boots this instance from its local disk"
 sleep 2
 poweroff
-`, humanBytes(bytes), s.curlPinFlag(), imageURL)
+`, selectTargetDiskFunc, bytes, humanBytes(bytes), humanBytes(bytes), s.curlPinFlag(), imageURL)
 }
 
 // handleCutoverScript serves the rescue copy script (GET /cutover/copy.sh,
@@ -148,6 +224,15 @@ func (s *Server) handleCutoverImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
+	// Drop the kernel's cached pages for this device before reading a byte.
+	// machine-convert.sh mounted this same volume and rewrote it (chroot, GRUB,
+	// fstab, agent removal); a page cached from before those writes would be
+	// streamed to the destination in their place, producing a boot image that
+	// silently lacks the conversion. Non-fatal by design — a stale read is a
+	// risk, refusing to stream is a certain failure.
+	if ierr := blockdiff.InvalidatePageCache(f); ierr != nil {
+		log.Printf("appliance: cutover image stream for migration %d: could not drop cached pages for %s (%v) — the streamed image may be stale", st.migID, st.path, ierr)
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", st.bytes))
 	if _, err := io.CopyN(w, f, st.bytes); err != nil {

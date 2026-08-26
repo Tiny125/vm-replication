@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"os"
 )
 
@@ -27,9 +28,36 @@ type Device struct {
 	Size int64
 }
 
+// invalidatePageCacheFn is invalidatePageCache, indirected through a package
+// variable so tests can inject a forced failure and assert that
+// OpenDeviceRead treats it as non-fatal (real page-cache staleness can't be
+// exercised without root and a live block device — see invalidate_test.go).
+var invalidatePageCacheFn = invalidatePageCache
+
 // OpenDeviceRead opens path read-only and determines its size. Works for both
 // regular files and block devices (lseek(SEEK_END) returns the size of a block
 // device on Linux).
+//
+// Every replication pass calls this (cmd/agent's replicate() reopens the
+// source on each invocation — see run()/replicate() in cmd/agent/main.go), so
+// invalidating the page cache here, right after open and before any reads,
+// covers every pass; there is no separate longer-lived handle that would need
+// its own periodic invalidation.
+// InvalidatePageCache drops the kernel's cached pages for an already-open
+// block device, so subsequent reads come from the disk rather than from
+// possibly-stale cache.
+//
+// Exported for callers outside this package that stream a block device the
+// appliance has just written through a MOUNTED filesystem — notably the
+// cutover image stream, which sends a replication volume immediately after
+// machine-convert.sh has mounted and rewritten it. A stale page there ships a
+// boot image missing the conversion's changes.
+//
+// Returns an error only when the cache could not be dropped at all. Callers
+// should log and continue rather than abort: a stale read is a risk, but
+// refusing to proceed is a certainty.
+func InvalidatePageCache(f *os.File) error { return invalidatePageCacheFn(f) }
+
 func OpenDeviceRead(path string) (*Device, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY, 0)
 	if err != nil {
@@ -39,6 +67,19 @@ func OpenDeviceRead(path string) (*Device, error) {
 	if err != nil {
 		f.Close()
 		return nil, err
+	}
+	// Drop any pages the kernel has cached for this device before this pass
+	// reads a single byte. A raw block-device fd and the mounted filesystem on
+	// top of the same disk cache independently, so without this a read here
+	// can return a stale page for a region the mount has already overwritten
+	// on disk (F-22). Worse, that stale read is self-reinforcing: the agent
+	// hashes what it read, checkpoints that hash, and on every later pass
+	// reads the same stale cached page, gets the same hash, and never
+	// resends — the corruption is silent and permanent. Best-effort: a
+	// failure to invalidate must not abort the migration, but we log loudly
+	// because it means this pass's reads may be stale.
+	if err := invalidatePageCacheFn(f); err != nil {
+		log.Printf("blockdiff: warning: could not invalidate the page cache for %s before reading (%v) — this pass's reads may return STALE cached data instead of the current on-disk contents", path, err)
 	}
 	return &Device{File: f, Size: size}, nil
 }
