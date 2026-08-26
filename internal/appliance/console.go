@@ -180,6 +180,7 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
  details>summary::before{content:"›";display:inline-block;margin-right:6px;transition:transform .15s}
  details[open]>summary::before{transform:rotate(90deg)}
  details>div{margin-top:10px}
+ .methodfixed{padding:9px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface2)}
  .banner{border:1px solid var(--border);background:var(--surface2);border-radius:12px;padding:12px 14px;margin:10px 0;font-size:13.5px;color:var(--text)}
  .banner.ok{border-color:var(--green-line);background:var(--green-bg);color:var(--green-fg)}
  .banner.warn{border-color:var(--amber-line);background:var(--amber-bg);color:var(--amber-fg)}
@@ -362,25 +363,25 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
       <input id="m_ip" placeholder="e.g. 172.236.148.63">
       <label style="margin-top:14px">Migration method</label>
       <div class="row">
-        <!-- Local-disk boot is the ONLY migration method this console offers
-             (product decision: Linode's own Backups service, Images, and
-             cross-datacentre migration don't work with Block Storage volumes,
-             so a volume-boot machine sits outside Linode's lifecycle tooling
-             for its whole life — see CONSOLE.md). The volume-boot code path
-             (api.BootTargetVolume) is fully retained: the HTTP API still
-             accepts it and a pre-existing volume-boot migration still renders
-             normally below (see migCard) — it just isn't offered here.
-             m_method stays a real <select> (one real <option>, disabled)
-             rather than plain text or a hidden input, so method()/createMig
-             need no change and re-enabling volume boot later is a one-line
-             HTML diff: drop the disabled attribute, add back the volume
-             option. It's disabled rather than left enabled with one choice
-             so it doesn't invite a click that does nothing. -->
-        <div style="display:flex;align-items:center;gap:2px">
-          <select id="m_method" disabled style="flex:1">
-            <option value="disk" selected>Local disk (NVMe boot)</option>
-          </select>
-          <span class="info" data-tip="This console currently offers local-disk boot only. Block Storage volume boot still works underneath (the API accepts it and existing volume-boot migrations keep working) but is not offered here, because it sits outside Linode's own Backups/Images/cross-datacentre tooling.">i</span>
+        <!-- One method, so this states it rather than offering a choice. A
+             single-option <select> (even disabled) reads as a control the
+             operator might be able to change, and a lone greyed-out entry
+             looks like something is unavailable to them.
+
+             The volume-boot code path (api.BootTargetVolume) is fully
+             retained — the HTTP API still accepts it and a pre-existing
+             volume-boot migration still renders normally in migCard — it is
+             simply not offered here. To re-enable it in the console, restore a
+             method picker with both options in place of this block and make
+             method() read its value again instead of returning a constant. -->
+        <div class="methodfixed">
+          <b>Local disk (NVMe boot)</b>
+          <div class="muted" style="font-size:12.5px;margin-top:2px">
+            The boot disk is written to the new Linode&rsquo;s own local NVMe
+            disk, which comes with the plan at no extra cost. Any further disks
+            are copied to Block Storage volumes and attached to the same
+            instance.
+          </div>
         </div>
         <div><select id="m_planclass" onchange="reloadPlanOptions()">
           <option value="shared">Shared CPU</option>
@@ -711,7 +712,7 @@ function diskSizeChanged(){reloadPlanOptions();}
 // (rather than being a hardcoded literal) so the 'volume' branches below stay
 // live dead code: re-enabling volume boot later only needs the <select> to
 // gain the option back (see the comment above it), not a JS change here.
-function method(){return $('m_method')?$('m_method').value:'disk';}
+function method(){return 'disk';}
 // sizeGBForPlan returns the GB the plan's LOCAL DISK must fit: the boot disk
 // alone (local-disk boot — the data disks become volumes), or the summed disk
 // sizes (volume boot, where nothing uses the plan's disk). The volume branch
@@ -797,7 +798,7 @@ async function createMig(btn){
   try{
     await api('POST','/api/v1/migrations',{name:name,source_hostname:host,source_ip:ip,devices:devices,boot_target:mth,plan_class:planClass,linode_type:planType});
     $('m_name').value=$('m_host').value=$('m_ip').value='';
-    $('disks').innerHTML='';diskSeq=0;addDisk();$('m_method').value='disk';methodChanged();
+    $('disks').innerHTML='';diskSeq=0;addDisk();methodChanged();
     await refresh(true);
     const last=$('migs').lastElementChild;if(last)last.scrollIntoView({behavior:'smooth',block:'center'});
     toast('Migration "'+name+'" created — enroll the source agent to start replicating','ok');

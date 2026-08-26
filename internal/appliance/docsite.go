@@ -317,7 +317,7 @@ sudo scripts/install-replication-server.sh</pre><button class="copy" onclick="cp
 <li>Run the shown one-line command on the <b>source server</b> as root (it is valid for 30 minutes). The command only <b>reads</b> system facts — OS, CPU architecture, disk layout, filesystems, SELinux, and live network reachability of the replication port — sends one report back, and exits. <b>Nothing is installed</b>, so there is nothing to remove afterwards.</li>
 <li>The tab updates by itself when the report arrives:</li>
 </ol>
-<figure><img src="/documentation/img/source-check.png" alt="A completed source check"><figcaption>A completed check: source facts and a verdict per migration method (Supported / Supported with cautions / Not supported) with the reasons.</figcaption></figure>
+
 <div class="adm tip"><span class="t">Tip</span>Run this on every server you plan to migrate, before anything else. A "Not supported" verdict (for example a LUKS-encrypted root) tells you up front that the server needs remediation before it can migrate — instead of finding out at cutover.</div>
 <div class="adm"><span class="t">Note</span>The full result is also printed <b>in the source server's own terminal</b>. If the source cannot reach the replication server, the terminal result still appears in full, with a note that the network to the migration instance is not accessible — fix the ports (console port + TCP 5000–5100), then re-run so the console receives it too.</div>
 </section>

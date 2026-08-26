@@ -1,9 +1,11 @@
 package appliance
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tiny125/vm-replication/internal/api"
 )
@@ -108,4 +110,50 @@ func fstabWarning(m fstabMarker) string {
 	return fmt.Sprintf(
 		"%d fstab %s could not be matched to any migrated disk: %s. They have been marked nofail so the migrated machine still boots, but those paths will NOT be mounted — check the disk list before you power the source off.",
 		m.Adjusted, noun, strings.Join(m.Mounts, ", "))
+}
+
+// --- F-25: don't race the volume attach when booting -----------------------
+//
+// Naming a volume in a config profile is what ATTACHES it (see
+// diskBootDeviceMap), and that attach is asynchronous. Issuing Boot as the very
+// next call after CreateConfig races it: measured on 2026-08-26, Linode logged
+// linode_boot "failed" ONE SECOND after linode_config_create, the appliance
+// then waited out its 10-minute status poll, and the cutover failed. Booting
+// the identical config by hand immediately afterwards worked first time, so
+// nothing was wrong but the timing.
+//
+// This costs more than a normal transient failure: it lands AFTER the operator
+// has pasted the rescue copy command and waited out the stream, and retrying
+// the cutover deletes the instance and its local disk — throwing the whole copy
+// away. So we both wait for the attach (the cause) and retry the boot (the
+// safety net).
+const (
+	// bootAttachRetries bounds re-issuing an immediate boot failure. More than
+	// one because a single attempt is exactly the bug; small because a config
+	// that is genuinely wrong should fail promptly rather than grind.
+	bootAttachRetries = 4
+	// bootAttachDelay separates the attempts. Seconds, not minutes: the attach
+	// completes quickly, and the 10-minute status wait afterwards is already
+	// spent doing nothing.
+	bootAttachDelay = 5 * time.Second
+	// volumeAttachWait bounds how long we wait for the config to finish
+	// attaching every data volume before the first boot attempt.
+	volumeAttachWait = 2 * time.Minute
+)
+
+// errVolumeLookup marks a volume whose state could not be read.
+var errVolumeLookup = errors.New("volume lookup failed")
+
+// volumesAttachedTo reports whether every volume is attached to instanceID.
+// linodeIDOf returns the instance a volume currently reports itself attached
+// to. A lookup error counts as NOT attached — treating it as ready would put us
+// straight back into the race this exists to prevent.
+func volumesAttachedTo(volumeIDs []int64, instanceID int64, linodeIDOf func(int64) (int64, error)) bool {
+	for _, id := range volumeIDs {
+		lid, err := linodeIDOf(id)
+		if err != nil || lid != instanceID {
+			return false
+		}
+	}
+	return true
 }

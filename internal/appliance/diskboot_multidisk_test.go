@@ -3,6 +3,7 @@ package appliance
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tiny125/vm-replication/internal/api"
 )
@@ -188,5 +189,73 @@ func TestConsoleDiskBootHelpMentionsDataVolumes(t *testing.T) {
 	js := extractJSFunc(t, "function methodChanged(")
 	if !strings.Contains(js, "boot") || !strings.Contains(js, "Block Storage") {
 		t.Errorf("the local-disk help must explain that extra disks become Block Storage volumes; got: %s", js)
+	}
+}
+
+// F-25. Naming a volume in the config profile is what ATTACHES it, and the
+// attach is asynchronous. Issuing Boot immediately after CreateConfig races
+// that attach: Linode rejected the boot one second after the config was
+// created, the appliance then sat in its 10-minute wait, and the cutover
+// failed — after the operator had already pasted the copy command and waited
+// out an 8-minute stream. Booting the identical config by hand afterwards
+// worked first time, so the config was never the problem; only the timing was.
+//
+// bootAttachRetries bounds how many times an immediate boot failure is
+// re-issued before giving up. It must be more than one (that is the whole
+// point) and small enough that a genuinely broken config still fails promptly
+// rather than grinding through a long backoff.
+func TestBootAttachRetryBounds(t *testing.T) {
+	if bootAttachRetries < 2 {
+		t.Errorf("bootAttachRetries = %d; a single attempt is exactly the bug — an immediate boot failure must be retried", bootAttachRetries)
+	}
+	if bootAttachRetries > 8 {
+		t.Errorf("bootAttachRetries = %d; too many attempts turn a genuinely bad config into a long stall", bootAttachRetries)
+	}
+	if bootAttachDelay < time.Second {
+		t.Errorf("bootAttachDelay = %v; retrying instantly just loses the race again", bootAttachDelay)
+	}
+	if bootAttachDelay > 30*time.Second {
+		t.Errorf("bootAttachDelay = %v; the wait between attempts should be seconds, not minutes", bootAttachDelay)
+	}
+}
+
+// volumesAttachedTo reports whether every volume is attached to the instance,
+// which is the condition Boot actually needs. Waiting on this addresses the
+// cause; retrying Boot is only the safety net.
+func TestVolumesAttachedTo(t *testing.T) {
+	const inst = int64(4242)
+	cases := []struct {
+		name string
+		vols map[int64]int64 // volume id -> linode id it reports
+		want bool
+	}{
+		{"all attached", map[int64]int64{1: inst, 2: inst}, true},
+		{"one still detached", map[int64]int64{1: inst, 2: 0}, false},
+		{"attached to a different instance", map[int64]int64{1: inst, 2: 999}, false},
+		{"no volumes at all is trivially satisfied", map[int64]int64{}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ids := make([]int64, 0, len(tc.vols))
+			for id := range tc.vols {
+				ids = append(ids, id)
+			}
+			got := volumesAttachedTo(ids, inst, func(id int64) (int64, error) {
+				return tc.vols[id], nil
+			})
+			if got != tc.want {
+				t.Errorf("volumesAttachedTo = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A lookup error must not be read as "attached" — that would send us straight
+// back into the race the check exists to prevent.
+func TestVolumesAttachedToTreatsErrorAsNotReady(t *testing.T) {
+	if volumesAttachedTo([]int64{1}, 42, func(int64) (int64, error) {
+		return 0, errVolumeLookup
+	}) {
+		t.Error("a failed volume lookup must not count as attached")
 	}
 }
