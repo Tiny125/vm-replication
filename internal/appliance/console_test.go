@@ -128,40 +128,24 @@ func TestConsoleCutoverNamingFields(t *testing.T) {
 // re-enabled later purely by editing code. This test asserts the create-form
 // side of that: exactly one method, and it posts boot_target:'disk'.
 func TestConsoleOffersOnlyDiskBootMethod(t *testing.T) {
-	i := strings.Index(consoleHTML, `id="m_method"`)
-	if i < 0 {
-		t.Fatal("console must define the m_method element")
+	// One method, so the form states it rather than offering a picker. What
+	// matters is that no OTHER method is presented as selectable, and that the
+	// operator is told what this one does.
+	if strings.Contains(consoleHTML, `id="m_method"`) {
+		t.Error("the method picker should be gone — with a single method the form should state it, not offer a control")
 	}
-	end := strings.Index(consoleHTML[i:], "</select>")
-	if end < 0 {
-		t.Fatal("m_method must be a <select> (a real DOM element with a .value, even though it now offers no choice) so method()/createMig need no change to re-enable volume boot later")
+	if !strings.Contains(consoleHTML, "Local disk (NVMe boot)") {
+		t.Error("the create form must name the migration method it will use")
 	}
-	block := consoleHTML[i : i+end]
-	if n := strings.Count(block, "<option"); n != 1 {
-		t.Errorf("m_method must offer exactly one <option>, found %d — the console must offer only local-disk boot", n)
+	// No other boot target may be offered as a choice anywhere in the form.
+	if strings.Contains(consoleHTML, `<option value="volume"`) {
+		t.Error("volume boot must not appear as a selectable option")
 	}
-	if !strings.Contains(block, `value="disk"`) {
-		t.Error("the one offered method must be value=\"disk\" (local-disk boot)")
-	}
-	if !strings.Contains(block, "selected") {
-		t.Error("the single disk option must be selected")
-	}
-	if strings.Contains(block, `value="volume"`) {
-		t.Error("the create-form selector must not offer boot_target=\"volume\" any more — volume boot is no longer offered in the console")
-	}
-	// Disabled (or otherwise non-interactive) so a single-item dropdown doesn't
-	// invite a click that does nothing — see the comment above the element.
-	if !strings.Contains(block, "disabled") {
-		t.Error("with nothing to choose, m_method should be visually non-interactive (disabled), not a live one-item dropdown")
-	}
-	if !strings.Contains(consoleHTML, "boot_target:mth") {
-		t.Error("create must still post the chosen method as boot_target")
+	if strings.Contains(consoleHTML, `<option value="file"`) {
+		t.Error("file transfer must not appear as a selectable option")
 	}
 }
 
-// The removed file-transfer method (from an earlier change) must still leave
-// no trace in the create form — unrelated to this change, but worth guarding
-// in the same place since it touches the same form.
 func TestConsoleNoFileTransferTraces(t *testing.T) {
 	for _, gone := range []string{
 		`value="file"`, "m_osimage", "m_used", "os_image:",
@@ -174,13 +158,13 @@ func TestConsoleNoFileTransferTraces(t *testing.T) {
 	}
 }
 
-// Creating a migration from the console must always send boot_target:'disk' —
-// method() reads the (now fixed, single-option) m_method element, so this
-// checks the plumbing stays wired from element to request.
+// Creating a migration from the console must always send boot_target:'disk'.
+// With one method there is no element to read, so method() returns it directly
+// — this checks the plumbing stays wired from method() through to the request.
 func TestConsoleCreateSendsDiskBootTarget(t *testing.T) {
 	methodFn := extractJSFunc(t, "function method(){")
-	if !strings.Contains(methodFn, "$('m_method')") {
-		t.Error("method() should still read the m_method element, not a hardcoded literal — that's what makes re-enabling volume boot later a pure HTML change")
+	if !strings.Contains(methodFn, "'disk'") {
+		t.Error("method() must resolve to 'disk' so createMig posts the right boot target")
 	}
 	createFn := extractJSFunc(t, "async function createMig(")
 	if !strings.Contains(createFn, "boot_target:mth") {
@@ -369,5 +353,35 @@ func TestConsoleSourceCheckShowsOnlyOfferedMethods(t *testing.T) {
 	// say "can migrate" above a table showing no usable method.
 	if !strings.Contains(js, "const okAny=shown.some(") {
 		t.Error("the overall verdict must be computed from the shown methods, not all of them")
+	}
+}
+
+// There is one migration method, so the create form should state it, not offer
+// a choice. A disabled <select> still reads as a control the operator might be
+// able to change — it invites a click, and a dropdown with a single greyed-out
+// entry looks like something is broken or unavailable to them.
+func TestConsoleShowsMethodAsTextNotADropdown(t *testing.T) {
+	if strings.Contains(consoleHTML, `<select id="m_method"`) {
+		t.Error("the migration method must be presented as text, not a <select> — there is only one method to offer")
+	}
+	// The value still has to reach createMig, so method() must keep working
+	// without the element.
+	js := extractJSFunc(t, "function method(")
+	if !strings.Contains(js, "'disk'") {
+		t.Errorf("method() must still resolve to 'disk'; got: %s", js)
+	}
+	// And the operator should be told what the method actually does.
+	for _, want := range []string{"local", "NVMe"} {
+		if !strings.Contains(consoleHTML, want) {
+			t.Errorf("the method description should mention %q so the operator knows what they get", want)
+		}
+	}
+}
+
+// Nothing in the create form may reset or read a method element that no longer
+// exists — a stale $('m_method').value would throw and break the form reset.
+func TestConsoleNoDanglingMethodElementReferences(t *testing.T) {
+	if strings.Contains(consoleHTML, "$('m_method')") {
+		t.Error("console still references the removed #m_method element; the create-form reset would throw")
 	}
 }

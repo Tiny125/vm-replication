@@ -84,8 +84,12 @@ func TestDocsGuideIsSingleMethod(t *testing.T) {
 func TestDocsImagesServed(t *testing.T) {
 	s := &Server{}
 	for _, name := range []string{
+		// method-selector.png and source-check.png were dropped: both showed the
+		// old three-method picker (File transfer / Volume boot / Disk boot),
+		// and the console now offers local-disk boot only. Shipping a stale
+		// screenshot of a control that no longer exists is worse than none.
 		"console-overview.png", "login.png", "new-migration.png",
-		"settings-token.png", "method-selector.png", "migration-card.png",
+		"settings-token.png", "migration-card.png",
 		"source-helper.png",
 	} {
 		rr := httptest.NewRecorder()
@@ -101,7 +105,7 @@ func TestDocsImagesServed(t *testing.T) {
 		}
 	}
 	// Unknown / traversal paths are rejected.
-	for _, bad := range []string{"nope.png", "../console.go", "a/b.png"} {
+	for _, bad := range []string{"nope.png", "../console.go", "a/b.png", "method-selector.png", "source-check.png"} {
 		rr := httptest.NewRecorder()
 		s.handleDocsImage(rr, httptest.NewRequest("GET", "/documentation/img/"+bad, nil))
 		if rr.Code == 200 {
