@@ -113,7 +113,7 @@ func (s *Server) cutoverCopyCmd(token string) string {
 // logic directly — without having to string-match the assembled script or
 // stand up a real rescue environment.
 const selectTargetDiskFunc = `
-# select_target_disk EXPECT_BYTES TOLERANCE_BYTES
+# select_target_disk EXPECT_BYTES
 #
 # Finds the one local disk to write the migrated image onto, using
 # "lsblk -bdno NAME,SIZE,RO" (byte-exact sizes, no header row; -d already
@@ -122,8 +122,9 @@ const selectTargetDiskFunc = `
 # A candidate must be:
 #   - not sr*/zram*/loop* (optical/zram/loop devices lsblk -d can still list)
 #   - writable (RO == 0)
-#   - within TOLERANCE_BYTES of EXPECT_BYTES (Linode disk sizes are rounded to
-#     a whole MB, so an exact byte match is not expected)
+#   - at least EXPECT_BYTES in size, so the image fits. The plan's disk is
+#     normally BIGGER than the image; only a disk too small to hold it is
+#     disqualified.
 #
 # On exactly one candidate: prints "/dev/NAME" on stdout and returns 0.
 # On zero or more than one candidate: prints nothing on stdout, prints every
@@ -131,7 +132,6 @@ const selectTargetDiskFunc = `
 # returns 1. It never guesses.
 select_target_disk() {
   expect=$1
-  tol=$2
   selected=""
   count=0
   seen=""
@@ -143,16 +143,14 @@ select_target_disk() {
       sr*|zram*|loop*) continue ;;
     esac
     [ "$ro" = "0" ] || continue
-    diff=$((size - expect))
-    [ "$diff" -ge 0 ] || diff=$((0 - diff))
-    [ "$diff" -le "$tol" ] || continue
+    [ "$size" -ge "$expect" ] || continue
     selected="/dev/$name"
     count=$((count + 1))
   done <<EOF
 $(lsblk -bdno NAME,SIZE,RO)
 EOF
   if [ "$count" -ne 1 ]; then
-    echo "vmrepl-cutover: could not identify the target disk - looking for exactly one writable whole disk within ${tol} bytes of ${expect} bytes, found ${count}. Disks seen:${seen}" >&2
+    echo "vmrepl-cutover: could not identify the target disk - looking for exactly one writable whole disk of at least ${expect} bytes, found ${count}. Disks seen:${seen}" >&2
     return 1
   fi
   echo "$selected"
@@ -178,8 +176,8 @@ func (s *Server) rescueCopyScript(token string, bytes int64) string {
 # (writable whole disk, size matching the image) instead of by name.
 set -e
 %s
-TARGET=$(select_target_disk %d 2097152) || exit 1
-echo "vmrepl-cutover: selected $TARGET as the target disk (writable whole disk, size within tolerance of the %s image)"
+TARGET=$(select_target_disk %d) || exit 1
+echo "vmrepl-cutover: selected $TARGET as the target disk (writable whole disk large enough for the %s image)"
 echo "vmrepl-cutover: streaming %s onto $TARGET from the appliance (live progress below)..."
 curl -fsSN %s'%s' | dd of=$TARGET bs=4M conv=fsync status=progress
 sync
