@@ -120,3 +120,35 @@ func TestConsoleLinksDocumentation(t *testing.T) {
 		t.Error("console should link to /documentation")
 	}
 }
+
+// The guide must tell users which operating systems have actually been
+// migrated end to end, so they can tell "we tested this" from "the code has a
+// branch for it". Every version listed here corresponds to a full migration
+// run — created, replicated, cut over, booted, and byte-verified — not to a
+// code path that ought to work.
+func TestDocsSiteListsSupportedOS(t *testing.T) {
+	s := &Server{}
+	rr := httptest.NewRecorder()
+	s.handleDocs(rr, httptest.NewRequest("GET", "/documentation", nil))
+	body := rr.Body.String()
+
+	if !strings.Contains(body, `id="supported-os"`) {
+		t.Fatal("the guide needs a Supported OS section users can link to")
+	}
+	if !strings.Contains(body, `href="#supported-os"`) {
+		t.Error("Supported OS must be reachable from the sidebar, not just by scrolling")
+	}
+	// Every version verified in the August 2026 campaign.
+	for _, v := range []string{"20.04", "22.04", "24.04", "25.10", "26.04"} {
+		if !strings.Contains(body, "Ubuntu "+v) {
+			t.Errorf("Supported OS must list Ubuntu %s — it was verified end to end", v)
+		}
+	}
+	// It must be explicit that this is a tested list, not a compatibility claim,
+	// otherwise readers will assume anything absent is unsupported.
+	for _, want := range []string{"tested", "x86_64"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the section should mention %q so the scope of the claim is clear", want)
+		}
+	}
+}
