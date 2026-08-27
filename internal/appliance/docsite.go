@@ -218,6 +218,7 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
   <div class="navfilter"><input id="navq" type="text" placeholder="Filter the guide…" oninput="filterNav(this.value)"></div>
   <div class="navgroup"><div class="gtitle">Getting started</div>
     <a href="#introduction">Introduction</a>
+    <a href="#supported-os">Supported operating systems</a>
     <a href="#install">Install the replication server</a>
     <a href="#sign-in">Sign in</a>
   </div>
@@ -251,6 +252,22 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
 <p>The <b>replication server</b> (a small Linode you create once) hosts the migration console. From the console you register each <b>source server</b>, copy one generated command onto it, and drive the whole migration — replication, validation, cutover — from the browser. Data flows from the source over <b>mutually-authenticated TLS</b>; nothing is ever pulled from the destination side.</p>
 <div class="codeblock"><pre>source server ──(agent, one-line install)──► replication server (console) ──► destination on Linode</pre></div>
 <p>Migrations are <b>block-for-block disk boot</b>: every source disk is copied whole, the boot disk lands on the new Linode's own <b>local NVMe disk</b> (free with the plan), and any further disks become Block Storage volumes attached to the same instance — see <a href="#disk-boot">Disk boot</a> for the full walkthrough.</p>
+</section>
+
+<section id="supported-os">
+<h2>Supported operating systems</h2>
+<p>These versions have been <b>migrated end to end and verified</b> — created, replicated, cut over, booted, and checked byte-for-byte against the source. This is a list of what has actually been tested, not a compatibility matrix: a version missing from it has not been proven, rather than known to fail.</p>
+<table>
+<tr><th>Operating system</th><th>Verified</th></tr>
+<tr><td><b>Ubuntu 26.04 LTS</b></td><td>Migrated and booted; data verified</td></tr>
+<tr><td><b>Ubuntu 25.10</b></td><td>Migrated and booted; data verified</td></tr>
+<tr><td><b>Ubuntu 24.04 LTS</b></td><td>Migrated and booted; data verified</td></tr>
+<tr><td><b>Ubuntu 22.04 LTS</b></td><td>Migrated and booted; data verified</td></tr>
+<tr><td><b>Ubuntu 20.04 LTS</b></td><td>Migrated and booted; data verified</td></tr>
+</table>
+<p>Each was migrated with a <b>separate data volume</b> alongside the boot disk, so multi-disk is covered too. In every case the destination came up on <b>its own kernel</b> with its security module intact (AppArmor enabled with the same profile count as the source), the data volume mounted by UUID, and the application serving from it.</p>
+<div class="adm"><span class="t">Scope</span><b>x86_64 only.</b> The replication agent is built for <code>linux/amd64</code>; ARM/aarch64 sources are not supported. Windows and other non-Linux systems are out of scope — the boot conversion is Linux-only.</div>
+<div class="adm tip"><span class="t">Tip</span>Running something not on this list? Replication itself is distro-agnostic — it copies blocks and never parses your filesystem. Only the post-copy boot conversion is OS-aware, and it handles the Debian/Ubuntu (<code>apt</code>, <code>initramfs-tools</code>, <code>grub</code>) and RHEL (<code>dnf</code>, <code>dracut</code>, <code>grub2</code>) families. Run the <a href="#source-check">Source check</a> first: it reports a verdict for your specific server before you commit to anything.</div>
 </section>
 
 <section id="install">
