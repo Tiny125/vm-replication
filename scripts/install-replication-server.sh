@@ -23,7 +23,7 @@ set -euo pipefail
 # outrank a stored setting, and "" has to mean "not given" rather than "empty".
 PUBLIC_HOST=""; REGION_FLAG=""; PORT_FLAG=""
 REGION=""; PORT=""
-REGION_DEFAULT="us-ord"; PORT_DEFAULT="8080"
+REGION_DEFAULT="us-ord"; PORT_DEFAULT="443"
 # The region this installer shipped as a hardcoded default before it learned to
 # detect one. A unit still carrying it was never an operator's choice, so it must
 # not outrank detection — see resolve_region.
@@ -110,7 +110,11 @@ resolve_region() {
 }
 
 # resolve_port [UNIT_PATH] — flag, then stored, then the installed unit, then the
-# default. No legacy-default exception: 8080 is a real default, not a mistake.
+# default. The default is 443 so the console and its guide are reached at
+# https://<ip>/ with no port to remember; the appliance runs as root on a
+# dedicated host, so a privileged port costs nothing. A port already stored (or
+# already in the unit) always wins, so upgrading never moves a running console
+# out from under its operator.
 resolve_port() {
   local unit="${1:-$UNIT_PATH}" stored in_unit
   PORT_SRC=""

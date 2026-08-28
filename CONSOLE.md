@@ -6,7 +6,7 @@ from the browser. No manual cert copying or command crafting — the console
 generates a one-line command for each source.
 
 > **The same guide, with screenshots of every step, is served by your own
-> replication server at `https://<ip>:8080/documentation`** (also linked from
+> replication server at `https://<ip>/documentation`** (also linked from
 > the console's header). This file is the Markdown companion with extra sizing
 > and operational detail.
 
@@ -20,7 +20,7 @@ For the manual/CLI workflow instead, see [`GETTING_STARTED.md`](docs/GETTING_STA
  ┌─ Replication server (a Linode) ──────────────────────────────┐
  │  one command installs everything → prints a password          │
  │  ┌────────────────────────────────────────────────────────┐  │
- │  │  Web console (https://<ip>:8080) ← log in with password │  │
+ │  │  Web console (https://<ip>) ← log in with password   │  │
  │  │   • enter source details → get a copy-paste command     │  │
  │  │   • watch replication status + validation checks        │  │
  │  │   • click "Start migration" → produces a Linode Image   │  │
@@ -172,7 +172,7 @@ installs a systemd service (`applianced`), and prints:
 
 ```
 ================ REPLICATION SERVER READY ================
- Console:   https://203.0.113.10:8080
+ Console:   https://203.0.113.10
  Password:  681af4b11221bacb88e34080
  Cert SHA-256 (verify this in your browser's certificate dialog):
    AB:CD:...:EF
@@ -180,7 +180,15 @@ installs a systemd service (`applianced`), and prints:
 ```
 
 Options: `--public-host <ip>` (if auto-detect is wrong), `--region us-ord`,
-`--port 8080`.
+`--port 8443`.
+
+The console listens on **443**, so it and the guide are reached at
+`https://<ip>/` with nothing to remember after the address. The replication
+server is a dedicated host and the service runs as root, so a privileged port
+costs nothing. Pass `--port` if 443 is already taken on that machine — and note
+that upgrading **never** changes the port of an existing install: whatever is in
+`/etc/vm-repl/applianced.env` wins, so a console already on 8080 stays there
+until you change it yourself.
 
 **Sessions & password recovery.** A console session lasts **12 hours from
 sign-in** (a fixed lifetime — it is not extended by activity); after that you'll
@@ -210,7 +218,7 @@ recovered without resetting.)
 
 ## 2. Open the console and sign in
 
-Browse to `https://<replication-server-ip>:8080`. Because the certificate is
+Browse to `https://<replication-server-ip>`. Because the certificate is
 self-signed, your browser warns on first visit — that's expected. Before
 entering the password, open the browser's **certificate dialog** and confirm the
 **SHA-256 fingerprint matches** the one the installer printed (also in
@@ -470,7 +478,7 @@ constrained by the plan's disk size.
 The console then shows a **one-line command**, e.g.:
 
 ```bash
-curl -fsSL -k --pinnedpubkey 'sha256//…' 'https://203.0.113.10:8080/install/agent.sh?token=…' | sudo bash
+curl -fsSL -k --pinnedpubkey 'sha256//…' 'https://203.0.113.10/install/agent.sh?token=…' | sudo bash
 ```
 
 The `--pinnedpubkey` flag pins this server's public key, so the download is
@@ -529,7 +537,7 @@ One command removes everything enrollment installed (binary, timer, certs,
 checkpoint). The console shows it with a Copy button on completed migrations:
 
 ```bash
-curl -fsSL -k --pinnedpubkey 'sha256//…' 'https://<replication-server>:8080/install/uninstall.sh' | sudo bash
+curl -fsSL -k --pinnedpubkey 'sha256//…' 'https://<replication-server>/install/uninstall.sh' | sudo bash
 ```
 
 The agent only ever *reads* the source disk; removal changes nothing about the

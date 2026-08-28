@@ -34,7 +34,7 @@ Full step-by-step process and sizing detail: [`CONSOLE.md`](CONSOLE.md#how-migra
    sudo scripts/install-replication-server.sh
    ```
 
-3. **Open the console** at `https://<replication-server-ip>:8080` and sign in
+3. **Open the console** at `https://<replication-server-ip>` and sign in
    with the printed password (the browser warns about the self-signed
    certificate — verify the printed SHA-256 fingerprint, then proceed).
 4. **Migrate**: add your Linode API token, create a migration, run the
@@ -42,7 +42,7 @@ Full step-by-step process and sizing detail: [`CONSOLE.md`](CONSOLE.md#how-migra
    when the copy is complete.
 
 **The full step-by-step guide — with screenshots of every step — is served by
-your own replication server at `https://<replication-server-ip>:8080/documentation`.**
+your own replication server at `https://<replication-server-ip>/documentation`.**
 The same content in Markdown: [`CONSOLE.md`](CONSOLE.md).
 
 ## Why it's safe
@@ -92,7 +92,7 @@ Prefer to drive the agent and receiver by hand (no console)? See
 
 | Document | What it covers |
 |---|---|
-| **`https://<your-server>:8080/documentation`** | the full console guide with screenshots (served by the appliance) |
+| **`https://<your-server>/documentation`** | the full console guide with screenshots (served by the appliance) |
 | [`CONSOLE.md`](CONSOLE.md) | the same console guide in Markdown, plus sizing and deep detail |
 | [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) | supported sources, prerequisites, limits |
 | [`docs/CLOUD-COMPAT.md`](docs/CLOUD-COMPAT.md) | per-cloud notes (AWS, GCP, Azure, …) |

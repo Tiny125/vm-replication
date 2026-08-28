@@ -32,7 +32,7 @@ import (
 
 func main() {
 	var (
-		listen        = flag.String("listen", ":8080", "console HTTP listen address")
+		listen        = flag.String("listen", ":443", "console HTTPS listen address")
 		dataDir       = flag.String("data-dir", "/var/lib/vm-repl", "state directory (db, keys, file-fallback volumes)")
 		publicHost    = flag.String("public-host", "", "IP/DNS source agents reach this server at (auto-detected if empty)")
 		region        = flag.String("region", "us-ord", "default Linode region for volumes/instances")
