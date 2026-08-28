@@ -3,6 +3,8 @@ package appliance
 import (
 	"strings"
 	"testing"
+
+	"github.com/tiny125/vm-replication/internal/api"
 )
 
 // The console's auto-refresh timers (5s full refresh + 1s live progress/status
@@ -383,5 +385,49 @@ func TestConsoleShowsMethodAsTextNotADropdown(t *testing.T) {
 func TestConsoleNoDanglingMethodElementReferences(t *testing.T) {
 	if strings.Contains(consoleHTML, "$('m_method')") {
 		t.Error("console still references the removed #m_method element; the create-form reset would throw")
+	}
+}
+
+// Every command the console hands an operator embeds the console's own URL.
+// Once the default port became 443 those read
+// "https://198.51.100.7:443/check/source.sh?token=…" — the port is redundant
+// for the scheme and is pure noise in a line someone has to read, trust and
+// paste into a production server.
+func TestConsoleBaseOmitsTheDefaultPort(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		scheme string
+		host   string
+		port   int
+		want   string
+	}{
+		{"https on 443 drops the port", "https", "198.51.100.7", 443, "https://198.51.100.7"},
+		{"http on 80 drops the port", "http", "198.51.100.7", 80, "http://198.51.100.7"},
+		{"a non-default port is kept", "https", "198.51.100.7", 8080, "https://198.51.100.7:8080"},
+		{"80 under https is NOT default and is kept", "https", "198.51.100.7", 80, "https://198.51.100.7:80"},
+		{"443 under http is NOT default and is kept", "http", "198.51.100.7", 443, "http://198.51.100.7:443"},
+		{"hostnames work the same", "https", "appliance.internal", 443, "https://appliance.internal"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := consoleBaseURL(tc.scheme, tc.host, tc.port); got != tc.want {
+				t.Errorf("consoleBaseURL(%q,%q,%d) = %q, want %q", tc.scheme, tc.host, tc.port, got, tc.want)
+			}
+		})
+	}
+}
+
+// The generated commands must actually use it, or the helper is decoration.
+func TestGeneratedCommandsUseTheSharedBase(t *testing.T) {
+	s := &Server{cfg: Config{PublicHost: "198.51.100.7", ConsolePort: 443}}
+	for name, got := range map[string]string{
+		"enroll":    s.enrollCmd("tok", api.Migration{}),
+		"uninstall": s.uninstallCmd(),
+	} {
+		if strings.Contains(got, ":443/") {
+			t.Errorf("%s command still carries a redundant :443 — %s", name, got)
+		}
+		if !strings.Contains(got, "https://198.51.100.7/") {
+			t.Errorf("%s command should address the console without a port — %s", name, got)
+		}
 	}
 }

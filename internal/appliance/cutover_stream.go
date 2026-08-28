@@ -92,8 +92,8 @@ func (s *Server) cutoverCopyCmdFor(migID int64) string {
 // cutoverCopyCmd is the ONE line the operator pastes into the rescue'd
 // instance's Lish console. Key-pinned like the enrollment command.
 func (s *Server) cutoverCopyCmd(token string) string {
-	return fmt.Sprintf("curl -fsSL %s'%s://%s:%d/cutover/copy.sh?token=%s' | sh",
-		s.curlPinFlag(), s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort, token)
+	return fmt.Sprintf("curl -fsSL %s'%s/cutover/copy.sh?token=%s' | sh",
+		s.curlPinFlag(), s.consoleBase(), token)
 }
 
 // selectTargetDiskFunc is the POSIX-sh disk-selection logic used by the
@@ -161,7 +161,7 @@ EOF
 // rescueCopyScript is the script that command downloads and runs inside the
 // Finnix rescue environment. It must stay /bin/sh-compatible.
 func (s *Server) rescueCopyScript(token string, bytes int64) string {
-	imageURL := fmt.Sprintf("%s://%s:%d/cutover/image?token=%s", s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort, token)
+	imageURL := fmt.Sprintf("%s/cutover/image?token=%s", s.consoleBase(), token)
 	// TOLERANCE_BYTES: Linode disk sizes are rounded to a whole MB, so a
 	// freshly created disk can legitimately land up to just under 1 MiB away
 	// from the image byte count; 2 MiB gives that a little headroom without

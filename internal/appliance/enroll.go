@@ -48,7 +48,7 @@ func (s *Server) handleAgentInstaller(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := r.URL.Query().Get("token")
-	base := fmt.Sprintf("%s://%s:%d", s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort)
+	base := s.consoleBase()
 
 	// Build the per-disk pieces: a precheck line and an ExecStart line per disk.
 	var checks, execs strings.Builder
@@ -238,4 +238,23 @@ func (s *Server) handleDownloadAgent(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="vmrepl-agent"`)
 	http.ServeFile(w, r, s.cfg.AgentBinary)
+}
+
+// consoleBaseURL builds the console's own address for the commands the operator
+// copies onto a source server, omitting the port when it is the scheme's
+// default.
+//
+// The console listens on 443 by default, and "https://host:443/…" is noise in a
+// line someone has to read, trust and paste into a production machine. A
+// non-default port is always shown, because then it genuinely matters.
+func consoleBaseURL(scheme, host string, port int) string {
+	if (scheme == "https" && port == 443) || (scheme == "http" && port == 80) {
+		return fmt.Sprintf("%s://%s", scheme, host)
+	}
+	return fmt.Sprintf("%s://%s:%d", scheme, host, port)
+}
+
+// consoleBase is consoleBaseURL for this server's own configuration.
+func (s *Server) consoleBase() string {
+	return consoleBaseURL(s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort)
 }

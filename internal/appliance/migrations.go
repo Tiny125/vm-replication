@@ -2349,14 +2349,14 @@ func (s *Server) validations(m api.Migration, rpoSec float64) []api.ValidationCh
 }
 
 func (s *Server) enrollCmd(token string, m api.Migration) string {
-	return fmt.Sprintf("curl -fsSL %s'%s://%s:%d/install/agent.sh?token=%s' | sudo bash",
-		s.curlPinFlag(), s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort, token)
+	return fmt.Sprintf("curl -fsSL %s'%s/install/agent.sh?token=%s' | sudo bash",
+		s.curlPinFlag(), s.consoleBase(), token)
 }
 
 // uninstallCmd is the one-liner that removes the agent from a source server.
 func (s *Server) uninstallCmd() string {
-	return fmt.Sprintf("curl -fsSL %s'%s://%s:%d/install/uninstall.sh' | sudo bash",
-		s.curlPinFlag(), s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort)
+	return fmt.Sprintf("curl -fsSL %s'%s/install/uninstall.sh' | sudo bash",
+		s.curlPinFlag(), s.consoleBase())
 }
 
 // scheme returns the console URL scheme (https unless explicitly http).
