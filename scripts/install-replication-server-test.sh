@@ -93,7 +93,7 @@ resolve_port
 
 reset
 resolve_port
-[ "$PORT" = "8080" ] || fail "expected the default port with nothing stored, got $PORT"
+[ "$PORT" = "443" ] || fail "expected the default port with nothing stored, got $PORT"
 
 reset; PORT_FLAG="9999"; write_env "us-ord" "9443"
 resolve_port
@@ -122,3 +122,24 @@ got="$(detect_region || echo "RETURNED_NONZERO")"
 [ -z "$got" ] || fail "detect_region should print nothing when metadata is unreachable, got '$got'"
 
 echo "ok  install-replication-server.sh settings resolution (region, port, upgrade preservation)"
+
+# 20) The default console port is 443, so the console and its guide are reached
+#     at https://<ip>/ with no port in the URL. The appliance runs as root on a
+#     dedicated host, so binding a privileged port is not a problem, and an
+#     operator who wants something else still has --port and the env file.
+reset
+[ "$PORT_DEFAULT" = "443" ] || fail "expected the built-in default port to be 443, got $PORT_DEFAULT"
+resolve_port "$WORK/none.service"
+[ "$PORT" = "443" ] || fail "with nothing stored the resolved port should be 443, got $PORT"
+
+# 20b) An existing install keeps the port it already has. Upgrading must not
+#      move a running console out from under its operator (the F-01 rule).
+reset; write_env "sg-sin-2" "8080"
+resolve_port "$WORK/none.service"
+[ "$PORT" = "8080" ] || fail "a stored port must survive an upgrade, got $PORT"
+
+# 20c) An explicit --port still wins over everything.
+reset; write_env "sg-sin-2" "8080"; PORT_FLAG="9443"
+resolve_port "$WORK/none.service"
+[ "$PORT" = "9443" ] || fail "--port must win, got $PORT"
+PORT_FLAG=""

@@ -65,8 +65,8 @@ func (s *Server) handleSourceCheckCreate(w http.ResponseWriter, r *http.Request)
 	s.sourceChecks.Store(tok, chk)
 	time.AfterFunc(sourceCheckTTL, func() { s.dropSourceCheck(tok) })
 
-	cmd := fmt.Sprintf("curl -fsSL %s'%s://%s:%d/check/source.sh?token=%s' | sudo bash",
-		s.curlPinFlag(), s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort, tok)
+	cmd := fmt.Sprintf("curl -fsSL %s'%s/check/source.sh?token=%s' | sudo bash",
+		s.curlPinFlag(), s.consoleBase(), tok)
 	writeJSON(w, http.StatusOK, map[string]any{"token": tok, "cmd": cmd, "ttl_minutes": int(sourceCheckTTL.Minutes())})
 }
 
@@ -114,7 +114,7 @@ func (s *Server) handleSourceCheckScript(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusForbidden, "invalid or expired check token — generate a fresh command in the console")
 		return
 	}
-	base := fmt.Sprintf("%s://%s:%d", s.scheme(), s.cfg.PublicHost, s.cfg.ConsolePort)
+	base := s.consoleBase()
 	script := fmt.Sprintf(sourceCheckScript, base, tok, s.cfg.PublicHost, chk.probePort, s.cfg.PublicKeyPin)
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
 	_, _ = w.Write([]byte(script))
