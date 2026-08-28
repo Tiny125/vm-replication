@@ -234,3 +234,29 @@ func TestBannerModifierClassesExist(t *testing.T) {
 		t.Errorf("the base .banner must be neutral, not green — otherwise \"banner\" secretly means \"success\": %s", rule)
 	}
 }
+
+// The tooltip badge and the informational banner both used the class name
+// "info". `.info` styles a 16px round inline-flex dot; a banner written as
+// class="banner info" therefore collapsed into that dot instead of rendering
+// as a full-width panel — measured computed style: display:inline-flex,
+// width:30px, with its text spilling out beside the card.
+//
+// `.banner` sets no display/width of its own, so there was nothing for the
+// modifier to win against: the two class names simply collided. The fix is a
+// distinct name for the badge, not a pile of resets on .banner.info that would
+// have to cancel every box property the badge sets.
+func TestBannerModifierDoesNotCollideWithTheTooltipBadge(t *testing.T) {
+	// The badge rule must not be reachable by a plain `.info` selector, or any
+	// element carrying class="… info" inherits its box.
+	if strings.Contains(consoleHTML, " .info{display:inline-flex") {
+		t.Error("the tooltip badge is still styled as bare `.info`, which any element with class=\"info\" picks up — including class=\"banner info\"")
+	}
+	// Banners must still carry their semantic modifier.
+	if !strings.Contains(consoleHTML, ".banner.info{") {
+		t.Error("the informational banner modifier should keep its semantic name")
+	}
+	// Every tooltip in the markup must use the renamed class.
+	if strings.Contains(consoleHTML, `class="info"`) {
+		t.Error(`markup still emits class="info" for tooltips; it collides with the banner modifier`)
+	}
+}

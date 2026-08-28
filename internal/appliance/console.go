@@ -197,14 +197,14 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
  .logpre.scroll{max-height:62vh;overflow:auto}
  .logpre .x{color:var(--red)} .logpre .w{color:var(--amber)}
  .mini{padding:3px 9px;font-size:12px;line-height:1.2}
- .info{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
+ .infodot{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;
    background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;font-weight:700;
    font-style:normal;cursor:help;position:relative;margin-left:6px;vertical-align:middle;flex:none}
- .info:hover{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
- .info:hover::after{content:attr(data-tip);position:absolute;left:50%;bottom:150%;transform:translateX(-50%);
+ .infodot:hover{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
+ .infodot:hover::after{content:attr(data-tip);position:absolute;left:50%;bottom:150%;transform:translateX(-50%);
    background:var(--tip-bg);color:var(--tip-fg);padding:9px 11px;border-radius:9px;font-size:12px;font-weight:400;white-space:pre-line;
    width:max-content;max-width:280px;line-height:1.45;text-align:left;z-index:30;box-shadow:var(--shadow-tip)}
- .info:hover::before{content:"";position:absolute;left:50%;bottom:150%;transform:translateX(-50%) translateY(100%);
+ .infodot:hover::before{content:"";position:absolute;left:50%;bottom:150%;transform:translateX(-50%) translateY(100%);
    border:5px solid transparent;border-top-color:var(--tip-bg);z-index:30}
  .leg{position:relative;display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;
    border-radius:50%;background:var(--surface2);border:1px solid var(--border);color:var(--muted);font-size:10px;
@@ -405,7 +405,7 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
 
       <div style="margin-top:16px;display:flex;align-items:center;gap:2px">
         <button id="createBtn" class="primary" onclick="createMig(this)">Create migration</button>
-        <span class="info" data-tip="Registers this source server, provisions one replication volume per disk on the appliance, and generates the one-line agent enrollment command. No data is copied until you run that command on the source.">i</span>
+        <span class="infodot" data-tip="Registers this source server, provisions one replication volume per disk on the appliance, and generates the one-line agent enrollment command. No data is copied until you run that command on the source.">i</span>
       </div>
       <div id="createErr" class="err"></div>
     </div>
@@ -1083,7 +1083,7 @@ function diskTable(m){const d=disks(m);if(!d.length)return '';
        '<td>'+(x.full_sync_done?'<span class="y">✔ done</span>':'<span class="muted">baselining</span>')+'</td><td>'+note+'</td></tr>';}
   return h+'</table>';
 }
-function infoIcon(tip){return '<span class="info" data-tip="'+esc(tip)+'">i</span>'}
+function infoIcon(tip){return '<span class="infodot" data-tip="'+esc(tip)+'">i</span>'}
 function stateLabel(s){return ({created:'created',awaiting_agent:'waiting for agent',replicating:'replicating',ready:'ready to cut over',awaiting_cutover:'power off source, then launch',migrating:'finalizing',image_ready:'image ready',launched:'launched',failed:'failed'})[s]||s}
 // pillFor renders the header status pill. Before replication starts (state still
 // awaiting_agent/created) it reflects the gated-start connection signals so the
