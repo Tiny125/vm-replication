@@ -1072,7 +1072,12 @@ func (s *Server) handleDeleteMigration(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not found")
 		return
 	}
-	s.cleanupMigrationResources(ctx, m, cleanupOpts{keepReplVolume: true}) // keep (detach) the replication volume
+	// Remove the replication volume too. Keeping it only detached left a paid
+	// volume in the account owned by nothing — the migration row it belonged to
+	// is gone, so no retry can reuse it — while the console told the operator
+	// "the replication volume and data were removed" (F-21). A silent leak is
+	// bad; one the UI denies is worse, because it stops anyone going to look.
+	s.cleanupMigrationResources(ctx, m, cleanupOpts{})
 	if err := s.st.DeleteMigration(ctx, id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1123,9 +1128,6 @@ func (s *Server) rollbackCreate(ctx context.Context, id int64) {
 
 // cleanupOpts controls which resources cleanupMigrationResources removes.
 type cleanupOpts struct {
-	// keepReplVolume: only DETACH the vmrep-<name> replication volume (keep it in
-	// the account for reference) instead of deleting it. Used by user delete.
-	keepReplVolume bool
 	// keepLaunched: keep the launched cutover instance and its <name>-cutover
 	// clone volumes. Used by "Close migration" (finish a successful migration):
 	// the migrated server and its volumes are the user's to keep — only the
@@ -1141,7 +1143,6 @@ type cleanupOpts struct {
 //   - The cutover artifacts (launched instance + <name>-cutover clone volumes)
 //     are deleted unless opts.keepLaunched is set.
 //   - The vmrep-<name> replication volume is deleted, or only DETACHED and kept
-//     when opts.keepReplVolume is set.
 //   - Disk images and manifests are always removed.
 func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration, opts cleanupOpts) {
 	s.recMu.Lock()
@@ -1175,22 +1176,17 @@ func (s *Server) cleanupMigrationResources(ctx context.Context, m api.Migration,
 			}
 		}
 		if d.VolumeID != 0 && haveLinode {
-			if !opts.keepReplVolume {
-				// Use detachAndDeleteVolume, which WAITS for the detach to finish
-				// before deleting. This used to fire a detach and then retry the
-				// delete for only 20s; Linode rejects a delete until the detach has
-				// completed ("This volume must be detached before it can be
-				// deleted"), and a detach routinely takes longer than that when
-				// several volumes are released at once — which is exactly what a
-				// multi-disk migration does. The result was that closing a two-disk
-				// migration deleted one volume and left the other detached, active
-				// and BILLING, with the operator told to clean it up by hand.
-				if err := s.detachAndDeleteVolume(ctx, cl, d.VolumeID); err != nil {
-					log.Printf("appliance: delete volume %d failed (remove it in Cloud Manager): %v", d.VolumeID, err)
-				}
-			} else {
-				_ = cl.DetachVolume(ctx, d.VolumeID) // detach but keep, for reference
-				log.Printf("appliance: migration %d: replication volume %d detached and kept for reference", m.ID, d.VolumeID)
+			// Use detachAndDeleteVolume, which WAITS for the detach to finish
+			// before deleting. This used to fire a detach and then retry the
+			// delete for only 20s; Linode rejects a delete until the detach has
+			// completed ("This volume must be detached before it can be
+			// deleted"), and a detach routinely takes longer than that when
+			// several volumes are released at once — which is exactly what a
+			// multi-disk migration does. The result was that closing a two-disk
+			// migration deleted one volume and left the other detached, active
+			// and BILLING, with the operator told to clean it up by hand.
+			if err := s.detachAndDeleteVolume(ctx, cl, d.VolumeID); err != nil {
+				log.Printf("appliance: delete volume %d failed (remove it in Cloud Manager): %v", d.VolumeID, err)
 			}
 		} else {
 			_ = os.Remove(s.diskDevicePath(m, d))
