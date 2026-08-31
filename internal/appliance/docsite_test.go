@@ -135,6 +135,16 @@ func TestDocsInstallStepUsesBootstrap(t *testing.T) {
 	if strings.Contains(body, "8080") {
 		t.Error("documentation still references the old default port 8080 — the console now defaults to 443")
 	}
+
+	// The version-pinning example has to work in the flow this page actually
+	// documents. This page only ever shows the piped form, so it never leaves a
+	// bootstrap.sh on disk — an example reading `bash bootstrap.sh` refers to a
+	// file the reader does not have, and fails with "No such file or directory"
+	// (verified on a live install). Pin via the environment through the pipe.
+	if !strings.Contains(body, "| sudo VMREPL_REF=") {
+		t.Error("the VMREPL_REF example must use the piped form (`| sudo VMREPL_REF=<tag> bash`); " +
+			"this page never downloads bootstrap.sh to disk, so `bash bootstrap.sh` cannot work here")
+	}
 }
 
 // The console links to the documentation so operators can find the guide.
