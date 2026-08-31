@@ -141,6 +141,12 @@ func TestDocsInstallStepUsesBootstrap(t *testing.T) {
 	// bootstrap.sh on disk — an example reading `bash bootstrap.sh` refers to a
 	// file the reader does not have, and fails with "No such file or directory"
 	// (verified on a live install). Pin via the environment through the pipe.
+	// An example a reader might paste must be pasteable. An elided URL
+	// ("…/bootstrap.sh") fails exactly like the `bash bootstrap.sh` form it
+	// replaced, so spell the URL out in full wherever a command appears.
+	if strings.Contains(body, "…/bootstrap.sh") {
+		t.Error("the pinning example elides the URL with `…`, which is not pasteable; spell it out in full")
+	}
 	if !strings.Contains(body, "| sudo VMREPL_REF=") {
 		t.Error("the VMREPL_REF example must use the piped form (`| sudo VMREPL_REF=<tag> bash`); " +
 			"this page never downloads bootstrap.sh to disk, so `bash bootstrap.sh` cannot work here")
