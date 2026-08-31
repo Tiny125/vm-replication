@@ -112,6 +112,41 @@ func TestDocsImagesServed(t *testing.T) {
 	}
 }
 
+// The install step must document the one-command installer (bootstrap.sh),
+// which is now the supported path, and must not mention the old default port
+// (8080 — the console now defaults to 443, see enroll.go's consoleBaseURL).
+// A raw `git clone` step may still appear as a secondary "build from source"
+// note, but must not be the primary instruction any more.
+func TestDocsInstallStepUsesBootstrap(t *testing.T) {
+	s := &Server{}
+	rr := httptest.NewRecorder()
+	s.handleDocs(rr, httptest.NewRequest("GET", "/documentation", nil))
+	body := rr.Body.String()
+
+	for _, want := range []string{
+		"bootstrap.sh",
+		"curl -fsSL https://raw.githubusercontent.com/Tiny125/vm-replication/main/scripts/bootstrap.sh",
+		"VMREPL_REF",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("install step should mention %q (the one-command installer)", want)
+		}
+	}
+	if strings.Contains(body, "8080") {
+		t.Error("documentation still references the old default port 8080 — the console now defaults to 443")
+	}
+
+	// The version-pinning example has to work in the flow this page actually
+	// documents. This page only ever shows the piped form, so it never leaves a
+	// bootstrap.sh on disk — an example reading `bash bootstrap.sh` refers to a
+	// file the reader does not have, and fails with "No such file or directory"
+	// (verified on a live install). Pin via the environment through the pipe.
+	if !strings.Contains(body, "| sudo VMREPL_REF=") {
+		t.Error("the VMREPL_REF example must use the piped form (`| sudo VMREPL_REF=<tag> bash`); " +
+			"this page never downloads bootstrap.sh to disk, so `bash bootstrap.sh` cannot work here")
+	}
+}
+
 // The console links to the documentation so operators can find the guide.
 func TestConsoleLinksDocumentation(t *testing.T) {
 	if !strings.Contains(consoleHTML, `href="/documentation"`) {

@@ -143,3 +143,52 @@ reset; write_env "sg-sin-2" "8080"; PORT_FLAG="9443"
 resolve_port "$WORK/none.service"
 [ "$PORT" = "9443" ] || fail "--port must win, got $PORT"
 PORT_FLAG=""
+
+echo "ok  install-replication-server.sh port default/preservation"
+
+# --- Defect 2: console_url omits the port only when it is the HTTPS default,
+#     mirroring internal/appliance/enroll.go's consoleBaseURL. -----------------
+[ "$(console_url "203.0.113.10" "443")" = "https://203.0.113.10" ] \
+  || fail "console_url must omit :443, got $(console_url "203.0.113.10" "443")"
+[ "$(console_url "203.0.113.10" "8443")" = "https://203.0.113.10:8443" ] \
+  || fail "console_url must keep a non-default port, got $(console_url "203.0.113.10" "8443")"
+[ "$(console_url "203.0.113.10" "80")" = "https://203.0.113.10:80" ] \
+  || fail "console_url must keep :80 too (it is not the https default), got $(console_url "203.0.113.10" "80")"
+
+echo "ok  install-replication-server.sh console_url port formatting"
+
+# --- Defect 1: the fingerprint wait actually waits for the race between
+#     `systemctl restart applianced` and applianced self-signing console.crt. --
+CERT="$WORK/console.crt"
+rm -f "$CERT"
+
+# openssl must be on PATH for this to mean anything; skip the assertion body
+# (not the test) if it genuinely is not available in this environment.
+if command -v openssl >/dev/null 2>&1; then
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/console.key" \
+    -out "$WORK/expected.crt" -days 1 -subj "/CN=test" >/dev/null 2>&1
+  EXPECTED_FPR="$(openssl x509 -in "$WORK/expected.crt" -noout -fingerprint -sha256 | sed 's/.*=//')"
+
+  # Simulate the race: the cert is absent when the summary would naively check
+  # for it, and appears a moment later (applianced signing it after the unit
+  # reports started). console_fingerprint must poll rather than give up on the
+  # first miss.
+  ( sleep 1; cp "$WORK/expected.crt" "$CERT" ) &
+  BGPID=$!
+  GOT_FPR="$(console_fingerprint "$CERT" 10 0.3)"   # up to ~3s, well past the 1s delay
+  wait "$BGPID"
+  [ "$GOT_FPR" = "$EXPECTED_FPR" ] || fail "console_fingerprint lost the cert-appears-late race: expected $EXPECTED_FPR, got '$GOT_FPR'"
+  [ "$GOT_FPR" != "" ] || fail "console_fingerprint must not fall back to empty when the cert appears within the bound"
+
+  # The wait must still be BOUNDED: a cert that never appears must not hang.
+  rm -f "$CERT"
+  START="$(date +%s)"
+  GOT_FPR="$(console_fingerprint "$CERT" 3 0.1)"    # ~0.3s bound
+  ELAPSED=$(( $(date +%s) - START ))
+  [ "$GOT_FPR" = "" ] || fail "console_fingerprint should give the caller's fallback when the cert never appears, got '$GOT_FPR'"
+  [ "$ELAPSED" -le 5 ] || fail "console_fingerprint did not respect its bound, took ${ELAPSED}s"
+else
+  echo "SKIP: openssl not on PATH — Defect 1 fingerprint assertions skipped" >&2
+fi
+
+echo "ok  install-replication-server.sh console_fingerprint waits for the self-sign race, bounded"

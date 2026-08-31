@@ -275,24 +275,25 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
 <p>You need one Linode to act as the replication server. A <b>2&nbsp;GB shared plan</b> is enough for 1–3 concurrent block disks (see <code>CONSOLE.md</code> in the repository for detailed sizing).</p>
 <ol class="steps">
 <li>Create a Linode (Ubuntu or Debian recommended) and SSH in as <b>root</b>.</li>
-<li>Clone the repository and run the installer — it bootstraps everything it needs (Go toolchain, build tools) on a bare server:
-<div class="codeblock"><pre>git clone https://github.com/Tiny125/vm-replication.git
-cd vm-replication
-sudo scripts/install-replication-server.sh</pre><button class="copy" onclick="cp(this)">Copy</button></div></li>
-<li>The installer builds the binaries, generates certificates and an <b>admin password</b>, installs the <code>applianced</code> systemd service, and prints a summary:
+<li>Run the one-command installer:
+<div class="codeblock"><pre>curl -fsSL https://raw.githubusercontent.com/Tiny125/vm-replication/main/scripts/bootstrap.sh | sudo bash</pre><button class="copy" onclick="cp(this)">Copy</button></div>
+It downloads the prebuilt release tarball matching this machine's CPU architecture (linux/amd64 or linux/arm64), <b>verifies its SHA-256 against the release's <code>SHA256SUMS</code> before extracting anything</b>, unpacks it to <code>/usr/local/src/vm-replication-&lt;version&gt;</code> (with a stable <code>/usr/local/src/vm-replication</code> symlink to it), and runs the installer from there. No Go toolchain, no compiler, no <code>git clone</code> needed — the binaries are prebuilt and static. To pin an exact release instead of always installing latest — recommended for production, so a later re-run cannot silently move you to whatever is newest — pass the tag through the pipe: <code>curl -fsSL …/bootstrap.sh | sudo VMREPL_REF=v0.1.0 bash</code>. Re-running is safe and upgrades in place: an existing region and port are preserved.</li>
+<li>The installer generates certificates and an <b>admin password</b>, installs the <code>applianced</code> systemd service, and prints a summary:
 <div class="codeblock"><pre>================ REPLICATION SERVER READY ================
- Console:   https://203.0.113.10:8080
+ Console:   https://203.0.113.10
+ Guide:     https://203.0.113.10/documentation
  Password:  681af4b11221bacb88e34080
  Cert SHA-256 (verify this in your browser's certificate dialog):
    AB:CD:...:EF</pre></div></li>
 <li>Keep that output — the password is also saved on the server at <code>/var/lib/vm-repl/initial-admin-password.txt</code>.</li>
 </ol>
-<div class="adm"><span class="t">Note</span>Useful installer flags: <code>--public-host &lt;ip&gt;</code> (if auto-detection picks the wrong address), <code>--region &lt;region&gt;</code> and <code>--port &lt;port&gt;</code> — both are only needed to <i>override</i> the defaults. The region is detected from the Linode Metadata service, and the port defaults to 8080. Once set, region and port are stored in <code>/etc/vm-repl/applianced.env</code>; re-running the installer to upgrade refreshes the service without overwriting them, so edit that file (then <code>systemctl restart applianced</code>) to change them later.</div>
+<div class="adm"><span class="t">Note</span>Useful installer flags: <code>--public-host &lt;ip&gt;</code> (if auto-detection picks the wrong address), <code>--region &lt;region&gt;</code> and <code>--port &lt;port&gt;</code> — both are only needed to <i>override</i> the defaults. The region is detected from the Linode Metadata service, and the port defaults to 443. Once set, region and port are stored in <code>/etc/vm-repl/applianced.env</code>; re-running the installer to upgrade refreshes the service without overwriting them, so edit that file (then <code>systemctl restart applianced</code>) to change them later.</div>
+<div class="adm tip"><span class="t">Tip</span>Prefer to build from source instead? <code>git clone https://github.com/Tiny125/vm-replication.git &amp;&amp; cd vm-replication &amp;&amp; sudo scripts/install-replication-server.sh</code> — the installer bootstraps its own build dependencies (Go toolchain, <code>make</code>, <code>gcc</code>). Useful when working from a branch, or on an architecture without a published release.</div>
 </section>
 
 <section id="sign-in">
 <h2>Sign in</h2>
-<p>Browse to <code>https://&lt;replication-server-ip&gt;:8080</code>. The console uses a <b>self-signed certificate</b>, so your browser warns on first visit — that is expected. Before entering the password, open the browser's certificate dialog and confirm the <b>SHA-256 fingerprint matches</b> the one the installer printed. Then sign in:</p>
+<p>Browse to <code>https://&lt;replication-server-ip&gt;</code>. The console uses a <b>self-signed certificate</b>, so your browser warns on first visit — that is expected. Before entering the password, open the browser's certificate dialog and confirm the <b>SHA-256 fingerprint matches</b> the one the installer printed. Then sign in:</p>
 <figure><img src="/documentation/img/login.png" alt="The console sign-in card"><figcaption>The sign-in page. The password was generated at install time.</figcaption></figure>
 <div class="adm tip"><span class="t">Tip</span>Forgot the password? Retrieve it on the replication server, without disturbing anything: <code>sudo /usr/local/bin/applianced -data-dir /var/lib/vm-repl -show-password</code></div>
 </section>

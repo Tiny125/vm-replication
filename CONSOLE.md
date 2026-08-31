@@ -186,7 +186,12 @@ production so an install doesn't silently move to whatever is newest next time
 you run it:
 
 ```bash
-sudo VMREPL_REF=v1.4.0 bash bootstrap.sh
+# piped, as in the one-command install above
+curl -fsSL https://raw.githubusercontent.com/Tiny125/vm-replication/main/scripts/bootstrap.sh \
+  | sudo VMREPL_REF=v0.1.0 bash
+
+# or, if you downloaded bootstrap.sh to inspect it first
+sudo VMREPL_REF=v0.1.0 bash bootstrap.sh
 ```
 
 **Flags pass straight through.** Anything you'd normally pass to
