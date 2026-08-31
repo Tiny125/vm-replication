@@ -1,0 +1,117 @@
+name: release
+
+# Cuts a GitHub Release with prebuilt, statically-linked linux/amd64 and
+# linux/arm64 binaries whenever a "vX.Y.Z" tag is pushed. This is what makes
+# the one-command bootstrap installer (scripts/bootstrap.sh) work without a
+# Go toolchain or gcc on the target machine.
+#
+# The release is GATED on the full test suite (build, vet, unit tests, and
+# the shell-level installer/converter tests): if any of it fails, no release
+# assets are ever produced or published.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate: nothing below runs unless this passes.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: go build
+        run: go build ./...
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./...
+      - name: shell-level installer/converter tests
+        run: |
+          bash scripts/machine-convert-test.sh
+          bash scripts/install-replication-server-test.sh
+      - name: bootstrap.sh unit tests
+        run: bash scripts/bootstrap-test.sh
+
+  # ---------------------------------------------------------------------------
+  # Cross-compile per arch (CGO_ENABLED=0, so no C toolchain needed for the
+  # target — the installer's own Go auto-install supports exactly these two
+  # arches, so this matches that set) and package the tarball bootstrap.sh
+  # expects: bin/{applianced,agent,receiver,controld,replctl} plus the three
+  # scripts install-replication-server.sh actually touches.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      CGO_ENABLED: 0
+      GOOS: linux
+      GOARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build binaries
+        run: make build
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          NAME="vm-replication_${TAG}_linux_${{ matrix.arch }}.tar.gz"
+          STAGE="$(mktemp -d)"
+          install -d "$STAGE/bin" "$STAGE/scripts"
+          install -m 0755 bin/applianced bin/agent bin/receiver bin/controld bin/replctl "$STAGE/bin/"
+          install -m 0755 scripts/install-replication-server.sh scripts/gen-certs.sh scripts/machine-convert.sh "$STAGE/scripts/"
+          # Tar from inside STAGE so the archive's paths are exactly "bin/..."
+          # and "scripts/...", with no wrapping directory — that is what
+          # bootstrap.sh extracts straight into its versioned install dir.
+          tar -czf "$NAME" -C "$STAGE" bin scripts
+          echo "ASSET_NAME=$NAME" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-asset-${{ matrix.arch }}
+          path: ${{ env.ASSET_NAME }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Gather both arch's tarballs, compute one SHA256SUMS covering both, and
+  # publish the release. This is the file bootstrap.sh downloads and verifies
+  # before it will extract anything.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-asset-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          sha256sum vm-replication_*_linux_*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/vm-replication_*_linux_*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true

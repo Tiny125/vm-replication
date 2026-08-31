@@ -38,6 +38,7 @@ test: test-scripts
 test-scripts:
 	bash scripts/machine-convert-test.sh
 	bash scripts/install-replication-server-test.sh
+	bash scripts/bootstrap-test.sh
 
 vet:
 	$(GO) vet ./...

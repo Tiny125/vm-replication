@@ -24,15 +24,47 @@ Full step-by-step process and sizing detail: [`CONSOLE.md`](CONSOLE.md#how-migra
 
 1. **Create a Linode** for the replication server (a 2 GB shared plan is
    enough; Ubuntu/Debian recommended) and SSH in as root.
-2. **Install everything with one command** — it bootstraps its own
-   dependencies, builds the binaries, generates certificates and an admin
-   password, and installs the `applianced` service:
+2. **Install with one command.** It downloads a prebuilt, checksum-verified
+   release binary for your CPU architecture (amd64 or arm64) — no Go
+   toolchain, no compiler needed on the server — generates certificates and
+   an admin password, and installs the `applianced` service:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Tiny125/vm-replication/main/scripts/bootstrap.sh | sudo bash
+   ```
+
+   For production, inspect the script before running it as root:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Tiny125/vm-replication/main/scripts/bootstrap.sh -o bootstrap.sh
+   less bootstrap.sh
+   sudo bash bootstrap.sh
+   ```
+
+   Pin a specific version instead of tracking the latest release with
+   `VMREPL_REF`, e.g. `sudo VMREPL_REF=v1.4.0 bash bootstrap.sh`. Any flags you'd
+   pass to the installer — `--port`, `--region`, `--public-host` — pass straight
+   through: `sudo bash bootstrap.sh --port 8443`. The download's SHA-256 is
+   always verified against the release's `SHA256SUMS` before anything is
+   extracted; if it doesn't match, bootstrap deletes the download and aborts.
+   If no prebuilt release exists yet for your arch, it falls back to fetching
+   the source and building it (this does require a Go toolchain + gcc, which
+   the fallback installs for you).
+
+   <details>
+   <summary>Alternative: build from a git checkout</summary>
 
    ```bash
    git clone https://github.com/Tiny125/vm-replication.git
    cd vm-replication
    sudo scripts/install-replication-server.sh
    ```
+
+   This bootstraps its own build dependencies (git, make, gcc, curl, openssl,
+   jq, tar, and a recent Go) and compiles the binaries locally instead of
+   downloading prebuilt ones. Useful for working from a branch, or on an
+   architecture without a published release.
+   </details>
 
 3. **Open the console** at `https://<replication-server-ip>` and sign in
    with the printed password (the browser warns about the self-signed

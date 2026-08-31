@@ -154,7 +154,56 @@ run.
 ## 1. Stand up the replication server
 
 Create a Linode (Ubuntu/Debian/RHEL-family — see sizing above), SSH in as root,
-and run:
+and run **one command**:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tiny125/vm-replication/main/scripts/bootstrap.sh | sudo bash
+```
+
+For production installs, inspect the script before piping it into a root
+shell — this is the same reason "curl | sudo bash" always deserves a second
+look:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Tiny125/vm-replication/main/scripts/bootstrap.sh -o bootstrap.sh
+less bootstrap.sh
+sudo bash bootstrap.sh
+```
+
+`bootstrap.sh` downloads the prebuilt release tarball matching this machine's
+CPU architecture (linux/amd64 or linux/arm64), **verifies its SHA-256 against
+the release's `SHA256SUMS` before extracting anything**, unpacks it to
+`/usr/local/src/vm-replication-<version>` (with a stable
+`/usr/local/src/vm-replication` symlink to it), and runs
+`scripts/install-replication-server.sh` from there. No Go toolchain, no
+compiler, no `git clone` needed — the binaries are prebuilt and static. If
+checksum verification fails, it deletes the download and aborts; nothing
+unverified is ever extracted or run.
+
+**Pinning a version.** By default bootstrap installs the latest published
+release. Set `VMREPL_REF` to pin an exact tag instead — recommended for
+production so an install doesn't silently move to whatever is newest next time
+you run it:
+
+```bash
+sudo VMREPL_REF=v1.4.0 bash bootstrap.sh
+```
+
+**Flags pass straight through.** Anything you'd normally pass to
+`install-replication-server.sh` — `--public-host`, `--region`, `--port` — works
+the same way through bootstrap, e.g. `sudo bash bootstrap.sh --port 8443`.
+Re-running bootstrap is safe and upgrades in place: the underlying installer
+already preserves an existing region/port, so it won't move a console that's
+already running.
+
+If no prebuilt release exists yet for your architecture (including a repo with
+no releases published at all), bootstrap **falls back to building from
+source** — it says so explicitly, fetches the source tarball, and needs a Go
+toolchain and gcc for that path (which `install-replication-server.sh`
+installs for you, same as below).
+
+<details>
+<summary>Alternative: build from a git checkout</summary>
 
 ```bash
 git clone https://github.com/Tiny125/vm-replication.git
@@ -165,10 +214,13 @@ sudo scripts/install-replication-server.sh
 The installer **bootstraps its own dependencies** — it installs `git`, `make`,
 `gcc`, `curl`, `openssl`, `jq`, `tar`, and a recent **Go** toolchain via the
 system package manager (apt/dnf/yum/zypper), then builds the binaries. A bare
-server with internet access is all you need.
+server with internet access is all you need. Useful when working from a
+branch, or on an architecture without a published release.
+</details>
 
-It builds the binaries, generates certificates and an **admin password**,
-installs a systemd service (`applianced`), and prints:
+Either way, you end up with the binaries built (or downloaded), certificates
+and an **admin password** generated, and a systemd service (`applianced`)
+installed, printing:
 
 ```
 ================ REPLICATION SERVER READY ================
