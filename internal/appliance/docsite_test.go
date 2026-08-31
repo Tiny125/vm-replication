@@ -112,6 +112,31 @@ func TestDocsImagesServed(t *testing.T) {
 	}
 }
 
+// The install step must document the one-command installer (bootstrap.sh),
+// which is now the supported path, and must not mention the old default port
+// (8080 — the console now defaults to 443, see enroll.go's consoleBaseURL).
+// A raw `git clone` step may still appear as a secondary "build from source"
+// note, but must not be the primary instruction any more.
+func TestDocsInstallStepUsesBootstrap(t *testing.T) {
+	s := &Server{}
+	rr := httptest.NewRecorder()
+	s.handleDocs(rr, httptest.NewRequest("GET", "/documentation", nil))
+	body := rr.Body.String()
+
+	for _, want := range []string{
+		"bootstrap.sh",
+		"curl -fsSL https://raw.githubusercontent.com/Tiny125/vm-replication/main/scripts/bootstrap.sh",
+		"VMREPL_REF",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("install step should mention %q (the one-command installer)", want)
+		}
+	}
+	if strings.Contains(body, "8080") {
+		t.Error("documentation still references the old default port 8080 — the console now defaults to 443")
+	}
+}
+
 // The console links to the documentation so operators can find the guide.
 func TestConsoleLinksDocumentation(t *testing.T) {
 	if !strings.Contains(consoleHTML, `href="/documentation"`) {

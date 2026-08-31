@@ -148,6 +148,49 @@ ENV
   return 0
 }
 
+# console_url HOST PORT — the console's own address, mirroring
+# internal/appliance/enroll.go's consoleBaseURL: omit the port when it is the
+# HTTPS default (443). "https://host:443/…" is noise in a line someone has to
+# read, trust and paste, and printing it would disagree with the URLs the
+# console itself generates.
+console_url() {
+  local host="$1" port="$2"
+  if [ "$port" = "443" ]; then
+    printf 'https://%s' "$host"
+  else
+    printf 'https://%s:%s' "$host" "$port"
+  fi
+}
+
+# wait_for_file PATH [TRIES] [SLEEP_S] — poll for PATH to appear, bounded.
+# Default is ~30s (60 tries x 0.5s). Returns success as soon as the file
+# exists, failure once TRIES is exhausted; never blocks forever.
+wait_for_file() {
+  local path="$1" tries="${2:-60}" sleep_s="${3:-0.5}" i
+  for i in $(seq 1 "$tries"); do
+    [ -f "$path" ] && return 0
+    sleep "$sleep_s"
+  done
+  [ -f "$path" ]
+}
+
+# console_fingerprint CERT_PATH [TRIES] [SLEEP_S] — the cert's SHA-256
+# fingerprint, waiting (bounded) for CERT_PATH to appear first.
+#
+# applianced self-signs $LIB/console.crt shortly AFTER the unit starts, so
+# checking for it immediately after `systemctl restart` is a race: on a real
+# install the file can lose that race, and the summary silently falls back to
+# a useless "see: journalctl" instead of the fingerprint the docs tell
+# operators to verify before typing the admin password. Poll instead of
+# treating a filesystem miss as "no cert". Prints nothing (never fails) if the
+# cert never appears within the bound, or if openssl is unavailable.
+console_fingerprint() {
+  local path="$1" tries="${2:-60}" sleep_s="${3:-0.5}"
+  command -v openssl >/dev/null 2>&1 || return 0
+  wait_for_file "$path" "$tries" "$sleep_s" || return 0
+  openssl x509 -in "$path" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//'
+}
+
 # Test hook: sourcing with VMREPL_INSTALL_LIB=1 loads the helpers above and
 # returns before the root check and any real work, so the resolution logic can be
 # unit-tested without root or a live metadata service.
@@ -339,16 +382,16 @@ PWFILE="$LIB/initial-admin-password.txt"
 for _ in $(seq 1 30); do [ -f "$PWFILE" ] && break; sleep 0.5; done
 
 # --- console cert fingerprint (printed so you can verify it in the browser) ---
-FPR=""
-if [ -f "$LIB/console.crt" ] && command -v openssl >/dev/null 2>&1; then
-  FPR="$(openssl x509 -in "$LIB/console.crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//')"
-fi
+# applianced self-signs $LIB/console.crt shortly AFTER the unit starts, so
+# console_fingerprint polls (bounded, ~30s) rather than checking once and
+# losing the race.
+FPR="$(console_fingerprint "$LIB/console.crt")"
 
 cat <<EOF
 
 ================ REPLICATION SERVER READY ================
- Console:   https://$PUBLIC_HOST:$PORT
- Guide:     https://$PUBLIC_HOST:$PORT/documentation
+ Console:   $(console_url "$PUBLIC_HOST" "$PORT")
+ Guide:     $(console_url "$PUBLIC_HOST" "$PORT")/documentation
  Password:  $( [ -f "$PWFILE" ] && cat "$PWFILE" || echo "see: journalctl -u applianced" )
  Cert SHA-256 (verify in the browser's certificate dialog):
    ${FPR:-see: journalctl -u applianced}
