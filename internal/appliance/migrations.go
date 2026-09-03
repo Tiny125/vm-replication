@@ -536,7 +536,17 @@ func (s *Server) reportQuiesceOutcome(m api.Migration, timedOut bool) bool {
 // an application's data and its write-ahead log/index/metadata live on
 // different disks. A single-disk migration structurally has no skew and gets
 // no entry (a "0s apart" event there would be meaningless noise); nor does a
-// migration where fewer than 2 disks actually landed a capture.
+// migration where fewer than 2 disks have a usable instant to compare.
+//
+// A disk that did NOT land a consistent capture still contributes: whatever
+// its last applied pass was is the instant the destination's copy of it
+// reflects. Measuring only across disks that quiesced successfully would miss
+// the ordinary — and most dangerous — multi-disk shape, since a running root
+// "almost never remounts read-only" (see quiesceForCutover) while a separate
+// data volume quiesces cleanly. That case has exactly one consistent capture,
+// so a consistent-only measurement reports nothing at all, precisely when the
+// disks are furthest apart. The 54s measured live (findings.md, F-14) was a
+// spread between final passes, not between successful quiesces.
 func (s *Server) recordCutoverSkew(m api.Migration) {
 	if len(m.Disks) < 2 {
 		return
@@ -546,7 +556,12 @@ func (s *Server) recordCutoverSkew(m api.Migration) {
 	for _, d := range m.Disks {
 		at, ok := s.diskConsistentAt(d.ID)
 		if !ok {
-			continue
+			// Fall back to the last applied pass — the instant this disk's
+			// replicated copy actually represents.
+			if d.LastSyncAt.IsZero() {
+				continue
+			}
+			at = d.LastSyncAt
 		}
 		n++
 		if earliest.IsZero() || at.Before(earliest) {
