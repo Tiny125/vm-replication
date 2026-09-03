@@ -843,6 +843,15 @@ async function startMig(id,btn){
   // a MULTI-disk local-disk migration still creates a Block Storage volume per
   // data disk, so the name applies there too.
   const nDisks=(meta.disks||[]).length;
+  // F-14: while the source keeps running, its disks are captured seconds-to-
+  // minutes apart from each other (measured: 54s apart on a two-disk test),
+  // so the destination's disks can reflect different instants — a real
+  // corruption risk if an application's data and its write-ahead log, index,
+  // or metadata live on different disks. The only way to guarantee every disk
+  // reflects the exact same instant is to power the source off before step 3.
+  // Single-disk migrations have no such gap, so this stays out of their way.
+  const multiDiskWarn=nDisks>1?('<div class="warn" style="margin-top:8px">Multi-disk migration — the disks are captured seconds-to-minutes apart.</div>'+
+    '<div class="muted" style="font-size:12px;margin-top:4px">While the source keeps running, each disk reaches its final consistent pass at a different moment (measured: 54s apart on a two-disk test), so the destination\'s disks can reflect different instants of the source — a real risk if an application\'s data and its write-ahead log/index/metadata live on different disks. The only way to guarantee every disk reflects the exact same instant is to <b>power the source off before step 3</b> (Launch instance).</div>'):'';
   if(!disk||nDisks>1)fields.push({id:'vol_name',label:(disk?'Name for the data volume(s) (optional)':'New volume name (optional)'),type:'text',placeholder:'default: '+defName});
   fields.push(
     {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
@@ -851,7 +860,7 @@ async function startMig(id,btn){
   const opts={
     title:'Cut over migration #'+id+' — step 1 of 3: stop replication & take a consistent pass',
     okText:'Stop replication & continue',
-    html:how+access+prep,
+    html:how+access+prep+multiDiskWarn,
     fields:fields,
     // Default to the read-only quiesce, with an opt-out for an
     // already-powered-off/idle source.
@@ -1205,6 +1214,14 @@ function migCard(v){
        '<a href="https://cloud.linode.com/volumes" target="_blank" rel="noopener">cloud.linode.com/volumes</a>): <code style="display:inline;padding:1px 5px">'+arts+'</code>. '+
        (m.launched_linode_id?('Launched Linode '+esc(m.launched_linode_id)+' — see <a href="https://cloud.linode.com/linodes" target="_blank" rel="noopener">your Linodes</a>.')
        :'To launch manually: create a Linode (same region), attach these volumes (boot disk = <b>sda</b>, data = sdb…), then add a config. If the boot disk has a <b>partition table + GRUB</b>, use kernel <code style="display:inline;padding:1px 5px">GRUB 2</code>; if it is a <b>partitionless whole-disk filesystem</b>, use a <b>Linode kernel</b> (e.g. “Latest 64-bit”) with root <code style="display:inline;padding:1px 5px">/dev/sda</code>. Then boot. The “Cutover” launch option picks the right kernel for you automatically.')+'</div>';
+  }
+
+  // F-14: a multi-disk migration's disks are captured at different instants
+  // while the source runs (measured live: up to 54s apart) — once a cutover
+  // has actually measured that spread, show it. Single-disk migrations never
+  // get a value here (no skew to show), so this stays silent for them.
+  if(v.cutover_skew_seconds){
+    b+='<div class="muted" style="font-size:12px;margin:2px 0 8px">Cutover disks captured '+Math.round(v.cutover_skew_seconds)+'s apart — the destination\'s disks may reflect instants up to '+Math.round(v.cutover_skew_seconds)+'s apart from each other.</div>';
   }
 
   // Disk-boot cutover, copy step: the appliance has booted the destination into

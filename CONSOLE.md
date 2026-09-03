@@ -633,6 +633,18 @@ instance** button enables.
 
 ## 7. Cut over the instance
 
+> **Multi-disk migrations: the disks are captured seconds-to-minutes apart.**
+> While the source keeps running, each disk reaches its final crash-consistent
+> pass at a different wall-clock moment — measured **54s apart** on a
+> two-disk test — so the destination's disks can reflect different instants
+> of the source. That's a real corruption risk if an application's data and
+> its write-ahead log, index, or metadata live on different disks. The
+> **only** way to guarantee every disk reflects the exact same instant is to
+> **power the source off before you launch** (step 3 below) — with the
+> source static, every disk is consistent. The card reports the measured
+> spread once a cutover has captured it. This does not apply to single-disk
+> migrations, which have no such gap.
+
 Cutover is **three steps: freeze the image, power off the source, launch**.
 
 1. Stop the source's apps/databases and let the **RPO lag drop to ~0** (shown on
