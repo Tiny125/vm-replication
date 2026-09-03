@@ -342,12 +342,15 @@ func (s *Server) wantDiskConsistency(diskID int64) bool {
 	return s.consistReq[diskID]
 }
 
-// markDiskConsistent records that a crash-consistent sync landed for this disk.
-// It deliberately leaves the request set so any further (live) pass before we
-// stop the receiver is still bounced — the last applied image stays consistent.
+// markDiskConsistent records that a crash-consistent sync landed for this disk,
+// and when — the timestamp is how a multi-disk cutover measures the spread
+// between disks' captures (F-14; see recordCutoverSkew). It deliberately
+// leaves the request set so any further (live) pass before we stop the
+// receiver is still bounced — the last applied image stays consistent.
 func (s *Server) markDiskConsistent(diskID int64) {
 	s.recMu.Lock()
 	s.consistDone[diskID] = true
+	s.consistAt[diskID] = time.Now()
 	s.recMu.Unlock()
 }
 
@@ -356,6 +359,15 @@ func (s *Server) diskConsistencyDone(diskID int64) bool {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
 	return s.consistDone[diskID]
+}
+
+// diskConsistentAt returns when a disk's crash-consistent sync landed (see
+// markDiskConsistent), and whether one has landed at all.
+func (s *Server) diskConsistentAt(diskID int64) (time.Time, bool) {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	at, ok := s.consistAt[diskID]
+	return at, ok
 }
 
 // markDiskQuiesceFailed records that a disk's agent reported it could not capture a
@@ -380,6 +392,7 @@ func (s *Server) clearConsistency(m api.Migration) {
 	for _, d := range m.Disks {
 		delete(s.consistReq, d.ID)
 		delete(s.consistDone, d.ID)
+		delete(s.consistAt, d.ID)
 		delete(s.quiesceErr, d.ID)
 	}
 	s.recMu.Unlock()
@@ -400,10 +413,20 @@ var consistencyPollEvery = 3 * time.Second
 // single instant — the key to a clean boot. If no agent is checking in, or the
 // agents are an older build that ignores the request, it warns and proceeds
 // with the current data.
+//
 // quiesceForCutover returns true only if every disk delivered a crash-consistent
 // pass (so the cloned image is a clean point-in-time). It returns false when there
 // is no agent to ask or the wait times out — the caller proceeds on the current
 // data, which may be inconsistent.
+//
+// F-14: this used to return false — and stop waiting on every OTHER disk — the
+// moment ANY single disk reported it could not quiesce. A running root almost
+// never remounts read-only, so on a multi-disk source the root's (expected)
+// refusal used to abandon the wait for a data disk that would very likely have
+// quiesced cleanly on its own. Now it waits until EVERY disk has reached a
+// definite outcome (consistent, or definitively refused) — or the deadline
+// below passes — before deciding, and reports the per-disk outcome in one
+// event (see reportQuiesceOutcome).
 func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) bool {
 	anyAgent := false
 	for _, d := range m.Disks {
@@ -423,31 +446,24 @@ func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) bool {
 		if ctx.Err() != nil {
 			return false
 		}
-		// Fail fast if any agent has actively reported it cannot quiesce — no point
-		// waiting out the timeout when we already know a consistent image won't come.
+		// A disk has a definite outcome once it is either consistent or has
+		// actively reported it cannot quiesce. Wait for every disk to reach one
+		// before deciding — a disk that hasn't reported anything yet might still
+		// land a consistent pass.
+		allSettled := true
 		for _, d := range m.Disks {
-			if reason, failed := s.diskQuiesceFailed(d.ID); failed {
-				// info, not warn: a running root almost never remounts read-only, so
-				// this is the normal path, not a fault. The single warn that follows
-				// explains the fallback and exactly what it costs.
-				_ = s.st.AddEvent(s.ctx, m.ID, "info", "cutover: the source could not be paused for a point-in-time image ("+reason+")")
-				return false
+			if s.diskConsistencyDone(d.ID) {
+				continue
 			}
-		}
-		allDone := true
-		for _, d := range m.Disks {
-			if !s.diskConsistencyDone(d.ID) {
-				allDone = false
-				break
+			if _, failed := s.diskQuiesceFailed(d.ID); failed {
+				continue
 			}
+			allSettled = false
+			break
 		}
-		if allDone {
-			_ = s.st.AddEvent(s.ctx, m.ID, "info", "cutover: crash-consistent snapshot captured on all disks; converting and cloning the point-in-time image")
-			return true
-		}
-		if time.Now().After(deadline) {
-			_ = s.st.AddEvent(s.ctx, m.ID, "warn", "cutover: timed out waiting for a crash-consistent snapshot from the source (the agent may be an older build, or offline, or the root could not be quiesced — stop the source's apps so its root can be remounted read-only); proceeding with the current replicated data, which may be inconsistent")
-			return false
+		timedOut := time.Now().After(deadline)
+		if allSettled || timedOut {
+			return s.reportQuiesceOutcome(m, timedOut && !allSettled)
 		}
 		select {
 		case <-ctx.Done():
@@ -455,6 +471,114 @@ func (s *Server) quiesceForCutover(ctx context.Context, m api.Migration) bool {
 		case <-time.After(consistencyPollEvery):
 		}
 	}
+}
+
+// reportQuiesceOutcome logs ONE activity event summarizing, per disk (index +
+// source device path), whether a crash-consistent point-in-time snapshot was
+// captured before cutover proceeds, records the cutover skew across the disks
+// that did capture one (F-14; see recordCutoverSkew), and returns true only
+// when every disk captured one.
+//
+// timedOut marks that the wait hit consistencyWait's deadline with at least
+// one disk neither consistent nor definitively refused — used to choose info
+// vs warn: a source explicitly refusing to quiesce is the ordinary case for a
+// running root and stays "info" (see the comment on the loop above and at the
+// call site), matching the pre-existing judgement; a wait that timed out
+// without an answer gets the one explanatory warn about what the fallback
+// costs. Either way this logs exactly one event — never one per disk — so a
+// multi-disk cutover doesn't repeat the same warning once per disk (duplicate
+// warnings were a real complaint; see the "Deliberately NOT an activity
+// event" comment on the quiesce-failure report in setupReceiver, above).
+func (s *Server) reportQuiesceOutcome(m api.Migration, timedOut bool) bool {
+	var consistent, notConsistent []string
+	allConsistent := true
+	for _, d := range m.Disks {
+		label := fmt.Sprintf("disk %d (%s)", d.Index, d.SourceDevice)
+		if s.diskConsistencyDone(d.ID) {
+			consistent = append(consistent, label)
+			continue
+		}
+		allConsistent = false
+		if reason, failed := s.diskQuiesceFailed(d.ID); failed {
+			notConsistent = append(notConsistent, label+": "+reason)
+		} else {
+			notConsistent = append(notConsistent, label+": timed out waiting for a consistent pass")
+		}
+	}
+	s.recordCutoverSkew(m)
+	if allConsistent {
+		_ = s.st.AddEvent(s.ctx, m.ID, "info", "cutover: crash-consistent snapshot captured on all disks; converting and cloning the point-in-time image")
+		return true
+	}
+	var summary string
+	if len(consistent) > 0 {
+		summary = fmt.Sprintf("cutover: point-in-time snapshot captured on %s; NOT captured on %s — those disks are cloned from the current replicated data as-is",
+			strings.Join(consistent, ", "), strings.Join(notConsistent, ", "))
+	} else {
+		summary = fmt.Sprintf("cutover: no disk captured a point-in-time snapshot (%s) — cloning the current replicated data as-is",
+			strings.Join(notConsistent, ", "))
+	}
+	if timedOut {
+		_ = s.st.AddEvent(s.ctx, m.ID, "warn", summary+fmt.Sprintf(" (timed out after %s waiting for a crash-consistent snapshot from the source; the agent may be an older build, or offline, or the root could not be quiesced — stop the source's apps so its root can be remounted read-only)", consistencyWait))
+	} else {
+		// info, not warn: a running root almost never remounts read-only, so
+		// this is the normal path for a live source, not a fault.
+		_ = s.st.AddEvent(s.ctx, m.ID, "info", summary)
+	}
+	return false
+}
+
+// recordCutoverSkew measures how far apart (wall clock) this migration's
+// disks landed their cutover-time crash-consistent captures and records it
+// for the API/console (F-14; see the cutoverSkew field). Measured live on a
+// two-disk source: 54 seconds apart, with the destination's root reflecting
+// an instant 54s earlier than its data volume — a real corruption risk when
+// an application's data and its write-ahead log/index/metadata live on
+// different disks. A single-disk migration structurally has no skew and gets
+// no entry (a "0s apart" event there would be meaningless noise); nor does a
+// migration where fewer than 2 disks have a usable instant to compare.
+//
+// A disk that did NOT land a consistent capture still contributes: whatever
+// its last applied pass was is the instant the destination's copy of it
+// reflects. Measuring only across disks that quiesced successfully would miss
+// the ordinary — and most dangerous — multi-disk shape, since a running root
+// "almost never remounts read-only" (see quiesceForCutover) while a separate
+// data volume quiesces cleanly. That case has exactly one consistent capture,
+// so a consistent-only measurement reports nothing at all, precisely when the
+// disks are furthest apart. The 54s measured live (findings.md, F-14) was a
+// spread between final passes, not between successful quiesces.
+func (s *Server) recordCutoverSkew(m api.Migration) {
+	if len(m.Disks) < 2 {
+		return
+	}
+	var earliest, latest time.Time
+	n := 0
+	for _, d := range m.Disks {
+		at, ok := s.diskConsistentAt(d.ID)
+		if !ok {
+			// Fall back to the last applied pass — the instant this disk's
+			// replicated copy actually represents.
+			if d.LastSyncAt.IsZero() {
+				continue
+			}
+			at = d.LastSyncAt
+		}
+		n++
+		if earliest.IsZero() || at.Before(earliest) {
+			earliest = at
+		}
+		if at.After(latest) {
+			latest = at
+		}
+	}
+	if n < 2 {
+		return
+	}
+	spread := latest.Sub(earliest)
+	s.cutoverSkew.Store(m.ID, spread)
+	_ = s.st.AddEvent(s.ctx, m.ID, "warn", fmt.Sprintf(
+		"cutover: this migration's disks were captured %s apart — the destination's disks may reflect instants up to %s apart from each other. That's a real corruption risk if an application's data and its write-ahead log/index/metadata live on different disks; powering the source off before cutover is the only way to guarantee a single instant.",
+		spread.Round(time.Second), spread.Round(time.Second)))
 }
 
 // receiverHandle tracks one disk receiver: cancel stops it (closes the
@@ -2265,6 +2389,12 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	v.UninstallCmd = s.uninstallCmd()
 	v.CutoverCopyCmd = s.cutoverCopyCmdFor(m.ID)
 	v.CutoverFreezing = s.cutoverFreezingFor(m.ID)
+	// F-14: the measured spread between this migration's disks' cutover-time
+	// captures, if any landed (recordCutoverSkew never sets one for a
+	// single-disk migration, which has no skew to report).
+	if sp, ok := s.cutoverSkew.Load(m.ID); ok {
+		v.CutoverSkewSeconds = sp.(time.Duration).Seconds()
+	}
 
 	// Reflect readiness in the displayed status so the operator can see at a
 	// glance when it's safe to cut over: a replicating migration whose disks are

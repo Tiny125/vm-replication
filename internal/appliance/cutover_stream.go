@@ -3,6 +3,7 @@ package appliance
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/tiny125/vm-replication/internal/api"
 	"github.com/tiny125/vm-replication/internal/blockdiff"
 )
 
@@ -47,8 +49,131 @@ func (s *Server) registerCutoverStream(migID int64, path string, bytes int64, tt
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	tok := hex.EncodeToString(b)
-	s.cutoverStreams.Store(tok, &cutoverStream{migID: migID, path: path, bytes: bytes, expires: time.Now().Add(ttl)})
+	expires := time.Now().Add(ttl)
+	s.cutoverStreams.Store(tok, &cutoverStream{migID: migID, path: path, bytes: bytes, expires: expires})
+	s.persistCutoverStream(migID, tok, path, bytes, expires, "")
 	return tok
+}
+
+// ---- F-24: survive an appliance restart mid-cutover -----------------------
+//
+// A disk-boot cutover parks in `migrating` with a live rescue instance while
+// it waits for the operator to paste the Lish copy command. Before this, the
+// token (registerCutoverStream) and the command text (setCutoverCopyCmd)
+// lived ONLY in memory, so restarting applianced during that wait (an
+// upgrade, a crash, a service restart) dropped both — measured live:
+//
+//	state: migrating | phase: finalizing (convert + clone)
+//	copy cmd present: False        <- the card no longer shows a command
+//	launched id: 103564624         <- the rescue instance is still running
+//
+// leaving the migration unfinishable with nothing explaining why (recovery
+// was Stop-then-Start, undiscoverable from the UI).
+//
+// persistedCutoverStream is the durable, JSON-encoded copy of a
+// cutoverStream plus its console copy command, stored per-migration in the
+// existing settings table (no schema migration / new table). It is written on
+// register/setCmd and read back at startup by restoreCutoverStream.
+//
+// Security note: the token is a bearer credential (anyone holding it can
+// download the migrated image via /cutover/image), so this now stores it at
+// rest in the appliance's SQLite database. That is an accepted, deliberate
+// trade-off — the same database already holds the Linode API token at rest
+// (see SetLinodeToken) — made so a restart can recover an in-flight cutover
+// instead of stranding it.
+type persistedCutoverStream struct {
+	Token   string `json:"token"`
+	Path    string `json:"path"`
+	Bytes   int64  `json:"bytes"`
+	Expires int64  `json:"expires"` // unix seconds
+	Cmd     string `json:"cmd"`     // the Lish copy command shown on the card; "" until setCutoverCopyCmd runs
+}
+
+// cutoverStreamSettingKey is the settings-table key holding one migration's
+// persisted cutover stream (see persistedCutoverStream).
+func cutoverStreamSettingKey(migID int64) string {
+	return fmt.Sprintf("cutover_stream:%d", migID)
+}
+
+// persistCutoverStream writes (or updates) the durable copy of a migration's
+// cutover stream so restoreCutoverStream can rebuild it after a restart. A nil
+// store (bare Server{} used by unit tests that only exercise the in-memory
+// registry) is a deliberate no-op, not an error.
+func (s *Server) persistCutoverStream(migID int64, token, path string, bytes int64, expires time.Time, cmd string) {
+	if s.st == nil {
+		return
+	}
+	rec := persistedCutoverStream{Token: token, Path: path, Bytes: bytes, Expires: expires.Unix(), Cmd: cmd}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		log.Printf("appliance: persist cutover stream for migration %d: %v", migID, err)
+		return
+	}
+	if err := s.st.SetSetting(s.ctx, cutoverStreamSettingKey(migID), string(b)); err != nil {
+		log.Printf("appliance: persist cutover stream for migration %d: %v", migID, err)
+	}
+}
+
+// restoreCutoverStream rebuilds a migration's in-memory cutover stream + copy
+// command from the durable settings-store copy, called from
+// StartActiveReceivers so a disk-boot cutover waiting on the operator's Lish
+// paste survives an appliance restart. Returns false — and clears the
+// persisted entry — when there is nothing persisted, it can't be decoded, or
+// its expiry has already passed: an expired token would just 403 the moment
+// it's pasted, so restoring it would show a copy command that can never work.
+func (s *Server) restoreCutoverStream(migID int64) bool {
+	if s.st == nil {
+		return false
+	}
+	v, ok, err := s.st.GetSetting(s.ctx, cutoverStreamSettingKey(migID))
+	if err != nil || !ok {
+		return false
+	}
+	var rec persistedCutoverStream
+	if err := json.Unmarshal([]byte(v), &rec); err != nil {
+		log.Printf("appliance: restore cutover stream for migration %d: %v", migID, err)
+		_ = s.st.DeleteSetting(s.ctx, cutoverStreamSettingKey(migID))
+		return false
+	}
+	expires := time.Unix(rec.Expires, 0)
+	if !time.Now().Before(expires) {
+		// Past its budget — restoring it would only show a copy command whose
+		// token 403s immediately. Clear it so the console and the state machine
+		// agree there is nothing left to resume.
+		_ = s.st.DeleteSetting(s.ctx, cutoverStreamSettingKey(migID))
+		return false
+	}
+	s.cutoverStreams.Store(rec.Token, &cutoverStream{migID: migID, path: rec.Path, bytes: rec.Bytes, expires: expires})
+	if rec.Cmd != "" {
+		s.cutoverCmds.Store(migID, rec.Cmd)
+	}
+	return true
+}
+
+// restoreCutoverState is called from StartActiveReceivers for every migration
+// found in `migrating` at startup. Only disk-boot cutover ever streams via a
+// Lish copy command, so a volume-boot migration (or anything mid-finalize
+// before a stream would even exist yet) is left alone. When a stream can be
+// restored, the console gets its copy command back and the operator is told
+// so. When it can't AND a rescue instance is already running (LaunchedID
+// set), this is the F-24 safety net: name the situation and the exact
+// recovery action on the migration's own activity log — matching the tone of
+// the restart message in StartActiveReceivers (say what happened, and
+// reassure/point at the fix) — instead of leaving the operator to discover a
+// vanished copy command with no explanation.
+func (s *Server) restoreCutoverState(m api.Migration) {
+	if m.BootTarget != api.BootTargetDisk {
+		return
+	}
+	if s.restoreCutoverStream(m.ID) {
+		_ = s.st.AddEvent(s.ctx, m.ID, "info",
+			"the appliance service restarted — the pending rescue-mode copy command has been restored below. If you already pasted the previous one, paste this one instead (the old token stopped working).")
+		return
+	}
+	if m.LaunchedID != 0 {
+		_ = s.st.AddEvent(s.ctx, m.ID, "warn",
+			"the appliance service restarted while this migration was mid-cutover, and its rescue-mode copy command could not be recovered (it had already expired, or was never issued yet). This card cannot finish the cutover as-is: click Stop, then Start the migration again to launch a fresh cutover from a clean state.")
+	}
 }
 
 // lookupCutoverStream resolves a token, enforcing expiry.
@@ -66,7 +191,9 @@ func (s *Server) lookupCutoverStream(token string) (*cutoverStream, bool) {
 }
 
 // dropCutoverStream invalidates a migration's stream token(s) and console copy
-// command — called when its cutover finishes, fails, or is cancelled.
+// command — called when its cutover finishes, fails, or is cancelled. Also
+// clears the durable copy (see persistCutoverStream): once a cutover is done,
+// a later restart must not resurrect it.
 func (s *Server) dropCutoverStream(migID int64) {
 	s.cutoverStreams.Range(func(k, v any) bool {
 		if v.(*cutoverStream).migID == migID {
@@ -75,11 +202,39 @@ func (s *Server) dropCutoverStream(migID int64) {
 		return true
 	})
 	s.cutoverCmds.Delete(migID)
+	if s.st != nil {
+		_ = s.st.DeleteSetting(s.ctx, cutoverStreamSettingKey(migID))
+	}
 }
 
 // setCutoverCopyCmd records the one-line Lish command the console shows while a
-// disk-boot cutover waits for the operator to run the copy.
-func (s *Server) setCutoverCopyCmd(migID int64, cmd string) { s.cutoverCmds.Store(migID, cmd) }
+// disk-boot cutover waits for the operator to run the copy, and fills the Cmd
+// field into the persisted record registerCutoverStream already wrote (the
+// command text isn't known yet at register time).
+func (s *Server) setCutoverCopyCmd(migID int64, cmd string) {
+	s.cutoverCmds.Store(migID, cmd)
+	if s.st == nil {
+		return
+	}
+	v, ok, err := s.st.GetSetting(s.ctx, cutoverStreamSettingKey(migID))
+	if err != nil || !ok {
+		return
+	}
+	var rec persistedCutoverStream
+	if err := json.Unmarshal([]byte(v), &rec); err != nil {
+		log.Printf("appliance: update persisted cutover command for migration %d: %v", migID, err)
+		return
+	}
+	rec.Cmd = cmd
+	b, err := json.Marshal(rec)
+	if err != nil {
+		log.Printf("appliance: update persisted cutover command for migration %d: %v", migID, err)
+		return
+	}
+	if err := s.st.SetSetting(s.ctx, cutoverStreamSettingKey(migID), string(b)); err != nil {
+		log.Printf("appliance: update persisted cutover command for migration %d: %v", migID, err)
+	}
+}
 
 // cutoverCopyCmdFor returns that command, or "" when no copy is pending.
 func (s *Server) cutoverCopyCmdFor(migID int64) string {

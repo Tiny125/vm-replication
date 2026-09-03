@@ -62,6 +62,12 @@ type Server struct {
 	// such a crash-consistent sync.
 	consistReq  map[int64]bool
 	consistDone map[int64]bool
+	// consistAt records WHEN (wall clock) each disk's consistDone landed, so a
+	// multi-disk cutover can measure how far apart the disks were actually
+	// captured (F-14: measured 54s apart on a live two-disk source). Keyed by
+	// diskID, guarded by recMu like the maps above; only ever read for disks
+	// present in consistDone.
+	consistAt map[int64]time.Time
 	// quiesceErr records that a disk's agent reported it could not capture a
 	// consistent image for cutover (keyed by diskID), so the wait can fail fast.
 	quiesceErr map[int64]string
@@ -88,6 +94,12 @@ type Server struct {
 	// freeze) is currently running, so the console can tell the operator to keep
 	// the source running until the card says to power it off.
 	cutoverFreezing sync.Map
+	// cutoverSkew holds the measured spread (F-14) between a multi-disk
+	// migration's disks' cutover-time crash-consistent captures, so the API/
+	// console can show it after the fact: migrationID -> time.Duration.
+	// Overwritten by each new cutover attempt; single-disk migrations never
+	// get an entry (see recordCutoverSkew).
+	cutoverSkew sync.Map
 	// Host specs of the appliance itself, read once in New(); see health.go.
 	vcpus    int
 	memBytes int64
@@ -122,6 +134,7 @@ func New(ctx context.Context, cfg Config) *Server {
 		receivers:      map[int64]*receiverHandle{},
 		finalizes:      map[int64]context.CancelFunc{},
 		consistReq:     map[int64]bool{},
+		consistAt:      map[int64]time.Time{},
 		consistDone:    map[int64]bool{},
 		quiesceErr:     map[int64]string{},
 		pendingCutover: map[int64]api.FinalizeRequest{},
@@ -622,6 +635,13 @@ func (s *Server) StartActiveReceivers() {
 			// half-way (see receiver.applyStaged).
 			_ = s.st.AddEvent(s.ctx, m.ID, "info",
 				"the appliance service restarted — receivers are back up and replication continues. A copy pass that was in flight was discarded whole (never applied half-way) and the agent retries within ~60s.")
+		case api.MigMigrating:
+			// F-24: nothing resumes a mid-finalize run after a restart — unlike the
+			// replication states above, there is no receiver to bring back here. For
+			// a disk-boot cutover specifically, try to restore the rescue-mode
+			// stream token + Lish copy command so a restart during that wait
+			// doesn't strand it (see restoreCutoverState).
+			s.restoreCutoverState(m)
 		}
 	}
 }

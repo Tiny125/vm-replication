@@ -395,6 +395,7 @@ Re-running is safe and upgrades in place: an existing region and port are preser
 <li><b>Launch.</b> Press <span class="btn-demo primary">Launch instance</span>: the new Linode boots into Rescue Mode and the card shows a one-line copy command — paste it in the instance's Lish console. The image streams onto the local disk and the instance boots automatically once the copy finishes.</li>
 </ol>
 <div class="adm tip"><span class="t">Tip</span>Before starting the cutover, stop the source's databases/heavy writers and let the RPO lag drop to ~0 so the final pass is small and current.</div>
+<div class="adm warn"><span class="t">Warning — multi-disk migrations</span>While the source keeps running, its disks are captured seconds-to-minutes apart from each other, not at one shared instant (measured: 54s apart on a two-disk test) — a real corruption risk if an application's data and its write-ahead log, index, or metadata live on different disks. The only way to guarantee every disk reflects the exact same instant is to <b>power the source off before completing the cutover</b> (step 3, above).</div>
 </section>
 
 <section id="finish">

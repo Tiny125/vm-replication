@@ -38,6 +38,7 @@ func TestGuidedCutoverFallsBackWhenQuiesceFails(t *testing.T) {
 		finalizes:      map[int64]context.CancelFunc{},
 		consistReq:     map[int64]bool{},
 		consistDone:    map[int64]bool{},
+		consistAt:      map[int64]time.Time{},
 		quiesceErr:     map[int64]string{},
 		pendingCutover: map[int64]api.FinalizeRequest{},
 	}

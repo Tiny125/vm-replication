@@ -343,6 +343,15 @@ type MigrationView struct {
 	PercentDone    float64 `json:"percent_done"`
 	ETASeconds     int64   `json:"eta_seconds"`
 	ElapsedSeconds int64   `json:"elapsed_seconds"`
+
+	// CutoverSkewSeconds (F-14) is the measured spread between this
+	// migration's disks' most recent point-in-time cutover captures — how far
+	// apart the destination's disks reflect different instants, because a
+	// running source's disks are replicated (and quiesced) one at a time, not
+	// in lockstep. 0/omitted for a single-disk migration, which structurally
+	// has no skew to report, and before any multi-disk cutover pass has
+	// landed.
+	CutoverSkewSeconds float64 `json:"cutover_skew_seconds,omitempty"`
 }
 
 // ConnTestRequest asks the appliance to probe network reachability to a source.
