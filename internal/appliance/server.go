@@ -350,13 +350,10 @@ func (s *Server) handleSetLinodeToken(w http.ResponseWriter, r *http.Request) {
 	// typo or revoked token is rejected immediately instead of failing later
 	// during provisioning. GET /profile also tells us which account it belongs to.
 	ctx := r.Context()
-	prof, err := linode.New(token).GetProfile(ctx)
+	cl := s.newLinode(token)
+	prof, err := cl.GetProfile(ctx)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "Linode rejected this token — check it is valid and has Linodes + Volumes read/write: "+err.Error())
-		return
-	}
-	if err := s.st.SetLinodeToken(ctx, token); err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	account := prof.Username
@@ -364,6 +361,32 @@ func (s *Server) handleSetLinodeToken(w http.ResponseWriter, r *http.Request) {
 		account = prof.Username + " <" + prof.Email + ">"
 	} else if account == "" {
 		account = prof.Email
+	}
+	// F-26: the appliance attaches every replication volume TO ITSELF, so the
+	// token must belong to the account that owns the appliance Linode.
+	// Otherwise this is only discovered later, at migration-create time, as a
+	// raw "403 Forbidden: You do not have permission to access this Linode"
+	// that misdirects the operator toward token SCOPES when the real problem
+	// is the wrong ACCOUNT. Catch it here instead, before the token is even
+	// saved. Only a DEFINITE 403/404 on the lookup means "not in this
+	// account" — a transient/5xx/network error must not block saving an
+	// otherwise-valid token. Skipped entirely when no appliance Linode is
+	// configured (non-automation mode: ApplianceLinodeID == 0).
+	if s.cfg.ApplianceLinodeID != 0 {
+		if _, err := cl.GetInstance(ctx, s.cfg.ApplianceLinodeID); err != nil {
+			if linode.IsForbidden(err) || linode.IsNotFound(err) {
+				writeErr(w, http.StatusBadRequest, fmt.Sprintf(
+					"this token belongs to %s, but the replication server (Linode %d) is not in that account — the server attaches replication volumes to itself, so create the token on the account that owns this server",
+					account, s.cfg.ApplianceLinodeID))
+				return
+			}
+			// Transient/unrelated failure (network error, 5xx, etc.) — don't
+			// block saving the token on the strength of a flaky lookup.
+		}
+	}
+	if err := s.st.SetLinodeToken(ctx, token); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	_ = s.st.SetLinodeAccount(ctx, account)
 	// Provision the audit-log bucket (best-effort: a failure here, e.g. the token

@@ -358,11 +358,19 @@ server and is only ever sent to `api.linode.com`.
 7. Paste it into the console's token field and **Save**. The console will show
    "✔ Linode API token stored".
 
-> Create the token on the **same account** that owns the replication server, and
-> make sure that account can create volumes in the server's region. Treat the
-> token like a password — anyone holding it can create/delete resources (and
-> incur charges) on your account. You can revoke it anytime from the same API
-> Tokens page; provisioning/finalize will then fail until you save a new one.
+> Create the token on the **same account** that owns the replication server —
+> the appliance attaches every replication volume **to itself**, so a token
+> from a different account fails as soon as it tries to attach one, and make
+> sure that account can create volumes in the server's region. The console now
+> checks this automatically when you save the token (it looks up the
+> replication server's own Linode id through the token and rejects a mismatch
+> by name, e.g. "this token belongs to `<account>`, but the replication server
+> (Linode `<id>`) is not in that account"), so a wrong-account token is caught
+> here rather than failing later, mid-migration, with a raw "403 Forbidden"
+> that misleadingly points at token scopes. Treat the token like a password —
+> anyone holding it can create/delete resources (and incur charges) on your
+> account. You can revoke it anytime from the same API Tokens page;
+> provisioning/finalize will then fail until you save a new one.
 
 ### Audit logs (Linode Object Storage)
 
