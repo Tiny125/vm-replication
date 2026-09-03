@@ -78,9 +78,20 @@ func TestApplianceUndersized(t *testing.T) {
 		{"enough RAM but one core", 1, 8 << 30, true},
 		{"enough cores but little RAM", 4, 2 << 30, true},
 		{"unknown RAM must not be treated as low", 2, 0, false},
+		// F-27: the recommendation is a PLAN LABEL (4096 MB advertised), but
+		// memBytes is what the GUEST sees via /proc/meminfo, which is always a
+		// bit less than the advertised size because the kernel reserves some.
+		// Measured live on g6-standard-2, the exact plan CONSOLE.md recommends:
+		// the guest reports MemTotal = 4009868 kB, ~180 MiB short of 4 GiB.
+		{"g6-standard-2 as its guest actually reports MemTotal", 2, 4009868 * 1024, false},
+		// A real 2 GB plan's guest, by the same reserve-shrinkage rule of thumb
+		// (~95% of the advertised 2013265920 B), must still read as undersized.
+		{"a real 2 GB plan's guest MemTotal", 2, 1912602624, true},
+		// The vCPU gate must fire regardless of how much RAM is present.
+		{"1 vCPU is undersized even with plenty of RAM", 1, 8 << 30, true},
 	} {
 		if got := applianceUndersized(tc.vcpus, tc.mem); got != tc.want {
-			t.Errorf("%s: undersized = %v, want %v", tc.name, got, tc.want)
+			t.Errorf("%s: undersized(%d, %d) = %v, want %v", tc.name, tc.vcpus, tc.mem, got, tc.want)
 		}
 	}
 }

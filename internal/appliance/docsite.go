@@ -272,7 +272,7 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
 
 <section id="install">
 <h2>Install the replication server</h2>
-<p>You need one Linode to act as the replication server. A <b>2&nbsp;GB shared plan</b> is enough for 1–3 concurrent block disks (see <code>CONSOLE.md</code> in the repository for detailed sizing).</p>
+<p>You need one Linode to act as the replication server. <b>2 vCPU / 4 GB shared</b> (e.g. <code>g6-standard-2</code>) is enough for 1–3 concurrent block disks (see <code>CONSOLE.md</code> in the repository for detailed sizing, including larger workloads).</p>
 <ol class="steps">
 <li>Create a Linode (Ubuntu or Debian recommended) and SSH in as <b>root</b>.</li>
 <li>Run the one-command installer:
@@ -314,6 +314,7 @@ Re-running is safe and upgrades in place: an existing region and port are preser
 <section id="api-token">
 <h2>Add your Linode API token</h2>
 <p>The token lets the console act on your Linode account: provision replication volumes, clone disks, and launch the cutover instance. It's needed for everything past evaluation — provisioning volumes, cloning disks, and launching the cutover instance.</p>
+<div class="adm warn"><span class="t">Warning</span>Create the token on the <b>same account that owns the replication server</b>. The appliance attaches every replication volume <b>to itself</b>, so a token from a different account can list/plan things but fails as soon as it tries to attach a volume. The console checks this automatically when you save the token and rejects a mismatched one by name (the account it found vs. the server it doesn't belong to), instead of letting it fail later with a raw "403 Forbidden" during a migration.</div>
 <ol class="steps">
 <li>Sign in to <a href="https://cloud.linode.com/profile/tokens" target="_blank" rel="noopener">Linode Cloud Manager → Profile → API Tokens</a> and create a <b>Personal Access Token</b> with scopes:
 <table>

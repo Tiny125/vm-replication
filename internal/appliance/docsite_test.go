@@ -153,6 +153,55 @@ func TestDocsInstallStepUsesBootstrap(t *testing.T) {
 	}
 }
 
+// F-28: the install step's sizing sentence must agree with CONSOLE.md's sizing
+// table (2 vCPU / 4 GB shared, e.g. g6-standard-2, for 1-3 concurrent block
+// disks) and with health.go's own recommendedVCPUs/recommendedMemBytes
+// constants. It must not recommend a 2 GB plan — the console's own
+// "appliance undersized" check (applianceUndersized) would immediately flag a
+// 2 GB / 1 vCPU appliance built by following this guide.
+func TestDocsInstallStepRecommendsSizedPlan(t *testing.T) {
+	s := &Server{}
+	rr := httptest.NewRecorder()
+	s.handleDocs(rr, httptest.NewRequest("GET", "/documentation", nil))
+	body := rr.Body.String()
+
+	for _, want := range []string{"2 vCPU", "4 GB", "g6-standard-2", "CONSOLE.md"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("install step should recommend a sized plan mentioning %q", want)
+		}
+	}
+	if strings.Contains(body, "2&nbsp;GB shared plan") || strings.Contains(body, "2 GB shared plan") {
+		t.Error("install step still recommends an undersized 2 GB shared plan, contradicting CONSOLE.md and health.go's applianceUndersized")
+	}
+}
+
+// F-26: the served guide's #api-token section must state the account
+// requirement (the appliance attaches replication volumes to itself, so the
+// token must belong to the account that owns the replication server) — not
+// just CONSOLE.md, which a console user reading only the served guide never
+// sees.
+func TestDocsApiTokenStatesAccountRequirement(t *testing.T) {
+	s := &Server{}
+	rr := httptest.NewRecorder()
+	s.handleDocs(rr, httptest.NewRequest("GET", "/documentation", nil))
+	body := rr.Body.String()
+
+	i := strings.Index(body, `id="api-token"`)
+	if i < 0 {
+		t.Fatal("no #api-token section found")
+	}
+	end := strings.Index(body[i:], "</section>")
+	if end < 0 {
+		t.Fatal("#api-token section has no closing tag")
+	}
+	section := body[i : i+end]
+	for _, want := range []string{"same account", "attaches", "itself"} {
+		if !strings.Contains(section, want) {
+			t.Errorf("#api-token section should mention %q (the account-ownership requirement), got: %s", want, section)
+		}
+	}
+}
+
 // The console links to the documentation so operators can find the guide.
 func TestConsoleLinksDocumentation(t *testing.T) {
 	if !strings.Contains(consoleHTML, `href="/documentation"`) {

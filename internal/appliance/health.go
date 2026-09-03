@@ -42,6 +42,20 @@ const (
 	recommendedMemBytes = 4 << 30
 )
 
+// minMemBytes is the actual comparison floor used by applianceUndersized. It is
+// deliberately LESS than recommendedMemBytes: recommendedMemBytes is the plan's
+// ADVERTISED size (a label like "4 GB"), but the value we compare it against
+// (hostSpecs' memBytes, read from /proc/meminfo MemTotal) is what the GUEST
+// kernel sees — which is always somewhat less than advertised because the
+// hypervisor/kernel reserves a slice of it. Comparing a guest measurement
+// directly against a plan label means the recommended plan can never clear the
+// bar. Measured live on g6-standard-2 (the exact plan CONSOLE.md recommends):
+// advertised 4096 MB = 4294967296 B, but guest MemTotal = 4009868 kB =
+// 4106104832 B — a ~180 MiB shortfall against the raw label. 90% of the
+// advertised size comfortably absorbs that reservation while still catching
+// genuinely undersized plans (e.g. a 2 GB plan's guest lands well under it).
+const minMemBytes = recommendedMemBytes * 9 / 10
+
 // lowDiskFloor is the absolute headroom the appliance wants on its data
 // directory. Replication STAGES each delta pass to a file there before applying
 // it atomically (internal/receiver/stage.go), so a pass needs room for its own
@@ -90,7 +104,7 @@ func hostSpecs() (vcpus int, memBytes int64) {
 // recommendation. It is advice, not an error: a smaller appliance works, it is
 // just slower.
 func applianceUndersized(vcpus int, memBytes int64) bool {
-	return vcpus < recommendedVCPUs || (memBytes > 0 && memBytes < recommendedMemBytes)
+	return vcpus < recommendedVCPUs || (memBytes > 0 && memBytes < minMemBytes)
 }
 
 // checkDiskHeadroom warns ONCE when the data directory crosses the low-disk
