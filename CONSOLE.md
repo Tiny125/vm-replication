@@ -764,3 +764,11 @@ the migration to `image_ready`.
   size.
 - One appliance manages many migrations concurrently (one receiver port each,
   starting at 5000).
+- **An appliance restart during the Lish-paste wait recovers automatically.**
+  While a disk-boot cutover is parked in `migrating` waiting for the copy
+  command to be pasted, the token and command are persisted (not just kept in
+  memory); restarting `applianced` (e.g. an upgrade) restores them and the
+  card's copy command keeps working — the activity log says so. If the wait
+  had already run past its budget while the service was down, the command
+  can't be restored; the log names that and tells you to click **Stop**, then
+  **Start** the migration again for a fresh cutover.

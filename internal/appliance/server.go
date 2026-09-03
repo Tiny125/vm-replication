@@ -622,6 +622,13 @@ func (s *Server) StartActiveReceivers() {
 			// half-way (see receiver.applyStaged).
 			_ = s.st.AddEvent(s.ctx, m.ID, "info",
 				"the appliance service restarted — receivers are back up and replication continues. A copy pass that was in flight was discarded whole (never applied half-way) and the agent retries within ~60s.")
+		case api.MigMigrating:
+			// F-24: nothing resumes a mid-finalize run after a restart — unlike the
+			// replication states above, there is no receiver to bring back here. For
+			// a disk-boot cutover specifically, try to restore the rescue-mode
+			// stream token + Lish copy command so a restart during that wait
+			// doesn't strand it (see restoreCutoverState).
+			s.restoreCutoverState(m)
 		}
 	}
 }
