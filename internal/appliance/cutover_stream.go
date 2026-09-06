@@ -155,8 +155,9 @@ func (s *Server) restoreCutoverStream(migID int64) bool {
 // Lish copy command, so a volume-boot migration (or anything mid-finalize
 // before a stream would even exist yet) is left alone. When a stream can be
 // restored, the console gets its copy command back and the operator is told
-// so (F-29: this used to restore silently, leaving a restart mid-paste-window
-// looking like a fault). When it can't AND a rescue instance is already
+// so (F-29: it used to say the opposite — that the old token had stopped
+// working and the command had to be re-pasted, neither of which is true).
+// When it can't AND a rescue instance is already
 // running (LaunchedID set), this is the F-24 safety net: name the situation
 // and the exact recovery action on the migration's own activity log —
 // matching the tone of the restart message in StartActiveReceivers (say what
