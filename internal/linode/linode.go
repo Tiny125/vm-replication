@@ -206,6 +206,32 @@ func (c *Client) GetInstance(ctx context.Context, id int64) (Instance, error) {
 	return inst, err
 }
 
+// ListInstances returns every Linode instance in the account. Used to report
+// current usage against Linode's (undocumented, API-invisible — see
+// IsServiceLimit) account-wide active-services cap.
+func (c *Client) ListInstances(ctx context.Context) ([]Instance, error) {
+	var resp struct {
+		Data []Instance `json:"data"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/linode/instances?page_size=500", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
+// ListVolumes returns every Block Storage volume in the account. Used
+// alongside ListInstances to report current usage against Linode's
+// active-services cap (see IsServiceLimit).
+func (c *Client) ListVolumes(ctx context.Context) ([]Volume, error) {
+	var resp struct {
+		Data []Volume `json:"data"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/volumes?page_size=500", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
+}
+
 // DeleteInstance permanently deletes a Linode instance (used to clean up a
 // previous cutover attempt before retrying, and on migration delete).
 func (c *Client) DeleteInstance(ctx context.Context, id int64) error {
