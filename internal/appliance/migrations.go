@@ -895,7 +895,10 @@ func (s *Server) provisionDiskStorage(ctx context.Context, m api.Migration, d ap
 	label := volumeLabel(m.Name, d.ID)
 	vol, err := cl.CreateVolume(ctx, label, s.cfg.Region, sizeGiB, s.cfg.ApplianceLinodeID)
 	if err != nil {
-		return err
+		// F-30: the account-wide "active services" cap can be hit here too (this
+		// migration needs one replication volume per disk). Name the arithmetic
+		// instead of passing the raw Linode error straight to the operator.
+		return wrapServiceLimit(ctx, cl, err, serviceNeed{Volumes: len(m.Disks)})
 	}
 	// Record the volume id immediately (before waiting for it to become active)
 	// so that a later failure still lets the rollback / delete path remove it.
@@ -1625,6 +1628,17 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 
 	_ = s.st.AddEvent(sctx, m.ID, "info", "cutover started: converting boot disk and cloning volumes")
 
+	// F-30: say up front how many additional Linode services this run will
+	// provision, and how many the account already has, so an operator close to
+	// the account-wide "active services" cap can act before the expensive work
+	// (replication + conversion, already done by this point) is wasted on a
+	// cutover that dies at the last clone.
+	need := serviceNeed{Volumes: len(m.Disks)}
+	if req.LaunchInstance {
+		need.Instances = 1
+	}
+	s.announceCutoverServiceNeed(sctx, m.ID, cl, need)
+
 	// On a retry, remove any instance/volumes left over from the previous cutover
 	// attempt so we start clean and the <name>-cutover labels are free to reuse.
 	s.cleanupCutoverArtifacts(sctx, m)
@@ -1639,6 +1653,7 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 			return
 		}
 		if err != nil {
+			err = wrapServiceLimit(ctx, cl, err, need)
 			s.fail(m.ID, fmt.Sprintf("clone disk %d into %s: %v", d.Index, label, err))
 			return
 		}
@@ -1676,6 +1691,7 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 			return
 		}
 		if err != nil {
+			err = wrapServiceLimit(ctx, cl, err, need)
 			s.fail(m.ID, "create instance: "+err.Error())
 			return
 		}
@@ -1779,6 +1795,17 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	bootDevice := s.diskDevicePath(m, boot)
 
 	_ = s.st.AddEvent(sctx, m.ID, "info", "cutover (local disk) started")
+
+	// F-30: say up front how many additional Linode services this run will
+	// provision (1 instance, plus one cloned volume per DATA disk — the boot
+	// disk streams onto the instance's local disk instead of a volume) and how
+	// many the account already has, so an operator close to the account-wide
+	// "active services" cap can act before the expensive work (replication +
+	// conversion, already done by this point) is wasted on a cutover that dies
+	// at the last clone.
+	need := serviceNeed{Instances: 1, Volumes: len(m.Disks) - 1}
+	s.announceCutoverServiceNeed(sctx, m.ID, cl, need)
+
 	s.cleanupCutoverArtifacts(sctx, m) // retry-safe
 
 	// 1) Create the target instance on the resolved plan (region = appliance's).
@@ -1793,6 +1820,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		return
 	}
 	if err != nil {
+		err = wrapServiceLimit(ctx, cl, err, need)
 		s.fail(m.ID, "create instance: "+err.Error())
 		return
 	}
@@ -1930,6 +1958,12 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 			return
 		}
 		if err != nil {
+			// F-30: this is the exact failure measured live (findings.md) — the
+			// account-wide Linode "active services" cap hit at the final clone,
+			// after the full replication and boot conversion had already run. Name
+			// what this cutover needed and what the account has instead of passing
+			// the raw Linode error straight through.
+			err = wrapServiceLimit(ctx, cl, err, need)
 			s.fail(m.ID, fmt.Sprintf("clone data disk %d into %s: %v", d.Index, label, err))
 			return
 		}

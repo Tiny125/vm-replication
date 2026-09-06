@@ -155,19 +155,27 @@ func (s *Server) restoreCutoverStream(migID int64) bool {
 // Lish copy command, so a volume-boot migration (or anything mid-finalize
 // before a stream would even exist yet) is left alone. When a stream can be
 // restored, the console gets its copy command back and the operator is told
-// so. When it can't AND a rescue instance is already running (LaunchedID
-// set), this is the F-24 safety net: name the situation and the exact
-// recovery action on the migration's own activity log — matching the tone of
-// the restart message in StartActiveReceivers (say what happened, and
-// reassure/point at the fix) — instead of leaving the operator to discover a
-// vanished copy command with no explanation.
+// so (F-29: it used to say the opposite — that the old token had stopped
+// working and the command had to be re-pasted, neither of which is true).
+// When it can't AND a rescue instance is already
+// running (LaunchedID set), this is the F-24 safety net: name the situation
+// and the exact recovery action on the migration's own activity log —
+// matching the tone of the restart message in StartActiveReceivers (say what
+// happened, and reassure/point at the fix) — instead of leaving the operator
+// to discover a vanished copy command with no explanation.
 func (s *Server) restoreCutoverState(m api.Migration) {
 	if m.BootTarget != api.BootTargetDisk {
 		return
 	}
 	if s.restoreCutoverStream(m.ID) {
+		// F-29: restoreCutoverStream rebuilds the SAME token and SAME command text
+		// that were persisted — nothing about the copy command actually changes
+		// across the restart. Say so plainly, in the voice of the replication-path
+		// restart message above: what happened, and the reassurance that matters
+		// most right now (the command the operator may already have copied is
+		// still good to paste, no need to copy it again).
 		_ = s.st.AddEvent(s.ctx, m.ID, "info",
-			"the appliance service restarted — the pending rescue-mode copy command has been restored below. If you already pasted the previous one, paste this one instead (the old token stopped working).")
+			"the appliance service restarted — this migration is still mid-cutover. The rescue-mode copy command shown on the card is unchanged and still valid: if you already copied it, there is no need to copy it again.")
 		return
 	}
 	if m.LaunchedID != 0 {

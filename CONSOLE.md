@@ -148,6 +148,17 @@ run.
   appliances or migrate in batches.
 - The installer opens receiver ports **5000–5100**; that covers ~100 disks over
   the appliance's lifetime. Widen the firewall range if you'll exceed that.
+- **Linode's account-wide "active services" limit** (instances + Block Storage
+  volumes combined) is enforced by Linode, not by vm-replication, and Linode's
+  API never exposes the numeric cap anywhere — only a support ticket raises
+  it. A migration create and a cutover both provision instances/volumes, so
+  either can hit it. When a migration create needs one more replication
+  volume than the account has room for, or a cutover needs one more instance
+  or cloned volume, the error names how many were needed and how many the
+  account currently holds (instead of Linode's raw "You've reached a limit
+  for the number of active services..." message) so you can tell whether to
+  free one resource or ten. A cutover also posts an informational note up
+  front, before any provisioning starts, stating the same two numbers.
 
 ---
 
@@ -679,12 +690,21 @@ Cutover is **three steps: freeze the image, power off the source, launch**.
    off yet); once the image is validated it switches to **"it is now safe to
    power off the source server"**. Follow the card — there is no need to guess.
 3. **Power off the source server** (now that the image is validated), then click
-   **Launch instance**. The appliance:
+   **Launch instance**. The activity log immediately posts a note stating how
+   many additional Linode services (instances + volumes) this run will
+   provision and how many the account already has — worth a glance if you're
+   anywhere near Linode's account-wide active-services limit, since that's
+   otherwise only discovered by hitting it. The appliance then:
    - **clones every disk's volume** into an image volume
      (`vmrepl-img-<id>-<diskIndex>`) — your migrated "snapshot(s)" (the boot
      conversion already ran and was validated in step 1),
    - **launches a new Linode** with all image volumes attached (boot as `sda`,
      data disks as `sdb`, `sdc`, …) and boots it.
+
+   If a clone or the launch hits Linode's account-wide service limit, the
+   failure names how many services this cutover needed and how many the
+   account currently has, instead of Linode's raw error — see "Limits to
+   know" above.
 
 So **a multi-disk migration produces multiple image volumes** — one per source
 disk. When it finishes, the completed banner lists them and links to
@@ -780,7 +800,11 @@ the migration to `image_ready`.
   While a disk-boot cutover is parked in `migrating` waiting for the copy
   command to be pasted, the token and command are persisted (not just kept in
   memory); restarting `applianced` (e.g. an upgrade) restores them and the
-  card's copy command keeps working — the activity log says so. If the wait
-  had already run past its budget while the service was down, the command
-  can't be restored; the log names that and tells you to click **Stop**, then
-  **Start** the migration again for a fresh cutover.
+  card's copy command keeps working. The activity log says so: it states that
+  the service restarted, the migration is still mid-cutover, and — since the
+  restore rebuilds the exact same token and command — the copy command shown
+  on the card is **unchanged and still valid**, so a command you already
+  copied doesn't need copying again. If the wait had already run past its
+  budget while the service was down, the command can't be restored; the log
+  names that and tells you to click **Stop**, then **Start** the migration
+  again for a fresh cutover.
