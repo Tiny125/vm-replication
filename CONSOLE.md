@@ -780,7 +780,11 @@ the migration to `image_ready`.
   While a disk-boot cutover is parked in `migrating` waiting for the copy
   command to be pasted, the token and command are persisted (not just kept in
   memory); restarting `applianced` (e.g. an upgrade) restores them and the
-  card's copy command keeps working — the activity log says so. If the wait
-  had already run past its budget while the service was down, the command
-  can't be restored; the log names that and tells you to click **Stop**, then
-  **Start** the migration again for a fresh cutover.
+  card's copy command keeps working. The activity log says so: it states that
+  the service restarted, the migration is still mid-cutover, and — since the
+  restore rebuilds the exact same token and command — the copy command shown
+  on the card is **unchanged and still valid**, so a command you already
+  copied doesn't need copying again. If the wait had already run past its
+  budget while the service was down, the command can't be restored; the log
+  names that and tells you to click **Stop**, then **Start** the migration
+  again for a fresh cutover.

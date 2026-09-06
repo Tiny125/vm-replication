@@ -128,9 +128,14 @@ func TestDropCutoverStreamClearsPersistedCopy(t *testing.T) {
 
 // TestRestartRestoresPendingCopyCommand exercises StartActiveReceivers end to
 // end: a migration parked in `migrating` with a persisted, unexpired stream
-// must come back with its stream restored AND get an activity event telling
-// the operator the command is back (in the tone of the existing restart
-// message at server.go:617-620).
+// must come back with its stream restored AND get a REASSURANCE event on the
+// migration's activity log — in the tone of the existing restart message at
+// server.go:617-620 ("the appliance service restarted — receivers are back up
+// and replication continues...") — stating that the service restarted, the
+// migration is still mid-cutover, and the copy command shown on the card is
+// UNCHANGED and still valid (restoreCutoverStream restores the exact same
+// token and command text, so a command the operator already copied is still
+// good to paste; nothing needs re-copying). F-29.
 func TestRestartRestoresPendingCopyCommand(t *testing.T) {
 	ctx := context.Background()
 	st := testPersistStore(t)
@@ -159,14 +164,53 @@ func TestRestartRestoresPendingCopyCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("events: %v", err)
 	}
-	var sawRestore bool
+	var sawReassurance bool
 	for _, e := range evs {
-		if strings.Contains(e.Message, "restarted") && strings.Contains(e.Message, "restored") {
-			sawRestore = true
+		low := strings.ToLower(e.Message)
+		if strings.Contains(low, "restarted") && strings.Contains(low, "mid-cutover") &&
+			strings.Contains(low, "unchanged") && strings.Contains(low, "valid") {
+			sawReassurance = true
 		}
 	}
-	if !sawRestore {
-		t.Errorf("restoring the copy command should be announced on the migration's activity log, got events: %+v", evs)
+	if !sawReassurance {
+		t.Errorf("a successful restore should announce that the service restarted, the migration is still mid-cutover, and the copy command is unchanged and still valid; got events: %+v", evs)
+	}
+}
+
+// TestRestartRestoresPendingCopyCommandExactlyOneEvent guards against a
+// regression where the reassurance event is emitted alongside (rather than
+// instead of) some other success-path event — the operator should see ONE
+// clear statement, not a pair of overlapping ones.
+func TestRestartRestoresPendingCopyCommandExactlyOneEvent(t *testing.T) {
+	ctx := context.Background()
+	st := testPersistStore(t)
+	m := newDiskBootMigration(t, st, ctx, "res-single")
+	if err := st.SetMigrationImage(ctx, m.ID, "", 103564624); err != nil {
+		t.Fatalf("set image: %v", err)
+	}
+	if err := st.SetMigrationState(ctx, m.ID, api.MigMigrating, ""); err != nil {
+		t.Fatalf("set state: %v", err)
+	}
+
+	s1 := &Server{st: st, ctx: ctx}
+	s1.registerCutoverStream(m.ID, "/dev/y", 999, time.Hour)
+	s1.setCutoverCopyCmd(m.ID, "curl -fsSL … | sh")
+
+	s2 := &Server{st: st, ctx: ctx}
+	s2.StartActiveReceivers()
+
+	evs, err := st.Events(ctx, m.ID, 0)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	var reassuranceCount int
+	for _, e := range evs {
+		if strings.Contains(e.Message, "restarted") {
+			reassuranceCount++
+		}
+	}
+	if reassuranceCount != 1 {
+		t.Errorf("expected exactly 1 restart-related event on a clean restore, got %d: %+v", reassuranceCount, evs)
 	}
 }
 
@@ -201,6 +245,12 @@ func TestRestartWithNoRestorableStreamWarnsWithRecoveryAction(t *testing.T) {
 		low := strings.ToLower(e.Message)
 		if strings.Contains(low, "restart") && strings.Contains(low, "stop") && strings.Contains(low, "start") {
 			sawRecovery = true
+		}
+		// This path could not restore anything, so it must never also emit the
+		// success-path reassurance ("unchanged and still valid") — that would
+		// contradict the recovery instruction sitting right next to it.
+		if strings.Contains(low, "unchanged") && strings.Contains(low, "valid") {
+			t.Errorf("no-restore path must not also emit the success reassurance event, got: %s", e.Message)
 		}
 	}
 	if !sawRecovery {
