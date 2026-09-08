@@ -229,17 +229,30 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
  .modal-overlay.closing{animation:fadeout .15s ease forwards}
  @keyframes fadein{from{opacity:0}to{opacity:1}}
  @keyframes fadeout{to{opacity:0}}
+ /* The dialog is a bounded flex column: h3 (title) and .modal-actions (buttons)
+    are pinned flex:none siblings; .modal-scroll is the only part that grows AND
+    shrinks, so on a short viewport IT scrolls instead of the whole dialog
+    overflowing off-screen (the bug: the fields and confirm checkbox below the
+    fold were unreachable without zooming out). max-height is given twice —
+    100% (in case the visualViewport unit isn't supported) then 100dvh — since
+    iOS Safari resolves position:fixed against the LARGE viewport, so a plain vh
+    figure can exceed what's actually visible. */
  .modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow-modal);
-   max-width:460px;width:100%;padding:24px 24px 20px;animation:pop .18s cubic-bezier(.2,.8,.3,1)}
+   max-width:460px;width:100%;padding:24px 24px 20px;animation:pop .18s cubic-bezier(.2,.8,.3,1);
+   display:flex;flex-direction:column;max-height:calc(100% - 40px);max-height:calc(100dvh - 40px)}
  @keyframes pop{from{transform:scale(.94);opacity:.5}to{transform:scale(1);opacity:1}}
- .modal h3{font-size:17px;font-weight:600;letter-spacing:-.01em;margin:0 0 10px}
+ .modal h3{flex:none;font-size:17px;font-weight:600;letter-spacing:-.01em;margin:0 0 10px}
+ /* min-height:0 is mandatory on a flex child that must scroll: without it the
+    default min-height:auto refuses to shrink below the content's own height,
+    which silently turns overflow-y:auto into a no-op and reproduces the bug. */
+ .modal-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;margin:0 -4px;padding:0 4px}
  .modal-body{font-size:14px;color:var(--text);line-height:1.55}
  .modal-body b{font-weight:600}
  .modal-body .warn{color:var(--red);font-weight:500}
  .modal-check{display:flex;align-items:flex-start;gap:9px;margin-top:16px;font-size:13.5px;color:var(--text);
    cursor:pointer;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:11px 13px}
  .modal-check input{width:auto;margin-top:2px;cursor:pointer;accent-color:var(--accent)}
- .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
+ .modal-actions{flex:none;display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
  .toast-wrap{position:fixed;top:18px;right:18px;z-index:200;display:flex;flex-direction:column;gap:10px;max-width:360px}
  .toast{display:flex;align-items:flex-start;gap:9px;background:var(--surface);border:1px solid var(--border);
    border-left:4px solid var(--muted);border-radius:12px;box-shadow:var(--shadow-toast);
@@ -458,9 +471,14 @@ function uiDialog(opts){
     // returned as out[id]=bool on confirm.
     const checks=(opts.checkboxes||[]).map(c=>'<label class="modal-check"><input type="checkbox" id="__c_'+c.id+'"'+(c.checked?' checked':'')+'><span>'+esc(c.label)+'</span></label>').join('');
     const cancelBtn=opts.cancel===false?'':'<button class="modal-cancel">'+esc(opts.cancelText||'Cancel')+'</button>';
+    // Everything that can grow tall (prose + fields + checkbox cards) lives in
+    // ONE .modal-scroll wrapper so it scrolls together; only <h3> and
+    // .modal-actions are pinned outside it. The #__f_*/#__mck/#__c_* lookups
+    // below are ov.querySelector(...) — document-order queries against the
+    // whole overlay — so this extra wrapper doesn't affect them.
     ov.innerHTML='<div class="modal'+(opts.wide?' wide':'')+'" role="dialog" aria-modal="true">'+
       '<h3>'+esc(opts.title||'')+'</h3>'+
-      '<div class="modal-body">'+(opts.html||'')+'</div>'+fields+check+checks+
+      '<div class="modal-scroll"><div class="modal-body">'+(opts.html||'')+'</div>'+fields+check+checks+'</div>'+
       '<div class="modal-actions">'+cancelBtn+
       '<button class="modal-ok '+(opts.okDanger?'danger':'primary')+'">'+esc(opts.okText||'OK')+'</button></div></div>';
     document.body.appendChild(ov);
@@ -834,7 +852,11 @@ async function startMig(id,btn){
     '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> stop replication, take a consistent final pass (the source root is briefly remounted read-only), then <b>convert the boot image and check its GRUB configuration for errors</b> — all while the source is still running, so a conversion problem surfaces before you power off. This checks the configuration file, not a live boot; the guest’s actual boot is verified separately after you launch.</div>'+
     '<div style="margin-top:4px"><b>Step 2:</b> once step 1 reports the image is validated, power off the source server.</div>'+
     '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the validated image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('clones the validated image and launches a new Linode'+planNote+'.'):'clones every disk into launchable volumes.'))+'</div></div>';
-  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the final pass is current. The final pass tries to remount the source root <b>read-only</b> for a perfectly clean image — if writers are still holding the root open (normal on a running system), the cutover <b>automatically falls back</b> to the current crash-consistent data, which is fsck-repaired on convert and has its GRUB configuration checked for errors before you power anything off (a real boot is verified separately, after you launch). Tick the box below to skip the read-only attempt if the source is already powered off or idle.</div>';
+  // Longest prose block — collapsed by default (<details>) so it doesn't push
+  // the fields and confirm checkbox further down the dialog; the operator can
+  // still open it, and it's still fully present in the DOM for the tests below
+  // that string-match it.
+  const prep='<details style="margin-top:8px"><summary>Before you click — tips for a clean cutover</summary><div class="muted" style="font-size:12px">Stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the final pass is current. The final pass tries to remount the source root <b>read-only</b> for a perfectly clean image — if writers are still holding the root open (normal on a running system), the cutover <b>automatically falls back</b> to the current crash-consistent data, which is fsck-repaired on convert and has its GRUB configuration checked for errors before you power anything off (a real boot is verified separately, after you launch). Tick the box below to skip the read-only attempt if the source is already powered off or idle.</div></details>';
   // Optional names/credentials the cutover applies — both methods CREATE the
   // instance (and, for volume boot, the cutover volume) at this step.
   const defName=esc((meta.name||'')+'-cutover');
@@ -850,8 +872,10 @@ async function startMig(id,btn){
   // or metadata live on different disks. The only way to guarantee every disk
   // reflects the exact same instant is to power the source off before step 3.
   // Single-disk migrations have no such gap, so this stays out of their way.
+  // The one-line RED warning must always stay visible (never behind a
+  // disclosure) — only its longer explanatory paragraph is collapsible.
   const multiDiskWarn=nDisks>1?('<div class="warn" style="margin-top:8px">Multi-disk migration — the disks are captured seconds-to-minutes apart.</div>'+
-    '<div class="muted" style="font-size:12px;margin-top:4px">While the source keeps running, each disk reaches its final consistent pass at a different moment (measured: 54s apart on a two-disk test), so the destination\'s disks can reflect different instants of the source — a real risk if an application\'s data and its write-ahead log/index/metadata live on different disks. The only way to guarantee every disk reflects the exact same instant is to <b>power the source off before step 3</b> (Launch instance).</div>'):'';
+    '<details style="margin-top:4px"><summary>Why, and what to do about it</summary><div class="muted" style="font-size:12px">While the source keeps running, each disk reaches its final consistent pass at a different moment (measured: 54s apart on a two-disk test), so the destination\'s disks can reflect different instants of the source — a real risk if an application\'s data and its write-ahead log/index/metadata live on different disks. The only way to guarantee every disk reflects the exact same instant is to <b>power the source off before step 3</b> (Launch instance).</div></details>'):'';
   if(!disk||nDisks>1)fields.push({id:'vol_name',label:(disk?'Name for the data volume(s) (optional)':'New volume name (optional)'),type:'text',placeholder:'default: '+defName});
   fields.push(
     {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
@@ -861,6 +885,10 @@ async function startMig(id,btn){
     title:'Cut over migration #'+id+' — step 1 of 3: stop replication & take a consistent pass',
     okText:'Stop replication & continue',
     html:how+access+prep+multiDiskWarn,
+    // This is the tallest dialog in the console (multiple prose blocks, a
+    // 2-3 line title, 3-4 fields, a checkbox card) — give it the wide modal
+    // in addition to the scroll fix, so scrolling is rarely even needed.
+    wide:true,
     fields:fields,
     // Default to the read-only quiesce, with an opt-out for an
     // already-powered-off/idle source.

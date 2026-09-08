@@ -669,7 +669,12 @@ Cutover is **three steps: freeze the image, power off the source, launch**.
 
 1. Stop the source's apps/databases and let the **RPO lag drop to ~0** (shown on
    the card), so the frozen copy is current.
-2. Click **Cutover instance**. In the dialog you can optionally set a **name
+2. Click **Cutover instance**. This dialog is the tallest in the console — its
+   longer explanations ("Before you click", and the multi-disk capture-skew
+   details) are tucked behind **collapsible disclosures** so the fields and
+   the confirm checkbox stay in easy reach, and the dialog itself **scrolls
+   independently of the page** on a short screen instead of running off the
+   bottom of the viewport. In the dialog you can optionally set a **name
    for the new instance**, and — for a **multi-disk** migration — a **name for
    the data volume(s)** (data disks become Block Storage volumes) — blank
    keeps the `<migration>-cutover` default (names are sanitized to Linode's
