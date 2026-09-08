@@ -352,6 +352,15 @@ type MigrationView struct {
 	// has no skew to report, and before any multi-disk cutover pass has
 	// landed.
 	CutoverSkewSeconds float64 `json:"cutover_skew_seconds,omitempty"`
+
+	// BootVerified/BootEvidence (F-31) report whether the LAUNCHED guest was
+	// actually confirmed to have booted — not merely that Linode's hypervisor
+	// reported the instance "running" (a Linode sitting at a grub> prompt
+	// reports "running" too). Set once, right after Boot() succeeds, from an
+	// ICMP/TCP probe of the launched instance (see verifyGuestBoot).
+	// BootEvidence is empty until a launch has actually run verification.
+	BootVerified bool   `json:"boot_verified,omitempty"`
+	BootEvidence string `json:"boot_evidence,omitempty"`
 }
 
 // ConnTestRequest asks the appliance to probe network reachability to a source.

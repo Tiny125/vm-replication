@@ -1172,8 +1172,23 @@ function migCard(v){
 
   // Migration-complete header: a prominent green strip at the top of a launched /
   // image-ready card so the finished state is obvious at a glance.
+  //
+  // F-31: 'launched' means Linode's hypervisor reported the instance running —
+  // NOT that the guest kernel booted (a Linode sitting at a grub> prompt
+  // reports "running" too). bootEvidence is only set once verifyGuestBoot has
+  // actually run (right after Boot() succeeds), so its presence here means
+  // verification happened; boot_verified says whether it succeeded. Derived
+  // from the settings-store record, not a new migration state.
+  const bootUnverified = m.state==='launched' && v.boot_evidence && !v.boot_verified;
   if(['image_ready','launched'].includes(m.state)){
-    h+='<div class="banner ok" style="margin:0 0 10px;font-size:14px;font-weight:600">✓ Migration complete<span style="font-weight:400"> — your server is migrated and running on Linode.</span></div>';
+    h+= bootUnverified
+      ? '<div class="banner warn" style="margin:0 0 10px;font-size:14px;font-weight:600">⚠ Migration launched — guest boot NOT verified<span style="font-weight:400"> — the instance is running, but its boot could not be confirmed. Do not decommission the source yet.</span></div>'
+      : '<div class="banner ok" style="margin:0 0 10px;font-size:14px;font-weight:600">✓ Migration complete<span style="font-weight:400"> — your server is migrated and running on Linode.</span></div>';
+  }
+  if(m.state==='launched' && v.boot_evidence){
+    h+= v.boot_verified
+      ? '<div class="muted" style="font-size:12px;margin:0 0 10px">Guest boot verified — '+esc(v.boot_evidence)+'.</div>'
+      : '<div class="banner warn" style="margin:0 0 10px"><b>Guest boot could not be confirmed.</b> '+esc(v.boot_evidence)+' This is not proof the boot failed, but it is also not proof it succeeded — open the instance’s Lish console and confirm it reaches a login prompt before you decommission the source.</div>';
   }
 
   // Method header banner: distinct colours so the method is obvious at a glance

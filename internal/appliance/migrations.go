@@ -1723,9 +1723,20 @@ func (s *Server) finalizeComplete(ctx context.Context, m api.Migration, req api.
 			s.fail(m.ID, "boot instance: "+err.Error())
 			return
 		}
+		// F-31: Boot() succeeding only means Linode's hypervisor accepted the
+		// boot request — it is NOT evidence the guest kernel came up (a Linode
+		// sitting at a grub> prompt reports "running" indefinitely). Probe the
+		// launched instance for real signs of network life before calling this
+		// done.
+		verified, evidence := false, "the launched instance reported no IPv4 address to probe"
+		if len(inst.IPv4) > 0 {
+			verified, evidence = verifyGuestBoot(ctx, inst.IPv4[0])
+		}
+		s.saveBootVerify(m.ID, verified, evidence)
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigLaunched, "")
 		_ = s.st.SetMigrateFinished(sctx, m.ID)
-		_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: launched cutover Linode %q (id %d) from %d volume(s)", label, inst.ID, len(cloneIDs)))
+		lvl, txt := volumeBootLaunchEvent(label, inst.ID, len(cloneIDs), verified, evidence)
+		_ = s.st.AddEvent(sctx, m.ID, lvl, txt)
 		return
 	}
 
@@ -2121,6 +2132,17 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		return
 	}
 
+	// F-31: WaitInstanceStatus above only proves LINODE'S HYPERVISOR marked the
+	// instance running — not that the guest kernel booted. A Linode sitting at
+	// a grub> prompt reports "running" for as long as it sits there (confirmed
+	// live against the API on aws-instance-test). Probe the instance itself
+	// for real signs of network life before this is called done.
+	verified, evidence := false, "the launched instance reported no IPv4 address to probe"
+	if len(inst.IPv4) > 0 {
+		verified, evidence = verifyGuestBoot(ctx, inst.IPv4[0])
+	}
+	s.saveBootVerify(m.ID, verified, evidence)
+
 	// Re-enable Lassie now that the copy's power-off dance is done, so the migrated
 	// production instance keeps the auto-reboot-on-crash watchdog (best-effort).
 	if err := cl.SetWatchdog(ctx, inst.ID, true); err != nil {
@@ -2138,7 +2160,8 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	if n := len(dataClones); n > 0 {
 		withData = fmt.Sprintf(", with %d data volume(s) attached", n)
 	}
-	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("migration complete: %q (id %d) is booting from its local disk on plan %s%s", instLabel, inst.ID, m.LinodeType, withData))
+	lvl, txt := diskBootLaunchEvent(instLabel, inst.ID, m.LinodeType, withData, verified, evidence)
+	_ = s.st.AddEvent(sctx, m.ID, lvl, txt)
 }
 
 // randPassword returns a strong random password for a launched destination when
@@ -2415,6 +2438,13 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	// single-disk migration, which has no skew to report).
 	if sp, ok := s.cutoverSkew.Load(m.ID); ok {
 		v.CutoverSkewSeconds = sp.(time.Duration).Seconds()
+	}
+	// F-31: whether the LAUNCHED guest was actually confirmed to have booted
+	// (see verifyGuestBoot) — derived from the settings-store record so the
+	// console banner reflects it without a new migration state.
+	if bv, ok := s.loadBootVerify(ctx, m.ID); ok {
+		v.BootVerified = bv.Verified
+		v.BootEvidence = bv.Evidence
 	}
 
 	// Reflect readiness in the displayed status so the operator can see at a

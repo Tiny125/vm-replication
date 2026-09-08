@@ -104,24 +104,40 @@ func probePorts(ctx context.Context, host string, base int) []api.PortProbe {
 	}
 	out := make([]api.PortProbe, len(ports))
 	var wg sync.WaitGroup
-	d := net.Dialer{Timeout: 2 * time.Second}
 	for i, p := range ports {
 		wg.Add(1)
 		go func(i, p int) {
 			defer wg.Done()
-			addr := net.JoinHostPort(host, fmt.Sprintf("%d", p))
-			conn, err := d.DialContext(ctx, "tcp", addr)
-			if err == nil {
-				_ = conn.Close()
-				out[i] = api.PortProbe{Port: p, Open: true, Detail: "TCP connect succeeded"}
-				return
-			}
-			out[i] = api.PortProbe{Port: p, Open: false, Detail: classifyDialErr(err)}
+			open, _, detail := dialPort(ctx, host, p, 2*time.Second)
+			out[i] = api.PortProbe{Port: p, Open: open, Detail: detail}
 		}(i, p)
 	}
 	wg.Wait()
 	sort.Slice(out, func(a, b int) bool { return out[a].Port < out[b].Port })
 	return out
+}
+
+// dialPort attempts one TCP connect to host:port and reports three things:
+// whether it succeeded (open), whether the OS definitively REFUSED it (a
+// RST — proof something answered, i.e. the remote's network stack is up,
+// even though nothing is listening on this exact port), and a short
+// human-readable detail. Shared by probePorts (source reachability
+// diagnostics) and verifyGuestBoot (F-31: confirming a just-launched guest
+// actually booted its network stack) so there is exactly one implementation
+// of "what does this dial error mean" — refused vs. timed out is precisely
+// the distinction verifyGuestBoot needs (a guest at a grub> prompt has no IP
+// stack at all: no open port, and no refusal either, only silence).
+func dialPort(ctx context.Context, host string, port int, timeout time.Duration) (open, refused bool, detail string) {
+	d := net.Dialer{Timeout: timeout}
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err == nil {
+		_ = conn.Close()
+		return true, false, "TCP connect succeeded"
+	}
+	detail = classifyDialErr(err)
+	refused = strings.Contains(err.Error(), "refused")
+	return false, refused, detail
 }
 
 // classifyDialErr turns a dial error into a short operator-friendly reason.
