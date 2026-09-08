@@ -639,6 +639,14 @@ and the whole list refreshes every 5 seconds — no manual **Refresh** needed
 load with an existing session and a fresh sign-in through the login form (e.g.
 right after the appliance was updated/restarted).
 
+> The **transfer rate** (the "· N MiB/s" part) is only ever shown while a live
+> copy is actually being measured — during the initial sync and ongoing
+> replication. It disappears once replication stops (cutover's finalize/copy
+> steps, and the completed **image ready**/**launched** states), where any
+> "speed" would either be stale or a meaningless total-size-over-total-time
+> average. Byte counts throughout the console use **binary (IEC) units** —
+> KiB/MiB/GiB — since every value is a raw byte count, not a decimal one.
+
 Each migration shows aggregate progress and a **per-disk table** (expand
 **Disks**), plus a checklist that requires **all disks**:
 - ✔ Agent connected — _N/N disks checked in_
