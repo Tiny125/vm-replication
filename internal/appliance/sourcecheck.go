@@ -205,6 +205,28 @@ func assessSource(r api.SourceCheckReport) api.SourceAssessment {
 		rootDetail += " on LUKS encryption"
 	}
 	a.Checks = append(a.Checks, api.ValidationCheck{Name: "Root filesystem", OK: r.RootFS != "", Detail: rootDetail})
+
+	// F-31: surface the partitioning/bootloader facts that decide which
+	// Linode boot target this source will land on, so the operator sees the
+	// consequence before migrating rather than after.
+	bootDetail := "partition table: " + orDefault(r.PartTable, "unknown")
+	if r.SeparateBoot {
+		bootDetail += ", separate /boot"
+	}
+	if r.EFIBoot {
+		bootDetail += ", EFI boot"
+	}
+	if r.BiosGrubPart {
+		bootDetail += ", GPT bios_grub partition present"
+	}
+	if r.MBRBootloader {
+		bootDetail += ", BIOS/MBR bootloader present"
+	} else {
+		bootDetail += ", no BIOS/MBR bootloader detected"
+	}
+	bootOK := !((r.PartTable == "gpt" || r.PartTable == "dos") && !r.MBRBootloader)
+	a.Checks = append(a.Checks, api.ValidationCheck{Name: "Boot loader", OK: bootOK, Detail: bootDetail})
+
 	if r.DataPortOK != nil {
 		a.Checks = append(a.Checks, api.ValidationCheck{
 			Name: "Replication port reachable", OK: *r.DataPortOK,
@@ -284,6 +306,42 @@ func assessSource(r api.SourceCheckReport) api.SourceAssessment {
 			worsen(v, "warn", "root on software RAID: the destination has a single virtual disk, so the array is flattened — verify the result boots before decommissioning the source")
 		}
 	}
+
+	// F-31: convertibleRootFS above only judges the root FILESYSTEM, so a
+	// partitioned AWS-style source got a clean bill of health by
+	// construction. Linode's linode/grub2 boot mode only reads a guest's
+	// grub.cfg for a PARTITIONLESS disk (Linode's own image shape); a
+	// PARTITIONED disk instead needs linode/direct-disk, which boots
+	// whatever BIOS bootloader is written into the disk's MBR — a real AWS
+	// EC2 -> Linode migration reported "complete" and "VALIDATED as
+	// bootable" and produced a machine stuck at a grub> prompt because this
+	// was never checked pre-flight. Warn here, before the operator commits
+	// to a migration, for every shape that lands on Linode's own kernel
+	// instead of the source's (which has silently disabled SELinux on a
+	// real migration even though /etc/selinux/config still said
+	// "enforcing").
+	//
+	// NOTE — this logic is duplicated in the sourceCheckScript's local
+	// `worsen` block below (bash), which prints a verdict directly in the
+	// operator's terminal for when the report can't reach the console. Keep
+	// both in sync; every rule added here must be added there too.
+	partitioned := r.PartTable == "gpt" || r.PartTable == "dos"
+	if partitioned && !r.MBRBootloader {
+		for _, v := range all {
+			worsen(v, "warn", "the disk is partitioned with no BIOS/MBR bootloader detected (F-31) — Linode cannot read a GRUB config off a partition, so this source will boot on LINODE's own kernel after migration instead of its own, which can silently change kernel-dependent behavior (e.g. disabling SELinux even though the config still says \"enforcing\"). Verify the guest boot after migrating, before decommissioning the source.")
+		}
+	}
+	if r.EFIBoot && !r.MBRBootloader {
+		for _, v := range all {
+			worsen(v, "warn", "this source boots via UEFI with no BIOS/MBR fallback bootloader detected — it will run on Linode's own kernel after migration, not its own")
+		}
+	}
+	if r.BootloaderKind != "" && r.BootloaderKind != "grub" && r.BootloaderKind != "unknown" && r.BootloaderKind != "none" {
+		for _, v := range all {
+			worsen(v, "warn", "the source uses a non-GRUB bootloader ("+r.BootloaderKind+") — the conversion only regenerates GRUB configs, so boot conversion is unverified for this source")
+		}
+	}
+
 	for _, d := range r.Disks {
 		if d.Ephemeral {
 			// A cloud scratch disk (Azure's temporary "resource disk"): its contents
@@ -344,6 +402,59 @@ ROOTFS="$(findmnt -no FSTYPE / 2>/dev/null || echo "")"
 EFI=false; [ -d /sys/firmware/efi ] && EFI=true
 SELINUX="$(getenforce 2>/dev/null | tr 'A-Z' 'a-z' || echo "")"
 
+# F-31: partitioning/bootloader facts. Linode's linode/grub2 boot mode only
+# reads a guest's grub.cfg for a PARTITIONLESS disk; a PARTITIONED disk needs
+# linode/direct-disk, which boots whatever BIOS bootloader is written into
+# the disk's MBR. Report what's actually there so the operator sees the
+# consequence BEFORE migrating, not after (a real AWS EC2 migration reported
+# "complete" and "VALIDATED as bootable" and produced a machine stuck at a
+# grub> prompt because none of this was checked pre-flight).
+ROOTDISK=""
+if [ -n "$ROOTSRC" ]; then
+  PK="$(lsblk -no pkname "$ROOTSRC" 2>/dev/null | tail -1)"
+  [ -n "$PK" ] && ROOTDISK="/dev/$PK"
+fi
+PARTTABLE="unknown"; MBRBOOT=false; BIOSGRUBPART=false
+if [ -n "$ROOTDISK" ] && [ -b "$ROOTDISK" ]; then
+  PARTTABLE="$(blkid -s PTTYPE -o value "$ROOTDISK" 2>/dev/null || true)"
+  [ -z "$PARTTABLE" ] && PARTTABLE="none"
+  # Same check as machine-convert.sh's detect_mbrboot (F-31): GRUB's boot.img
+  # is a fixed 512-byte sector at LBA0. The live failing disk showed byte
+  # sequence eb 63 90 at offset 0 and the string "GRUB" within the sector;
+  # the 0x55AA boot signature ALONE is not enough (every partitioned disk
+  # carries it whether or not a bootloader was ever installed).
+  MBRHEX="$(dd if="$ROOTDISK" bs=512 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  case "$MBRHEX" in
+    *55aa) dd if="$ROOTDISK" bs=1 count=440 2>/dev/null | grep -qa GRUB && MBRBOOT=true ;;
+  esac
+  if [ "$PARTTABLE" = "gpt" ] && command -v sgdisk >/dev/null 2>&1; then
+    EF02PART="$(sgdisk -p "$ROOTDISK" 2>/dev/null | awk '$6=="EF02"{print $1}' | head -1)"
+    [ -n "$EF02PART" ] && BIOSGRUBPART=true
+    # A non-zero bios_grub partition also counts as an MBR bootloader present
+    # (GRUB's core.img sometimes lives there instead of the protective MBR).
+    if [ "$MBRBOOT" = "false" ] && [ -n "$EF02PART" ]; then
+      EF02DEV="${ROOTDISK}${EF02PART}"
+      [ -b "$EF02DEV" ] || EF02DEV="${ROOTDISK}p${EF02PART}"
+      if [ -b "$EF02DEV" ]; then
+        NZ="$(dd if="$EF02DEV" bs=1M count=1 2>/dev/null | tr -d '\0' | wc -c)"
+        [ "${NZ:-0}" -gt 0 ] && MBRBOOT=true
+      fi
+    fi
+  fi
+fi
+SEPBOOT=false
+[ -n "$(findmnt -no FSTYPE /boot 2>/dev/null || true)" ] && SEPBOOT=true
+BLKIND="unknown"
+if [ -f /boot/grub2/grub.cfg ] || [ -f /boot/grub/grub.cfg ]; then
+  BLKIND="grub"
+elif [ -d /boot/syslinux ] || [ -f /boot/extlinux.conf ]; then
+  BLKIND="other"
+elif [ -f /etc/lilo.conf ]; then
+  BLKIND="other"
+elif [ "$EFI" != true ] && [ ! -d /boot ]; then
+  BLKIND="none"
+fi
+
 # Device stack under the root source: detect LVM / LUKS / RAID anywhere in it.
 LVM=false; LUKS=false; RAID=false
 if [ -n "$ROOTSRC" ] && [ -e "$ROOTSRC" ]; then
@@ -403,6 +514,11 @@ REPORT="{
  \"root_on_raid\":$RAID,
  \"efi_boot\":$EFI,
  \"selinux\":\"$(js "$SELINUX")\",
+ \"part_table\":\"$(js "$PARTTABLE")\",
+ \"bios_grub_part\":$BIOSGRUBPART,
+ \"mbr_bootloader\":$MBRBOOT,
+ \"separate_boot\":$SEPBOOT,
+ \"bootloader_kind\":\"$(js "$BLKIND")\",
  \"disks\":[$DISKS_JSON],
  \"used_bytes\":$USED,
  \"data_port_ok\":$PORT_OK,
@@ -450,6 +566,20 @@ if [ "$RAID" = "true" ]; then
   worsen VOL warn "root on software RAID - the array is flattened on the destination"
   worsen DSK warn "root on software RAID - the array is flattened on the destination"
 fi
+# F-31 (kept in sync with assessSource in sourcecheck.go -- see the note
+# there; every rule added to one must be added to the other).
+if { [ "$PARTTABLE" = "gpt" ] || [ "$PARTTABLE" = "dos" ]; } && [ "$MBRBOOT" != "true" ]; then
+  worsen VOL warn "disk is partitioned with no BIOS/MBR bootloader detected (F-31) - this source will boot on LINODE's own kernel after migration instead of its own"
+  worsen DSK warn "disk is partitioned with no BIOS/MBR bootloader detected (F-31) - this source will boot on LINODE's own kernel after migration instead of its own"
+fi
+if [ "$EFI" = "true" ] && [ "$MBRBOOT" != "true" ]; then
+  worsen VOL warn "boots via UEFI with no BIOS/MBR fallback bootloader detected - it will run on Linode's own kernel after migration, not its own"
+  worsen DSK warn "boots via UEFI with no BIOS/MBR fallback bootloader detected - it will run on Linode's own kernel after migration, not its own"
+fi
+if [ -n "$BLKIND" ] && [ "$BLKIND" != "grub" ] && [ "$BLKIND" != "unknown" ] && [ "$BLKIND" != "none" ]; then
+  worsen VOL warn "non-GRUB bootloader ($BLKIND) - the conversion only regenerates GRUB configs, so boot conversion is unverified"
+  worsen DSK warn "non-GRUB bootloader ($BLKIND) - the conversion only regenerates GRUB configs, so boot conversion is unverified"
+fi
 if [ "${MAXDISK:-0}" -gt 10995116277760 ] 2>/dev/null; then
   worsen VOL fail "a disk exceeds Linode Block Storage's 10 TiB volume limit"
   worsen DSK warn "a disk exceeds 10 TiB - a plan with that much local disk is required"
@@ -465,6 +595,7 @@ echo "==================== SOURCE CHECK RESULT ===================="
 echo " OS:        ${PRETTY_NAME:-unknown} ($ARCH, kernel $KERNEL)"
 echo " Root:      ${ROOTFS:-unknown} on ${ROOTSRC:-unknown}$( [ "$LVM" = true ] && echo ' (LVM)')$( [ "$LUKS" = true ] && echo ' (LUKS)')$( [ "$RAID" = true ] && echo ' (RAID)')"
 echo " systemd:   $( [ "$HAS_SYSTEMD" = true ] && echo present || echo 'NOT FOUND')     SELinux: ${SELINUX:-n/a}"
+echo " Boot:      partition table ${PARTTABLE:-unknown}, $( [ "$MBRBOOT" = true ] && echo 'BIOS/MBR bootloader present' || echo 'NO BIOS/MBR bootloader detected' )$( [ "$EFI" = true ] && echo ', EFI boot' )"
 echo " Used:      ${USED_GB} GB"
 case "$PORT_OK" in
   true)  echo " Network:   replication port TCP $PROBE_PORT reachable";;

@@ -404,6 +404,19 @@ type SourceCheckReport struct {
 	RootOnRAID bool   `json:"root_on_raid"`
 	EFIBoot    bool   `json:"efi_boot"`
 	SELinux    string `json:"selinux"` // enforcing | permissive | disabled | ""
+	// F-31: partitioning/bootloader facts the tool used to collect (EFIBoot)
+	// and never use, or not collect at all — so an AWS-style partitioned
+	// source got a clean bill of health by construction (convertibleRootFS
+	// only judges the root FILESYSTEM). A migration reported "complete" and
+	// "VALIDATED as bootable" and produced a machine stuck at a grub> prompt
+	// because Linode's host-side GRUB never reads a config off a partition;
+	// these let the pre-flight check warn about that BEFORE the operator
+	// commits to a migration.
+	PartTable      string `json:"part_table,omitempty"`      // gpt | dos | none | unknown | ""(undetermined)
+	BiosGrubPart   bool   `json:"bios_grub_part"`            // GPT bios_grub/EF02 partition present
+	MBRBootloader  bool   `json:"mbr_bootloader"`            // a BIOS/MBR bootloader signature was found in the boot sector
+	SeparateBoot   bool   `json:"separate_boot"`             // /boot is its own mounted filesystem
+	BootloaderKind string `json:"bootloader_kind,omitempty"` // grub | other | none | unknown | ""(undetermined)
 	// Real data disks (pseudo devices already filtered by the script).
 	Disks     []SourceCheckDisk `json:"disks"`
 	UsedBytes int64             `json:"used_bytes"` // used storage across real filesystems

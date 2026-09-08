@@ -3,7 +3,10 @@ package appliance
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -314,5 +317,167 @@ func TestSourceCheckScriptBuildsPinFlagFromBareValue(t *testing.T) {
 	// -k must survive: the console certificate is self-signed by design.
 	if !strings.Contains(sourceCheckScript, "-k --pinnedpubkey") {
 		t.Error("the delivery needs -k: the console's certificate is self-signed")
+	}
+}
+
+// F-31: convertibleRootFS only judges the ROOT FILESYSTEM, so an AWS-style
+// partitioned source got a clean bill of health by construction — EFIBoot was
+// already collected and never used. assessSource must warn clearly for the
+// cases that land on linode/latest-64bit (Linode's own kernel instead of the
+// source's) after migration: a partitioned disk with no BIOS/MBR bootloader,
+// UEFI-only sources with no BIOS/MBR fallback, and non-GRUB bootloaders.
+func TestAssessPartitionedNoMBRBootloaderWarns(t *testing.T) {
+	r := api.SourceCheckReport{
+		OSID: "ubuntu", OSVersion: "24.04", Arch: "x86_64", HasSystemd: true,
+		RootFS: "ext4", DataPortOK: boolp(true),
+		PartTable: "gpt", MBRBootloader: false, BootloaderKind: "grub",
+	}
+	a := assessSource(r)
+	for _, name := range []string{"volume", "disk"} {
+		m := methodByName(t, a, name)
+		if m.Verdict == "ok" {
+			t.Errorf("method %s: partitioned + no MBR bootloader must not be ok, got verdict %q", name, m.Verdict)
+		}
+		found := false
+		for _, reason := range m.Reasons {
+			if strings.Contains(reason, "F-31") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("method %s: expected an F-31 reason among %v", name, m.Reasons)
+		}
+	}
+}
+
+// The MBR-bootloader-present case is the F-31 FIX (linode/direct-disk) — a
+// partitioned disk with a BIOS bootloader must NOT be warned about on this
+// basis alone.
+func TestAssessPartitionedWithMBRBootloaderOK(t *testing.T) {
+	r := api.SourceCheckReport{
+		OSID: "ubuntu", OSVersion: "24.04", Arch: "x86_64", HasSystemd: true,
+		RootFS: "ext4", DataPortOK: boolp(true),
+		Disks:     []api.SourceCheckDisk{{Name: "sda", SizeBytes: 80 << 30}},
+		PartTable: "gpt", MBRBootloader: true, BootloaderKind: "grub",
+	}
+	a := assessSource(r)
+	for _, name := range []string{"volume", "disk"} {
+		if v := methodByName(t, a, name).Verdict; v != "ok" {
+			t.Errorf("method %s: partitioned WITH an MBR bootloader must be ok, got %q (reasons: %v)", name, v, methodByName(t, a, name).Reasons)
+		}
+	}
+}
+
+// A partitionless source (PartTable unset/"none") must never trigger the
+// partitioned-no-MBR-bootloader warning, regardless of MBRBootloader.
+func TestAssessPartitionlessNeverWarnsOnMBRBootloader(t *testing.T) {
+	for _, pt := range []string{"", "none"} {
+		r := api.SourceCheckReport{
+			OSID: "ubuntu", OSVersion: "24.04", Arch: "x86_64", HasSystemd: true,
+			RootFS: "ext4", DataPortOK: boolp(true),
+			PartTable: pt, MBRBootloader: false,
+		}
+		a := assessSource(r)
+		for _, name := range []string{"volume", "disk"} {
+			m := methodByName(t, a, name)
+			for _, reason := range m.Reasons {
+				if strings.Contains(reason, "F-31") {
+					t.Errorf("part_table=%q method %s: unexpected F-31 warning for a partitionless source: %v", pt, name, m.Reasons)
+				}
+			}
+		}
+	}
+}
+
+// EFI-only boot with no BIOS/MBR fallback must warn even when PartTable
+// itself is not reported (a source-check script that could read
+// /sys/firmware/efi but not run sgdisk, say).
+func TestAssessEFIOnlyNoMBRFallbackWarns(t *testing.T) {
+	r := api.SourceCheckReport{
+		OSID: "ubuntu", OSVersion: "24.04", Arch: "x86_64", HasSystemd: true,
+		RootFS: "ext4", DataPortOK: boolp(true),
+		EFIBoot: true, MBRBootloader: false,
+	}
+	a := assessSource(r)
+	m := methodByName(t, a, "disk")
+	if m.Verdict == "fail" {
+		t.Errorf("EFI-only with no MBR fallback should warn, not fail: %v", m.Reasons)
+	}
+	if m.Verdict != "warn" {
+		t.Errorf("EFI-only with no MBR fallback must warn, got %q", m.Verdict)
+	}
+	found := false
+	for _, reason := range m.Reasons {
+		if strings.Contains(strings.ToUpper(reason), "UEFI") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a UEFI-specific reason among %v", m.Reasons)
+	}
+}
+
+// A non-GRUB bootloader must warn: the conversion only regenerates GRUB
+// configs, so a syslinux/lilo/other source is unverified.
+func TestAssessNonGRUBBootloaderWarns(t *testing.T) {
+	r := api.SourceCheckReport{
+		OSID: "debian", OSVersion: "12", Arch: "x86_64", HasSystemd: true,
+		RootFS: "ext4", DataPortOK: boolp(true),
+		PartTable: "dos", MBRBootloader: true, BootloaderKind: "syslinux",
+	}
+	a := assessSource(r)
+	m := methodByName(t, a, "disk")
+	if m.Verdict != "warn" {
+		t.Errorf("non-GRUB bootloader must warn, got %q (reasons %v)", m.Verdict, m.Reasons)
+	}
+	found := false
+	for _, reason := range m.Reasons {
+		if strings.Contains(strings.ToLower(reason), "non-grub") || strings.Contains(reason, "syslinux") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a non-GRUB-bootloader reason among %v", m.Reasons)
+	}
+}
+
+// A healthy BIOS/MBR Ubuntu source must stay fully "ok" -- the new fields'
+// zero values (as in TestAssessHealthyUbuntu, which sets none of them) must
+// never introduce a false-positive warning.
+func TestAssessHealthyUbuntuStaysOKWithNewFieldsUnset(t *testing.T) {
+	r := api.SourceCheckReport{
+		Hostname: "web01", OSID: "ubuntu", OSVersion: "24.04", OSPretty: "Ubuntu 24.04 LTS",
+		Arch: "x86_64", Kernel: "6.8.0", HasSystemd: true,
+		RootFS: "ext4", RootDevice: "/dev/sda1",
+		Disks:     []api.SourceCheckDisk{{Name: "sda", SizeBytes: 80 << 30}},
+		UsedBytes: 4 << 30, DataPortOK: boolp(true),
+	}
+	a := assessSource(r)
+	for _, m := range a.Methods {
+		if m.Verdict != "ok" {
+			t.Errorf("method %s verdict %q (reasons %v), want ok (new F-31 fields left at zero value must not warn)", m.Method, m.Verdict, m.Reasons)
+		}
+	}
+}
+
+// The rendered source-check script must be syntactically valid bash. Guards
+// against exactly the class of mistake that is easy to make when editing a
+// large embedded shell script inside a Go raw string (e.g. a stray backtick
+// in a comment terminating the Go string early, or a shell syntax slip in
+// the F-31 boot-fact gathering added to it).
+func TestSourceCheckScriptIsValidBash(t *testing.T) {
+	rendered := fmt.Sprintf(sourceCheckScript, "https://example.invalid:8443", "tok123", "203.0.113.5", 5100, "")
+	f, err := os.CreateTemp(t.TempDir(), "sourcecheck-*.sh")
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	if _, err := f.WriteString(rendered); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	f.Close()
+	cmd := exec.Command("bash", "-n", f.Name())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("rendered source-check script has a bash syntax error: %v\n%s", err, out)
 	}
 }
