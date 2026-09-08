@@ -557,8 +557,24 @@ constrained by the plan's disk size.
 > powers the instance off — the appliance then boots it from the local disk
 > automatically. Typical copy time for an 80 GiB image is **15–30 minutes**
 > (it reads the appliance's already-hydrated volume, not a slow fresh clone);
-> **no temporary volume is created**. The activity log posts a status line
-> every 15 minutes while it waits.
+> **no temporary volume is created**.
+>
+> The card tracks **three states** while this runs, and answers the question
+> operators actually have — whether it's safe to close the Lish/Weblish
+> window: **waiting for paste** (keep the window open), **copying N%** (byte
+> counts, elapsed time and an ETA, updated every second — keep the window
+> open until this reports finished), and **finished** (the instance already
+> powered itself off automatically — safe to close the window now; the
+> appliance is attaching any data volumes and booting from there). The
+> activity log gets a matching progress-aware event (roughly every 5% or
+> every couple of minutes, whichever comes first) instead of one identical
+> message on a fixed timer, plus one event for each remaining step (data
+> volumes hydrated, boot config created, volumes attached, boot requested) so
+> nothing between "image copied" and the final completion event goes silent.
+> If the appliance restarts mid-copy, the in-flight percentage cannot survive
+> (a restart also kills the pasted command's live connection) — the card
+> says the copy was interrupted and needs a fresh paste, rather than
+> guessing at a resumed percentage.
 
 The console then shows a **one-line command**, e.g.:
 
@@ -639,6 +655,14 @@ and the whole list refreshes every 5 seconds — no manual **Refresh** needed
 load with an existing session and a fresh sign-in through the login form (e.g.
 right after the appliance was updated/restarted).
 
+> The **transfer rate** (the "· N MiB/s" part) is only ever shown while a live
+> copy is actually being measured — during the initial sync and ongoing
+> replication. It disappears once replication stops (cutover's finalize/copy
+> steps, and the completed **image ready**/**launched** states), where any
+> "speed" would either be stale or a meaningless total-size-over-total-time
+> average. Byte counts throughout the console use **binary (IEC) units** —
+> KiB/MiB/GiB — since every value is a raw byte count, not a decimal one.
+
 Each migration shows aggregate progress and a **per-disk table** (expand
 **Disks**), plus a checklist that requires **all disks**:
 - ✔ Agent connected — _N/N disks checked in_
@@ -669,7 +693,12 @@ Cutover is **three steps: freeze the image, power off the source, launch**.
 
 1. Stop the source's apps/databases and let the **RPO lag drop to ~0** (shown on
    the card), so the frozen copy is current.
-2. Click **Cutover instance**. In the dialog you can optionally set a **name
+2. Click **Cutover instance**. This dialog is the tallest in the console — its
+   longer explanations ("Before you click", and the multi-disk capture-skew
+   details) are tucked behind **collapsible disclosures** so the fields and
+   the confirm checkbox stay in easy reach, and the dialog itself **scrolls
+   independently of the page** on a short screen instead of running off the
+   bottom of the viewport. In the dialog you can optionally set a **name
    for the new instance**, and — for a **multi-disk** migration — a **name for
    the data volume(s)** (data disks become Block Storage volumes) — blank
    keeps the `<migration>-cutover` default (names are sanitized to Linode's

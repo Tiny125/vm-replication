@@ -90,6 +90,22 @@ type Server struct {
 	// cutoverCmds:    migrationID -> the Lish copy command the console shows.
 	cutoverStreams sync.Map
 	cutoverCmds    sync.Map
+	// cutoverCopy tracks the disk-boot cutover's Lish image-copy progress —
+	// migrationID -> *cutoverCopyState (paste/started/finished timestamps,
+	// bytes sent vs. the exact total, and an attempt counter). Kept in its
+	// OWN map, separate from cutoverStreams/cutoverCmds: those are cleared by
+	// dropCutoverStream the INSTANT the copy completes (see cutover_stream.go),
+	// which would otherwise erase the "finished" state before the console had
+	// a chance to show it. In-memory only, like the maps above — a restart
+	// also kills the in-flight HTTP response, so there is nothing valid to
+	// resume; see restoreCutoverStream / cutoverCopyMarkInterrupted.
+	cutoverCopy sync.Map
+	// testAfterCutoverChunk, when non-nil, is called after each chunk
+	// streamImageChunked reports in handleCutoverImage. It exists ONLY so
+	// tests can deterministically pause a streaming response mid-transfer to
+	// assert on progress while the request is still open, without relying on
+	// TCP/socket-buffer timing; production code never sets it.
+	testAfterCutoverChunk func()
 	// cutoverFreezing marks migrations whose guided cutover step 1 (drain +
 	// freeze) is currently running, so the console can tell the operator to keep
 	// the source running until the card says to power it off.

@@ -229,17 +229,30 @@ try{var t=localStorage.getItem('vmrepl-theme');if(t==='dark'||t==='light')docume
  .modal-overlay.closing{animation:fadeout .15s ease forwards}
  @keyframes fadein{from{opacity:0}to{opacity:1}}
  @keyframes fadeout{to{opacity:0}}
+ /* The dialog is a bounded flex column: h3 (title) and .modal-actions (buttons)
+    are pinned flex:none siblings; .modal-scroll is the only part that grows AND
+    shrinks, so on a short viewport IT scrolls instead of the whole dialog
+    overflowing off-screen (the bug: the fields and confirm checkbox below the
+    fold were unreachable without zooming out). max-height is given twice —
+    100% (in case the visualViewport unit isn't supported) then 100dvh — since
+    iOS Safari resolves position:fixed against the LARGE viewport, so a plain vh
+    figure can exceed what's actually visible. */
  .modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow-modal);
-   max-width:460px;width:100%;padding:24px 24px 20px;animation:pop .18s cubic-bezier(.2,.8,.3,1)}
+   max-width:460px;width:100%;padding:24px 24px 20px;animation:pop .18s cubic-bezier(.2,.8,.3,1);
+   display:flex;flex-direction:column;max-height:calc(100% - 40px);max-height:calc(100dvh - 40px)}
  @keyframes pop{from{transform:scale(.94);opacity:.5}to{transform:scale(1);opacity:1}}
- .modal h3{font-size:17px;font-weight:600;letter-spacing:-.01em;margin:0 0 10px}
+ .modal h3{flex:none;font-size:17px;font-weight:600;letter-spacing:-.01em;margin:0 0 10px}
+ /* min-height:0 is mandatory on a flex child that must scroll: without it the
+    default min-height:auto refuses to shrink below the content's own height,
+    which silently turns overflow-y:auto into a no-op and reproduces the bug. */
+ .modal-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;margin:0 -4px;padding:0 4px}
  .modal-body{font-size:14px;color:var(--text);line-height:1.55}
  .modal-body b{font-weight:600}
  .modal-body .warn{color:var(--red);font-weight:500}
  .modal-check{display:flex;align-items:flex-start;gap:9px;margin-top:16px;font-size:13.5px;color:var(--text);
    cursor:pointer;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:11px 13px}
  .modal-check input{width:auto;margin-top:2px;cursor:pointer;accent-color:var(--accent)}
- .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
+ .modal-actions{flex:none;display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
  .toast-wrap{position:fixed;top:18px;right:18px;z-index:200;display:flex;flex-direction:column;gap:10px;max-width:360px}
  .toast{display:flex;align-items:flex-start;gap:9px;background:var(--surface);border:1px solid var(--border);
    border-left:4px solid var(--muted);border-radius:12px;box-shadow:var(--shadow-toast);
@@ -438,7 +451,20 @@ function copyText(t,btn){
 }
 function legacyCopy(t,done){const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.focus();ta.select();try{document.execCommand('copy');done&&done()}catch(e){}document.body.removeChild(ta)}
 function flash(el){if(!el)return;el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash')}
-function fmtBytes(n){if(!n)return '0 B';const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return n.toFixed(1)+' '+u[i]}
+// fmtBytes renders a binary byte count (every value it receives is a raw
+// byte count, so IEC units — KiB/MiB/GiB — are used throughout, never the
+// decimal KB/MB/GB). Hardened against non-numeric/negative/non-finite input,
+// and every branch returns a toFixed(1) string — no branch may return the
+// raw Number, which JS prints in exponential notation for a tiny value (a
+// stale rate that decayed toward zero once rendered as
+// "4.3143739454258046e-19 B").
+function fmtBytes(n){
+  n=Number(n);
+  if(!isFinite(n)||n<=0)return '0 B';
+  const u=['B','KiB','MiB','GiB','TiB'];let i=0;
+  while(n>=1024&&i<u.length-1){n/=1024;i++}
+  return n.toFixed(1)+' '+u[i];
+}
 function fmtDur(s){if(s==null||s<0)return '—';s=Math.round(s);if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
 function fmtTime(t){try{return new Date(t).toLocaleTimeString([],{hour12:false})}catch(e){return ''}}
 
@@ -458,9 +484,14 @@ function uiDialog(opts){
     // returned as out[id]=bool on confirm.
     const checks=(opts.checkboxes||[]).map(c=>'<label class="modal-check"><input type="checkbox" id="__c_'+c.id+'"'+(c.checked?' checked':'')+'><span>'+esc(c.label)+'</span></label>').join('');
     const cancelBtn=opts.cancel===false?'':'<button class="modal-cancel">'+esc(opts.cancelText||'Cancel')+'</button>';
+    // Everything that can grow tall (prose + fields + checkbox cards) lives in
+    // ONE .modal-scroll wrapper so it scrolls together; only <h3> and
+    // .modal-actions are pinned outside it. The #__f_*/#__mck/#__c_* lookups
+    // below are ov.querySelector(...) — document-order queries against the
+    // whole overlay — so this extra wrapper doesn't affect them.
     ov.innerHTML='<div class="modal'+(opts.wide?' wide':'')+'" role="dialog" aria-modal="true">'+
       '<h3>'+esc(opts.title||'')+'</h3>'+
-      '<div class="modal-body">'+(opts.html||'')+'</div>'+fields+check+checks+
+      '<div class="modal-scroll"><div class="modal-body">'+(opts.html||'')+'</div>'+fields+check+checks+'</div>'+
       '<div class="modal-actions">'+cancelBtn+
       '<button class="modal-ok '+(opts.okDanger?'danger':'primary')+'">'+esc(opts.okText||'OK')+'</button></div></div>';
     document.body.appendChild(ov);
@@ -811,11 +842,17 @@ function disks(m){return m.disks||[]}
 function allDone(m){const d=disks(m);return d.length>0&&d.every(x=>x.full_sync_done)}
 function bytesTotal(m){return disks(m).reduce((a,d)=>a+(d.bytes_on_wire||0),0)}
 function anyDiskError(m){return disks(m).map(d=>d.last_error).filter(Boolean)[0]||''}
+// LIVE_REPL_STATES lists the migration states during which the source agent is
+// actively streaming: RPO lag, throughput, and the replication start/pause/
+// resume controls are only meaningful then. Shared by rpoText, pillFor,
+// replSpeed and migCard's actions row — it used to be written out separately
+// at each of those (a real triplication that grew a 4th copy with replSpeed).
+const LIVE_REPL_STATES=['created','awaiting_agent','replicating','ready'];
 // rpoText renders the replication lag (RPO). Only meaningful while replication is
-// live (created/awaiting_agent/replicating/ready); once cutover is initiated the
-// stream stops, so a stale lag would mislead — show a dash from then on.
+// live (LIVE_REPL_STATES); once cutover is initiated the stream stops, so a
+// stale lag would mislead — show a dash from then on.
 function rpoText(v,m){
-  const replicating=['created','awaiting_agent','replicating','ready'].includes(m.state);
+  const replicating=LIVE_REPL_STATES.includes(m.state);
   return (replicating && v.rpo_seconds) ? Math.round(v.rpo_seconds)+'s' : '—';
 }
 
@@ -834,7 +871,11 @@ async function startMig(id,btn){
     '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> stop replication, take a consistent final pass (the source root is briefly remounted read-only), then <b>convert the boot image and check its GRUB configuration for errors</b> — all while the source is still running, so a conversion problem surfaces before you power off. This checks the configuration file, not a live boot; the guest’s actual boot is verified separately after you launch.</div>'+
     '<div style="margin-top:4px"><b>Step 2:</b> once step 1 reports the image is validated, power off the source server.</div>'+
     '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the validated image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('clones the validated image and launches a new Linode'+planNote+'.'):'clones every disk into launchable volumes.'))+'</div></div>';
-  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the final pass is current. The final pass tries to remount the source root <b>read-only</b> for a perfectly clean image — if writers are still holding the root open (normal on a running system), the cutover <b>automatically falls back</b> to the current crash-consistent data, which is fsck-repaired on convert and has its GRUB configuration checked for errors before you power anything off (a real boot is verified separately, after you launch). Tick the box below to skip the read-only attempt if the source is already powered off or idle.</div>';
+  // Longest prose block — collapsed by default (<details>) so it doesn't push
+  // the fields and confirm checkbox further down the dialog; the operator can
+  // still open it, and it's still fully present in the DOM for the tests below
+  // that string-match it.
+  const prep='<details style="margin-top:8px"><summary>Before you click — tips for a clean cutover</summary><div class="muted" style="font-size:12px">Stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the final pass is current. The final pass tries to remount the source root <b>read-only</b> for a perfectly clean image — if writers are still holding the root open (normal on a running system), the cutover <b>automatically falls back</b> to the current crash-consistent data, which is fsck-repaired on convert and has its GRUB configuration checked for errors before you power anything off (a real boot is verified separately, after you launch). Tick the box below to skip the read-only attempt if the source is already powered off or idle.</div></details>';
   // Optional names/credentials the cutover applies — both methods CREATE the
   // instance (and, for volume boot, the cutover volume) at this step.
   const defName=esc((meta.name||'')+'-cutover');
@@ -850,8 +891,10 @@ async function startMig(id,btn){
   // or metadata live on different disks. The only way to guarantee every disk
   // reflects the exact same instant is to power the source off before step 3.
   // Single-disk migrations have no such gap, so this stays out of their way.
+  // The one-line RED warning must always stay visible (never behind a
+  // disclosure) — only its longer explanatory paragraph is collapsible.
   const multiDiskWarn=nDisks>1?('<div class="warn" style="margin-top:8px">Multi-disk migration — the disks are captured seconds-to-minutes apart.</div>'+
-    '<div class="muted" style="font-size:12px;margin-top:4px">While the source keeps running, each disk reaches its final consistent pass at a different moment (measured: 54s apart on a two-disk test), so the destination\'s disks can reflect different instants of the source — a real risk if an application\'s data and its write-ahead log/index/metadata live on different disks. The only way to guarantee every disk reflects the exact same instant is to <b>power the source off before step 3</b> (Launch instance).</div>'):'';
+    '<details style="margin-top:4px"><summary>Why, and what to do about it</summary><div class="muted" style="font-size:12px">While the source keeps running, each disk reaches its final consistent pass at a different moment (measured: 54s apart on a two-disk test), so the destination\'s disks can reflect different instants of the source — a real risk if an application\'s data and its write-ahead log/index/metadata live on different disks. The only way to guarantee every disk reflects the exact same instant is to <b>power the source off before step 3</b> (Launch instance).</div></details>'):'';
   if(!disk||nDisks>1)fields.push({id:'vol_name',label:(disk?'Name for the data volume(s) (optional)':'New volume name (optional)'),type:'text',placeholder:'default: '+defName});
   fields.push(
     {id:'root_pw',label:'Root password for the migrated instance (optional)',type:'password',placeholder:'leave blank to keep the source’s credentials'},
@@ -861,6 +904,10 @@ async function startMig(id,btn){
     title:'Cut over migration #'+id+' — step 1 of 3: stop replication & take a consistent pass',
     okText:'Stop replication & continue',
     html:how+access+prep+multiDiskWarn,
+    // This is the tallest dialog in the console (multiple prose blocks, a
+    // 2-3 line title, 3-4 fields, a checkbox card) — give it the wide modal
+    // in addition to the scroll fix, so scrolling is rarely even needed.
+    wide:true,
     fields:fields,
     // Default to the read-only quiesce, with an opt-out for an
     // already-powered-off/idle source.
@@ -1021,13 +1068,32 @@ function syncPct(v,m){
 function progBar(width,indet){
   return '<div class="prog'+(indet?' indet':'')+'"><div style="width:'+(indet?35:Math.round(width))+'%"></div></div>';
 }
-// replSpeed estimates copy throughput (bytes/sec). It prefers the backend's
-// LIVE in-session rate (accurate while a full-sync session is actively
-// transferring), and otherwise falls back to the change in total bytes received
-// between polls, smoothed with an EMA (covers reconnecting/short sessions where
-// bytes only update at session completion). Returns -1 until measurable.
+// replSpeed estimates copy throughput (bytes/sec), but ONLY while a live copy
+// is actually being measured (LIVE_REPL_STATES) — throughput is meaningless
+// once replication has stopped: cutover states freeze bytes_on_wire (the
+// receivers were drained), and image_ready/launched have no live session at
+// all, so reporting total-size ÷ cutover-duration there isn't a rate, it's
+// noise. It prefers the backend's LIVE in-session rate (accurate while a
+// full-sync session is actively transferring), and otherwise falls back to
+// the change in total bytes received between polls, smoothed with an EMA
+// (covers reconnecting/short sessions where bytes only update at session
+// completion). Returns -1 until measurable.
+//
+// A migration leaving a live-replication state (e.g. into "migrating" at
+// cutover) must drop its sample immediately: without this, the fallback
+// branch computes a zero instantaneous rate every poll (bytes frozen,
+// percent_done -1) and halves the EMA forever, never resetting and never
+// quite reaching zero — measured live: ~88 halvings reached ~1e-19, which
+// JS then rendered as "4.3143739454258046e-19 B/s".
 const speedSamples={}; // id -> {bytes, t, ema}
+// MIN_MEASURABLE_BPS floors the EMA: below this it reports "unknown" (-1)
+// instead of a vanishingly small (and eventually exponential-notation) value.
+const MIN_MEASURABLE_BPS=1024; // 1 KiB/s
 function replSpeed(v,m){
+  if(!LIVE_REPL_STATES.includes(m.state)){
+    delete speedSamples[m.id]; // stale sample must not decay across states
+    return -1;
+  }
   // Live in-session rate: bytes written this session / session elapsed.
   const tot=disks(m).reduce((a,d)=>a+(d.size_bytes||0),0);
   if(v.percent_done>=0 && v.elapsed_seconds>0 && tot>0) return v.percent_done/100*tot/v.elapsed_seconds;
@@ -1035,10 +1101,11 @@ function replSpeed(v,m){
   const now=Date.now(), bytes=bytesTotal(m), s=speedSamples[m.id];
   if(!s||bytes<s.bytes){speedSamples[m.id]={bytes,t:now,ema:-1};return -1;}
   const dt=(now-s.t)/1000;
-  if(dt<4)return s.ema;            // don't resample faster than ~the poll interval
+  if(dt<4)return (s.ema>0&&s.ema<MIN_MEASURABLE_BPS)?-1:s.ema; // don't resample faster than ~the poll interval
   const inst=Math.max(0,(bytes-s.bytes)/dt);
   s.ema = s.ema<0 ? inst : 0.5*inst+0.5*s.ema;
   s.bytes=bytes; s.t=now;
+  if(s.ema>0 && s.ema<MIN_MEASURABLE_BPS)return -1; // decayed into noise — report unknown, not a tiny number
   return s.ema;
 }
 function progressLine(v,m){
@@ -1084,6 +1151,24 @@ function liveDur(sinceISO,fallbackSecs){
   if(isNaN(t)||t<=0)return fmtDur(fallbackSecs);
   return '<span class="livedur" data-since="'+t+'">'+fmtDur((Date.now()-t)/1000)+'</span>';
 }
+// cutoverCopyStatusHTML renders the live status line inside the disk-boot
+// cutover's "paste the command" banner — 'waiting' or 'copying' (with real
+// % / bytes / elapsed / ETA) — and always answers whether the Weblish window
+// may be closed: keep it open here, since closing it mid-copy isn't
+// confirmed safe. Separate from the 'finished' banner (see migCard), which
+// renders once the command itself is gone.
+function cutoverCopyStatusHTML(v){
+  const phase=v.cutover_copy_phase||'waiting';
+  if(phase==='copying'){
+    const tot=v.cutover_copy_total_bytes||0,sent=v.cutover_copy_sent_bytes||0;
+    const pct=tot>0?Math.min(100,sent/tot*100):0;
+    return '<b>Status: copying — '+pct.toFixed(1)+'%</b> ('+fmtBytes(sent)+' of '+fmtBytes(tot)+'), elapsed '+fmtDur(v.cutover_copy_elapsed_seconds)+
+      (v.cutover_copy_eta_seconds>=0?(', ETA ~'+fmtDur(v.cutover_copy_eta_seconds)):'')+
+      '. <b>Keep this Weblish window open</b> until this card reports the copy has finished.';
+  }
+  return '<b>Status: waiting</b> for the command above to be pasted. <b>Keep this Weblish window open</b> — do not close it until this card reports the copy has finished.'+
+    (v.cutover_copy_interrupted?' <i>(A previous copy attempt was interrupted by an appliance restart — paste the fresh command above to start again.)</i>':'');
+}
 function diskTable(m){const d=disks(m);if(!d.length)return '';
   let h='<table><tr><th>Disk</th><th>Device</th><th>Size</th><th>Port</th><th>Baseline</th><th>Volume / note</th></tr>';
   for(const x of d){const note=x.last_error?('<span class="x">'+esc(x.last_error)+'</span>'):(x.artifact_id?esc(x.artifact_id):(x.volume_id?('vol '+x.volume_id):'file'));
@@ -1099,7 +1184,7 @@ function stateLabel(s){return ({created:'created',awaiting_agent:'waiting for ag
 // operator sees connect → start at a glance; otherwise it uses the migration state.
 function pillFor(v,m){
   // Paused takes precedence at any replication-phase state.
-  if(v.replication_paused && ['created','awaiting_agent','replicating','ready'].includes(m.state))
+  if(v.replication_paused && LIVE_REPL_STATES.includes(m.state))
     return '<span class="pill warn">paused</span>';
   if((m.state==='awaiting_agent'||m.state==='created') && !v.replication_started){
     if(v.agent_connected)return '<span class="pill ok">agent connected</span>';
@@ -1243,6 +1328,16 @@ function migCard(v){
   // Rescue Mode and is waiting for the operator to paste ONE command in its Lish
   // console (the command streams the image onto the local disk and powers the
   // instance off; the appliance finishes automatically from there).
+  //
+  // Three real states, driven by v.cutover_copy_phase: 'waiting' (paste
+  // banner + command), 'copying' (same banner, now with live % / bytes /
+  // elapsed / ETA via cutoverCopyStatusHTML — refreshed every second by the
+  // #cutstat cell below, same as the rest of the live progress), and
+  // 'finished'. dropCutoverStream erases v.cutover_copy_cmd the INSTANT the
+  // bytes finish sending, so 'finished' is rendered from a SEPARATE banner
+  // keyed off the phase field alone (which survives that) — otherwise the
+  // whole post-copy stretch (hydrating volumes, attaching, booting) would go
+  // back to being silent, which is the bug being fixed here.
   if(m.state==='migrating' && v.cutover_copy_cmd){
     b+='<div class="banner warn">'+
       '<b>Action needed — copy the image onto the local disk.</b>'+
@@ -1251,7 +1346,11 @@ function migCard(v){
       '<div style="margin-top:4px">3. Paste this one line there:</div>'+
       '<div style="display:flex;gap:8px;align-items:flex-start;margin-top:6px"><pre id="cutcmd'+m.id+'" style="flex:1;margin:0">'+esc(v.cutover_copy_cmd)+'</pre>'+
       '<button onclick="copyText(document.getElementById(\'cutcmd'+m.id+'\').textContent,this)">Copy</button></div>'+
-      '<div style="font-size:12px;margin-top:6px">The copy shows live progress in the Lish session and powers the instance off when it finishes — the appliance then boots your server from its local disk automatically. Nothing else to click here.</div></div>';
+      '<div id="cutstat'+m.id+'" style="font-size:12px;margin-top:8px">'+cutoverCopyStatusHTML(v)+'</div></div>';
+  } else if(m.state==='migrating' && v.cutover_copy_phase==='finished'){
+    b+='<div class="banner ok">'+
+      '<b>Image copy finished.</b>'+
+      '<div style="margin-top:6px">The instance already powered itself off automatically once the copy completed — <b>it is safe to close the Weblish window now</b>. The appliance is finishing up (attaching any data volumes and booting your server from its local disk); this card will update automatically. This can take a few minutes.</div></div>';
   }
 
   // Two groups: pre-migration (environment readiness while replicating) and
@@ -1344,7 +1443,7 @@ function migCard(v){
   }else{
     // Replication controls (start / pause / resume) precede the cutover button,
     // but only during the replication phase.
-    const ctrl=['created','awaiting_agent','replicating','ready'].includes(m.state);
+    const ctrl=LIVE_REPL_STATES.includes(m.state);
     if(ctrl && !v.replication_started){
       b+='<button class="primary"'+(v.can_replicate?'':' disabled title="Waiting for the agent connection to be validated"')+' onclick="startReplication('+m.id+',this,false)">Start replication</button>'+
         infoIcon('Replication does not start automatically. Once the agent connection shows a green tick, this begins the initial full sync.');
@@ -1463,6 +1562,7 @@ function startTimers(){
         set('#disks'+id,disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining'));
         set('#prog'+id,progressLine(v,m));
         set('#rpo'+id,rpoText(v,m));
+        set('#cutstat'+id,cutoverCopyStatusHTML(v)); // live % / bytes / elapsed / ETA while the copy runs
       }).catch(()=>{});
     });
   },1000);
@@ -1498,13 +1598,5 @@ function cycleTheme(){
   applyTheme(order[themePref()]||'auto');
 }
 applyTheme(themePref());
-
-/* fmtBytes renders a byte count for the appliance line. */
-function fmtBytes(n){
-  n=Number(n)||0;
-  const u=['B','KB','MB','GB','TB']; let i=0;
-  while(n>=1024&&i<u.length-1){n/=1024;i++}
-  return (i===0?n:n.toFixed(1))+' '+u[i];
-}
 </script>
 </body></html>`

@@ -320,6 +320,27 @@ type MigrationView struct {
 	// source running" until this clears and the state parks in awaiting_cutover.
 	CutoverFreezing bool `json:"cutover_freezing,omitempty"`
 
+	// Disk-boot cutover Lish-copy progress: which of the three states
+	// (waiting for the operator to paste / copying / finished) the copy is
+	// in, plus the numbers the console renders for "copying". Populated
+	// whenever a copy has ever been registered for this migration (even
+	// after CutoverCopyCmd above has been cleared at copy completion — this
+	// is the ONLY signal that survives long enough for the console to show
+	// "finished", since the stream/cmd are dropped the instant the bytes
+	// finish sending). Empty CutoverCopyPhase means no cutover copy has run.
+	CutoverCopyPhase          string `json:"cutover_copy_phase,omitempty"` // "waiting" | "copying" | "finished"
+	CutoverCopySentBytes      int64  `json:"cutover_copy_sent_bytes,omitempty"`
+	CutoverCopyTotalBytes     int64  `json:"cutover_copy_total_bytes,omitempty"`
+	CutoverCopyElapsedSeconds int64  `json:"cutover_copy_elapsed_seconds,omitempty"`
+	CutoverCopyETASeconds     int64  `json:"cutover_copy_eta_seconds,omitempty"` // -1 when unknown
+	CutoverCopyAttempt        int    `json:"cutover_copy_attempt,omitempty"`
+	// CutoverCopyInterrupted is true when an appliance restart lost an
+	// in-flight copy's progress (the counter is in-memory only, and a
+	// restart also kills the pasted command's live HTTP connection) — the
+	// console must say the copy was interrupted and needs a re-paste, never
+	// fabricate a resumed percentage.
+	CutoverCopyInterrupted bool `json:"cutover_copy_interrupted,omitempty"`
+
 	// Gated replication start + pause/resume (computed for the console):
 	//   AgentConnected     — every disk's agent has handshaked recently (tick).
 	//   ConnectionFailed   — enrolled, the grace window elapsed, and the agent has
