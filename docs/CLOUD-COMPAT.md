@@ -36,21 +36,43 @@ These apply to every source, cloud or on-prem:
 | Predictable-NIC renaming | ✅ | `net.ifnames=0 biosdevname=0` on the kernel cmdline **plus** a full network-config reset — covers EC2's `ens5`, GCP's `ens4`, Azure's `eth0`. |
 | Network config reset to DHCP/eth0 | ✅ | netplan, systemd-networkd, ifupdown, NetworkManager, and RHEL `ifcfg-*` are all backed up and replaced with one authoritative DHCP config — the source's static IP/DNS cannot leak onto the new instance. |
 | virtio drivers in the initramfs | ✅ | Injected for both **initramfs-tools** (Debian/Ubuntu) and **dracut** (RHEL family); all mainstream distro kernels ship the modules. |
-| GRUB regeneration + verification | ✅ | For partitioned disks, GRUB config is regenerated and **verified to contain boot entries** — the convert fails loudly rather than leaving a `grub>` disk. |
+| GRUB config regeneration + syntax check | ⚠️ | For partitioned disks, GRUB config is regenerated and checked to contain boot entries — the convert fails loudly rather than leaving a `grub>` disk with a broken config. **This is a config-file check, not proof the disk boots** — see the boot-firmware note below (F-31): a syntactically valid `grub.cfg` on a partitioned disk still would not boot via `linode/grub2`, because Linode's host-side GRUB never reads a config off a partition. |
 | Separate `/boot` partition | ✅ | Mounted from the image's fstab before the chroot. |
 | Stale swap entries | ✅ | fstab swap pointing at a non-migrated device (separate cloud swap disk) is disabled, avoiding a ~90s boot stall. |
 | Root password / SSH key seeding | ✅ | Cutover dialog seeds root access so the instance is reachable without rescue surgery. |
 | Fresh machine-id | ✅ | Reset so the migrated host doesn't collide with the still-existing source identity. |
 | xfs roots (RHEL family) | ✅ | `xfs_repair` path exists alongside e2fsck. |
 
-**Boot-firmware note that matters for all three clouds:** Linode's "GRUB 2"
-boot mode runs a **host-side GRUB that reads the guest's `grub.cfg`** — it
-does not chain the disk's MBR. So even a **UEFI-only source** (no BIOS boot
-path on disk) generally boots on Linode, because the convert regenerates a
-full `grub.cfg` and only needs that file to be valid. The in-chroot
-`grub-install --target=i386-pc` may warn on GPT disks without a `bios_grub`
-partition — that warning is tolerated by design; the hard requirement
-(verified, loud failure) is a valid `grub.cfg`.
+**Boot-firmware note that matters for all three clouds — corrected after F-31,
+a real production incident.** A live AWS EC2 -> Linode migration (Ubuntu
+24.04, a **partitioned** AMI: separate `/boot`, EFI System Partition, BIOS-boot
+partition) reported "complete" and "VALIDATED as bootable" and produced a
+machine stuck at a `grub>` prompt. Proven at the prompt itself, not inferred:
+
+    grub> ls (hd0,gpt16)/grub/grub.cfg      -> grub.cfg   (present, correct)
+    grub> [drops straight to the shell; the config is never loaded]
+
+**The previous claim in this doc — that Linode's `linode/grub2` boot mode
+reads the guest's `grub.cfg` regardless of partitioning — is FALSE for a
+PARTITIONED disk.** It is true only for a **partitionless** disk (the
+filesystem directly on the device, no partition table) — the shape Linode's
+own images happen to use, which is why this was never caught before F-31:
+every migration tested before it used a Linode source.
+
+The tool now picks the boot target from the disk's actual shape:
+
+| Disk shape | Linode boot target | Notes |
+|---|---|---|
+| Partitionless, `grub.cfg` present | `linode/grub2` | Reads the guest's config directly off the root filesystem. The only case the old claim was actually true for. |
+| Partitioned, BIOS/MBR bootloader written | `linode/direct-disk`, `root_device=/dev/sda` (the **whole disk** — a partition here fails the boot outright) | Boots whatever is in the disk's MBR. Verified live: `linode/direct-disk` booted the AWS AMI above unattended. |
+| No usable bootloader at all | Linode's own kernel (`linode/latest-64bit`) | No GRUB config to read either way. |
+| Partitioned, no MBR bootloader (UEFI-only / non-GRUB source) | Linode's own kernel, with a loud warning | Neither `linode/grub2` nor `direct-disk` can boot it. Running Linode's kernel instead of the source's has silently disabled SELinux on a real RHEL-family migration even though `/etc/selinux/config` still said `enforcing` — verify the guest boot on the Lish console before decommissioning the source whenever this warning appears. |
+
+So a **UEFI-only source with no BIOS/MBR fallback bootloader does NOT
+generally boot on Linode** — the opposite of what this doc previously
+claimed. The in-chroot `grub-install --target=i386-pc` succeeding or failing
+now drives a real branch in the boot-target decision (via the
+`vmrepl-mbrboot`/`vmrepl-grubinstall` markers), not just a tolerated warning.
 
 ---
 
@@ -61,7 +83,7 @@ partition — that warning is tolerated by design; the hard requirement
 | Aspect | Finding |
 |---|---|
 | Device naming | 🧪 Nitro instances expose EBS as `/dev/nvme0n1` (partitions `nvme0n1p1…`); older Xen types use `/dev/xvda`. Enter the **whole disk** (`/dev/nvme0n1`, not `p1`) on the create form — the "find source details" helper prints it. The agent reads NVMe devices like any block device. |
-| Boot firmware | ✅/🧪 Most x86 AMIs are BIOS; AL2023/Ubuntu UEFI-preferred AMIs are covered by the host-side GRUB 2 note above. |
+| Boot firmware | ✅ Most x86 AMIs are BIOS with an MBR bootloader — `linode/direct-disk` (F-31, see the boot-firmware note above). ⚠️ AL2023/Ubuntu UEFI-preferred AMIs that carry NO BIOS/MBR fallback bootloader fall back to Linode's own kernel with a loud warning — verify the guest boot on Lish before decommissioning the source. |
 | Root filesystem | ✅ Ubuntu (ext4) and Amazon Linux / RHEL (xfs, plain partition) convert fine. ✅ LVM roots are activated and probed too (§3.1); 🧪 verify live once. |
 | Cloud agents | ✅ cloud-init / amazon-ssm-agent / hibinit-agent are disabled at conversion (§3.2). |
 | Instance-store (ephemeral) disks | ⚠️ Never add them as migration disks — they are not the OS disk and their data is disposable by design. Migrate **EBS** volumes only. |
@@ -73,7 +95,7 @@ partition — that warning is tolerated by design; the hard requirement
 | Aspect | Finding |
 |---|---|
 | Device naming | 🧪 OS disk is `/dev/sda`. ⚠️ `/dev/sdb` is the **ephemeral resource disk** — never migrate it; migrate `/dev/sda` only. |
-| Boot firmware | ✅ Gen1 VMs are BIOS (cleanest case). 🧪 Gen2 VMs are UEFI-only — expected to boot via Linode's host-side GRUB 2 after the convert regenerates `grub.cfg`; verify live. |
+| Boot firmware | ✅ Gen1 VMs are BIOS with an MBR bootloader — `linode/direct-disk` (F-31, see the boot-firmware note above). ⚠️ Gen2 VMs are UEFI-only; if they carry no BIOS/MBR fallback bootloader they fall back to Linode's own kernel with a loud warning, NOT Linode's host-side GRUB reading `grub.cfg` off a partition (that does not work — F-31). Verify live. |
 | Resource-disk fstab | ✅/🧪 Azure images mount the resource disk with `nofail` (no boot hang); waagent-managed swap on it disappears silently — the new stale-swap handling covers fstab-declared swap. |
 | Cloud agents | ✅ waagent and cloud-init (whose Azure datasource would otherwise poll the wireserver for minutes at boot) are disabled at conversion (§3.2). |
 | RHEL-family images | ✅ enforcing sources get an automatic first-boot relabel (§3.3). |
@@ -84,7 +106,7 @@ partition — that warning is tolerated by design; the hard requirement
 | Aspect | Finding |
 |---|---|
 | Device naming | 🧪 Boot disk is `/dev/sda` (partitioned; newer images UEFI with GPT). |
-| Boot firmware | 🧪 Newer GCP images are UEFI-only — same host-side GRUB 2 expectation as Azure Gen2; verify live. |
+| Boot firmware | ⚠️ Newer GCP images are UEFI-only — same as Azure Gen2 above: without a BIOS/MBR fallback bootloader they fall back to Linode's own kernel with a loud warning, not Linode's host-side GRUB (F-31). Verify live. |
 | Cloud agents | ✅ google-guest-agent / osconfig / startup-scripts are disabled at conversion (§3.2). |
 | OS Login | ⚠️ If the project used **OS Login**, sshd/PAM are wired to Google's `google_authorized_keys`/`pam_oslogin` — on Linode those return nothing, so **metadata-based SSH users stop working**. Mitigation already built in: seed a root password/SSH key at cutover (the dialog fields); local accounts keep working. |
 | Network egress | 🧪 Default VPC egress is allow; same port requirements. |
@@ -99,8 +121,11 @@ When no plain partition carries the root, the convert now activates the volume
 groups **whose PVs live on the migrated disk only** (never the appliance's own
 LVM), probes their logical volumes for the root, and deactivates those VGs
 again when done so the volume is free for the clone/stream. LVM layouts keep
-their separate plain `/boot` partition, which is what Linode's host-side GRUB 2
-reads. 🧪 Verify live with one RHEL/LVM image.
+their separate plain `/boot` partition — but that disk is still **partitioned**
+(the LVM PV sits in a partition, `/boot` in another), so it boots via
+`linode/direct-disk` (F-31) when a BIOS/MBR bootloader was written, not by
+Linode's host-side GRUB reading `grub.cfg` off `/boot`. 🧪 Verify live with one
+RHEL/LVM image.
 
 ### 3.2 ✅ Cloud agents are disabled at conversion — HANDLED
 cloud-init (provider datasource), Azure **waagent**, GCP **google-guest-agent**
