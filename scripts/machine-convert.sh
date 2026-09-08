@@ -407,6 +407,75 @@ detect_bootloader() {
   echo none
 }
 
+# bios_grub_partition_has_content DEV -> 0 (has content) | 1 (absent/no info)
+#
+# On a GPT disk, GRUB commonly embeds its core.img in a small bios_grub
+# (EF02) partition rather than (or in addition to) the protective MBR's boot
+# code. Finds that partition via sgdisk, if available, and reports whether it
+# holds any non-zero byte in its first MiB — GRUB actually embedded there,
+# versus a partition that exists but was never written to.
+#
+# Uses `-e`/`-r` rather than `-b` on the partition node deliberately: in
+# production this is always a kernel-created block device, but relaxing the
+# check lets scripts/machine-convert-test.sh exercise this exact function
+# against a plain file standing in for the partition, with no real GPT disk
+# or loop device required.
+bios_grub_partition_has_content() {
+  local dev="$1" pttype part pdev nz
+  command -v sgdisk >/dev/null 2>&1 || return 1
+  pttype="$(blkid -s PTTYPE -o value "$dev" 2>/dev/null || true)"
+  [ "$pttype" = "gpt" ] || return 1
+  part="$(sgdisk -p "$dev" 2>/dev/null | awk '$6=="EF02"{print $1}' | head -1)"
+  [ -n "$part" ] || return 1
+  pdev="${dev}${part}"
+  [ -e "$pdev" ] && [ -r "$pdev" ] || pdev="${dev}p${part}"
+  [ -e "$pdev" ] && [ -r "$pdev" ] || return 1
+  nz="$(dd if="$pdev" bs=1M count=1 2>/dev/null | tr -d '\0' | wc -c)"
+  [ "${nz:-0}" -gt 0 ]
+}
+
+# detect_mbrboot DEV -> "present" | "absent"
+#
+# Reports whether a BIOS/MBR bootloader is actually written into the disk's
+# boot sector — the thing `linode/direct-disk` boots (F-31: it boots the raw
+# MBR, not any filesystem's grub.cfg, which is exactly why linode/grub2
+# cannot read a config off a PARTITIONED disk but direct-disk boots the same
+# image unattended).
+#
+# GRUB's boot.img occupies a fixed 512-byte sector at LBA0. Live evidence
+# (F-31, at the grub> prompt of the real failing instance): byte offset 0
+# read `eb 63 90` and the literal string "GRUB" appeared within the sector.
+# The 0x55AA boot signature ALONE is not enough to conclude a bootloader is
+# present — every disk with a valid (MBR or protective-MBR/GPT) partition
+# table carries that signature whether or not GRUB was ever installed — so
+# both the signature AND the GRUB string in the code area must be present.
+#
+# Falls back to checking a GPT bios_grub/EF02 partition's content (see
+# bios_grub_partition_has_content) when the 512-byte sector alone doesn't
+# show it, since GRUB's core.img sometimes lives there instead.
+#
+# Deliberately checks `[ -r "$dev" ]`, not `[ -b "$dev" ]`: production only
+# ever calls this with the real migrated block device, but the relaxed check
+# lets the unit tests exercise it against a plain file with crafted bytes.
+detect_mbrboot() {
+  local dev="$1" hex
+  [ -n "$dev" ] && [ -r "$dev" ] || { echo absent; return 0; }
+  hex="$(dd if="$dev" bs=512 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  case "$hex" in
+    *55aa)
+      if dd if="$dev" bs=1 count=440 2>/dev/null | grep -qa 'GRUB'; then
+        echo present
+        return 0
+      fi
+      ;;
+  esac
+  if bios_grub_partition_has_content "$dev"; then
+    echo present
+    return 0
+  fi
+  echo absent
+}
+
 # Test hook: sourcing with VMREPL_CONVERT_LIB=1 loads the helper functions above
 # without running the conversion (no root, block device, traps or mounts), so
 # scripts/machine-convert-test.sh can exercise them in isolation.
@@ -797,25 +866,52 @@ if [ "\$BOOTLOADER" = "grub2" ]; then
     PTTYPE="\$(blkid -s PTTYPE -o value "\$DISK" 2>/dev/null || true)"
     log "Boot disk \$DISK (partition table: \${PTTYPE:-unknown})"
     log "Installing GRUB (BIOS/i386-pc) to \$DISK"
-    \$INSTALL --target=i386-pc --recheck "\$DISK" 2>&1 | sed 's/^/   [grub] /' || \
-      log "WARNING: grub-install failed (a GPT disk needs a small BIOS-boot/bios_grub partition for BIOS GRUB)"
+    # F-31: grub-install's real exit status must be captured via PIPESTATUS,
+    # not read off the trailing `sed` pipeline — sed almost always exits 0
+    # regardless of whether grub-install itself failed, which used to let a
+    # failed install through with only a log line, no machine-readable
+    # signal for the appliance. set +e/-e brackets the pipeline so a failing
+    # grub-install does not trip `set -e` before PIPESTATUS is read.
+    set +e
+    \$INSTALL --target=i386-pc --recheck "\$DISK" 2>&1 | sed 's/^/   [grub] /'
+    GRUBINSTALL_RC="\${PIPESTATUS[0]}"
+    set -e
+    if [ "\$GRUBINSTALL_RC" -eq 0 ]; then
+      echo "vmrepl-grubinstall: ok"
+    else
+      log "WARNING: grub-install failed (rc=\$GRUBINSTALL_RC) (a GPT disk needs a small BIOS-boot/bios_grub partition for BIOS GRUB)"
+      echo "vmrepl-grubinstall: failed"
+    fi
+  elif [ "$PARTITIONED" = "1" ]; then
+    log "WARNING: no grub-install/grub2-install tool found in the chroot — cannot write a BIOS/MBR bootloader (linode/direct-disk would have nothing to boot)"
+    echo "vmrepl-grubinstall: skipped-notool"
   elif [ "$PARTITIONED" != "1" ]; then
     log "partitionless whole-disk filesystem — no MBR to install GRUB into (Linode's own partitionless images work the same way). Regenerating grub.cfg only, skipping grub-install."
+    echo "vmrepl-grubinstall: skipped-partitionless"
   fi
   if [ -n "\$MK" ]; then
     log "Generating \$GCFG"
     \$MK 2>&1 | sed 's/^/   [grub] /' || true
     if [ -s "\$GCFG" ] && grep -qE '^[[:space:]]*(linux|linux16|menuentry)' "\$GCFG"; then
       log "GRUB config OK: \$GCFG"
+      echo "vmrepl-bootcfg: ok"
     else
+      echo "vmrepl-bootcfg: failed"
       echo "   [chroot] ERROR: \$GCFG is missing or has no boot entries; the disk would drop to a grub> prompt" >&2
       exit 3
     fi
   else
-    log "WARNING: a grub.cfg was detected before conversion, but no grub-mkconfig/update-grub tool was found in the chroot to regenerate it; leaving the existing grub.cfg as-is (it will lack the serial-console/virtio cmdline changes)"
+    # F-31: this used to be a WARNING with no machine-readable signal, so the
+    # script still exited 0 and the appliance reported the image "VALIDATED
+    # as bootable" even though the check never ran. vmrepl-bootcfg:
+    # skipped-notool tells the appliance this is NOT a pass — it is an
+    # unvalidated grub.cfg left exactly as it was found.
+    log "WARNING: a grub.cfg was detected before conversion, but no grub-mkconfig/update-grub tool was found in the chroot to regenerate it; leaving the existing grub.cfg as-is, UNVALIDATED (it will also lack the serial-console/virtio cmdline changes)"
+    echo "vmrepl-bootcfg: skipped-notool"
   fi
 else
   log "no bootloader detected on the image (vmrepl-bootloader: none) — relying on the Linode kernel to boot the root filesystem; skipping GRUB entirely"
+  echo "vmrepl-bootcfg: skipped-nobootloader"
 fi
 
 # 5) Network: reset to DHCP on eth0 and REMOVE the source's network config so it
@@ -965,6 +1061,15 @@ rm -f "$MNT/root/.convert-inner.sh"
 
 log "Syncing"
 sync
+
+# F-31: check the WHOLE disk's boot sector for an actual BIOS/MBR bootloader,
+# AFTER the chroot step above (which may just have written one via
+# grub-install) so this reflects the disk's real final state. This is what
+# the appliance uses to decide whether linode/direct-disk can boot this
+# image (it boots the MBR, not any filesystem's grub.cfg) — see
+# detect_mbrboot's comment and decideBootTarget in internal/appliance.
+log "Checking for a BIOS/MBR bootloader on $DEV"
+echo "vmrepl-mbrboot: $(detect_mbrboot "$DEV")"
 
 log "Conversion done. Next: in the Linode API/UI, create a config profile that"
 log "boots this disk (Kernel = GRUB 2, or Direct Disk) with the raw disk as sda,"

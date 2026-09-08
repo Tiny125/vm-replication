@@ -412,4 +412,104 @@ mkdir -p "$WORK/empty"
 [ "$(detect_bootloader "$WORK/empty")" = none ] \
   || fail "an empty image must be detected as none"
 
+# 18) F-31: detect_mbrboot decides whether linode/direct-disk can boot this
+#     disk (it boots whatever is in the MBR, not any filesystem's grub.cfg).
+#     Live evidence: byte offset 0 read `eb 63 90` and the literal string
+#     "GRUB" appeared in the first 512 bytes, alongside the standard 0x55AA
+#     boot signature at the end of the sector.
+#
+# make_mbr OUT GRUB_STRING(0|1) BOOT_SIG(0|1): builds a 512-byte sector.
+make_mbr() {
+  local out="$1" grub="$2" sig="$3" cur
+  : > "$out"
+  [ "$grub" = 1 ] && printf '\xeb\x63\x90GRUB' >> "$out"
+  cur=$(stat -c %s "$out")
+  dd if=/dev/zero bs=1 count=$((510 - cur)) >> "$out" 2>/dev/null
+  if [ "$sig" = 1 ]; then printf '\x55\xaa' >> "$out"; else printf '\x00\x00' >> "$out"; fi
+}
+
+# The exact bytes from the live disk (F-31): GRUB's code + string, plus the
+# boot signature -> present.
+MBR_GOOD="$WORK/mbr-good"
+make_mbr "$MBR_GOOD" 1 1
+[ "$(detect_mbrboot "$MBR_GOOD")" = present ] \
+  || fail "eb 63 90 + 'GRUB' string + 0x55AA signature (the live F-31 bytes) must be detected as present"
+
+# An all-zero sector (never had a bootloader written) -> absent.
+MBR_EMPTY="$WORK/mbr-empty"
+make_mbr "$MBR_EMPTY" 0 0
+[ "$(detect_mbrboot "$MBR_EMPTY")" = absent ] \
+  || fail "an all-zero boot sector must be detected as absent"
+
+# The 0x55AA boot signature ALONE (no GRUB string) must NOT count as
+# present: every disk with a valid partition table carries that signature,
+# with or without a bootloader — checking it alone would false-positive on
+# every partitioned disk, including ones with no bootloader at all.
+MBR_SIGONLY="$WORK/mbr-sigonly"
+make_mbr "$MBR_SIGONLY" 0 1
+[ "$(detect_mbrboot "$MBR_SIGONLY")" = absent ] \
+  || fail "the 0x55AA boot signature alone (no GRUB string) must NOT count as a bootloader present"
+
+# A missing/unreadable device must fail closed (absent), not error out --
+# detect_mbrboot must never abort the conversion under set -e.
+[ "$(detect_mbrboot "$WORK/does-not-exist")" = absent ] \
+  || fail "a missing device must be treated as absent, not error"
+
+# GPT bios_grub (EF02) fallback: when the 512-byte sector itself carries no
+# "GRUB" string (common when GRUB's core.img lives in the bios_grub partition
+# instead), a non-empty bios_grub/EF02 partition still counts as present.
+# blkid + sgdisk are stubbed the same way the swap tests above stub blkid --
+# host-independent, no real GPT disk required.
+blkid() {
+  case "$*" in
+    "-s PTTYPE -o value $MBR_SIGONLY") echo gpt; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+sgdisk() {
+  case "$*" in
+    "-p $MBR_SIGONLY") printf '   1            2048          411647   200.0 MiB   EF02  BIOS boot partition\n'; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+: > "${MBR_SIGONLY}1"   # the bios_grub partition node: empty -> no content yet
+[ "$(detect_mbrboot "$MBR_SIGONLY")" = absent ] \
+  || fail "an EMPTY bios_grub/EF02 partition must not count as a bootloader present"
+printf 'not-actually-grub-core-img-but-non-zero' > "${MBR_SIGONLY}1"
+[ "$(detect_mbrboot "$MBR_SIGONLY")" = present ] \
+  || fail "a non-empty bios_grub/EF02 partition must count as a bootloader present, even with no GRUB string in the protective MBR"
+unset -f blkid sgdisk
+rm -f "${MBR_SIGONLY}1"
+
+# 19) F-31: grub-install's exit status must be captured via PIPESTATUS, not
+#     lost through the `| sed` pipeline whose own (near-always-zero) exit
+#     code is what a bare `||` would otherwise see, and the result must be
+#     reported as a machine-readable vmrepl-grubinstall marker so the
+#     appliance can tell "installed" apart from "silently didn't".
+grep -qF 'GRUBINSTALL_RC="\${PIPESTATUS[0]}"' "$HERE/machine-convert.sh" \
+  || fail "grub-install's real exit status must be captured via PIPESTATUS[0], not read off the sed pipeline"
+grep -q 'vmrepl-grubinstall: ok' "$HERE/machine-convert.sh" \
+  || fail "convert must report vmrepl-grubinstall: ok on a successful install"
+grep -q 'vmrepl-grubinstall: failed' "$HERE/machine-convert.sh" \
+  || fail "convert must report vmrepl-grubinstall: failed when grub-install's real exit code is non-zero"
+grep -q 'vmrepl-grubinstall: skipped-notool' "$HERE/machine-convert.sh" \
+  || fail "convert must report vmrepl-grubinstall: skipped-notool when no grub-install/grub2-install tool exists in the chroot"
+grep -q 'vmrepl-grubinstall: skipped-partitionless' "$HERE/machine-convert.sh" \
+  || fail "convert must report vmrepl-grubinstall: skipped-partitionless on a partitionless whole-disk image"
+
+# 20) F-31: the "validated as bootable" grep on grub.cfg must not silently
+#     report success when it never ran. Today `if [ -n "$MK" ]` skips the
+#     whole check (and the config-generation) entirely when no
+#     grub-mkconfig/update-grub/grub2-mkconfig exists in the chroot, and the
+#     script still exits 0 -- reading as a validated, bootable image when
+#     nothing was validated at all. The skipped path must emit its own
+#     distinct marker so the appliance can tell "checked and OK" apart from
+#     "never checked".
+grep -q 'vmrepl-bootcfg: ok' "$HERE/machine-convert.sh" \
+  || fail "convert must report vmrepl-bootcfg: ok when the GRUB config was actually regenerated and verified"
+grep -q 'vmrepl-bootcfg: skipped-notool' "$HERE/machine-convert.sh" \
+  || fail "convert must report vmrepl-bootcfg: skipped-notool when grub-mkconfig/update-grub is unavailable, instead of silently exiting 0 as if it had been validated"
+grep -q 'vmrepl-bootcfg: skipped-nobootloader' "$HERE/machine-convert.sh" \
+  || fail "convert must report vmrepl-bootcfg: skipped-nobootloader when there is no bootloader to check at all"
+
 echo "machine-convert-test: all tests passed"

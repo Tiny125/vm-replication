@@ -1472,9 +1472,9 @@ func (s *Server) takeCutoverConvert(migID int64) (convertOutcome, bool) {
 // canceled=true if the run was cancelled (the caller should return). It never
 // fails the migration itself — the caller decides (fail fast in phase 1, or the
 // existing best-effort handling in phase 2). kernel/rootDevice default to the
-// GRUB2 path; the actual kernel choice is made by decideBootKernel from what
-// the convert script reports about the image (see its comment: partitioning
-// alone is NOT a reliable signal for this).
+// GRUB2 path; the actual kernel AND root device are decided together by
+// decideBootTarget from what the convert script reports about the image (see
+// its comment: partitioning alone is NOT a reliable signal for this).
 func (s *Server) convertBootDisk(ctx context.Context, m api.Migration, req api.FinalizeRequest) (convertOutcome, bool) {
 	sctx := s.ctx
 	co := convertOutcome{kernel: "linode/grub2", rootDevice: "/dev/sda"}
@@ -1507,14 +1507,19 @@ func (s *Server) convertBootDisk(ctx context.Context, m api.Migration, req api.F
 	if ctx.Err() != nil {
 		return co, true
 	}
-	// See decideBootKernel: the choice is driven by whether the image actually
-	// carries a usable bootloader (vmrepl-bootloader), not by partitioning.
-	co.kernel = decideBootKernel(string(out))
-	// Use the exact root device the convert script detected (e.g. /dev/sda1 for a
-	// partitioned disk) — booting a partitioned disk with root_device /dev/sda
-	// panics with "unable to mount root fs".
-	if rd := convertField(string(out), "vmrepl-root:"); rd != "" {
-		co.rootDevice = rd
+	// See decideBootTarget: kernel AND root device now come from the SAME
+	// decision. F-31: they used to be chosen independently — the kernel from
+	// decideBootKernel, the root device unconditionally from vmrepl-root — so a
+	// partitioned disk that fell back to linode/direct-disk (which only boots
+	// the WHOLE disk) could still be handed root_device=/dev/sda1 from
+	// vmrepl-root, which fails the boot outright (verified live:
+	// linode_reboot status=failed, no message). Bundling them in one result
+	// makes that pairing impossible to get wrong again.
+	bt := decideBootTarget(string(out))
+	co.kernel = bt.kernel
+	co.rootDevice = bt.rootDevice
+	if bt.warn != "" {
+		_ = s.st.AddEvent(sctx, m.ID, "warn", bt.warn)
 	}
 	co.fstab, co.hasFtab = parseFstabMarker(string(out))
 	// Surface unverifiable data mounts NOW. In a guided cutover this runs in
@@ -2728,45 +2733,114 @@ func convertField(out, key string) string {
 	return ""
 }
 
-// decideBootKernel (F-19) picks the Linode boot kernel from machine-convert.sh's
-// output. It used to be inferred from partitioning alone ("wholedisk" =>
-// Linode kernel), on the assumption that a partitionless filesystem has no
-// on-disk bootloader. That assumption is FALSE for Linode's own images:
-// queried live via the API, Linode's stock CentOS Stream 9 and Ubuntu 24.04
+// bootTargetResult is decideBootTarget's answer: which Linode kernel to boot
+// the migrated disk with, which device Linode should treat as root, and
+// (case 4 below) a warning to surface BEFORE the operator powers off the
+// source.
+type bootTargetResult struct {
+	kernel     string
+	rootDevice string
+	warn       string // non-empty => the caller must emit this as a loud warn event
+}
+
+// decideBootTarget (F-31) replaces decideBootKernel. F-19 (see its history,
+// preserved below) established that "vmrepl-layout: wholedisk" alone does not
+// mean "no bootloader": Linode's own partitionless CentOS Stream 9 / Ubuntu
+// images boot fine via linode/grub2, which reads boot/grub2|grub/grub.cfg
+// straight off the root filesystem.
+//
+// F-31 found the mirror-image trap on the OTHER side of that same signal,
+// live on a real AWS EC2 -> Linode migration: a PARTITIONED image with a
+// perfectly good, freshly regenerated grub.cfg still does not boot via
+// linode/grub2 — Linode's host-side GRUB never reads a config off a
+// partition. Proven at the grub> prompt, not inferred:
+//
+//	grub> ls (hd0,gpt16)/grub/grub.cfg      -> grub.cfg      (present, correct)
+//	grub> [drops straight to the shell; the config is never loaded]
+//
+// `linode/direct-disk` boots the SAME image unattended — verified live:
+// `09:07:58 ping=ICMP-REPLY ssh=tcp22-OPEN` — but ONLY with
+// root_device=/dev/sda (the WHOLE disk). root_device=/dev/sda1 FAILS the
+// boot outright (`linode_reboot status=failed`, no message). direct-disk
+// works by booting whatever BIOS bootloader is written into the MBR, so it
+// only applies when grub-install (or equivalent) actually wrote one — hence
+// the new `vmrepl-mbrboot:` marker (see detect_mbrboot in
+// scripts/machine-convert.sh).
+//
+// The ladder, evaluated in order (first match wins):
+//
+//  1. layout=wholedisk && bootloader=grub2  -> linode/grub2, root /dev/sda
+//     (the only case proven good before F-31: Linode's own partitionless
+//     images — unchanged by this fix).
+//  2. layout=partitioned && mbrboot=present -> linode/direct-disk, root /dev/sda
+//     (the F-31 fix, verified live against the AWS AMI above). The root
+//     device is ALWAYS the whole disk here, regardless of what vmrepl-root
+//     reports for the root partition — pairing direct-disk with a partition
+//     is exactly the trap that produced the unbootable machine this
+//     commit fixes.
+//  3. bootloader=none                       -> linode/latest-64bit, root = vmrepl-root
+//     (no usable bootloader at all; nothing else to try).
+//  4. layout=partitioned && mbrboot=absent  -> linode/latest-64bit, root = vmrepl-root,
+//     plus a loud warning. This is the UEFI-only / non-BIOS-GRUB source: a
+//     grub.cfg may exist, but with no MBR bootloader, direct-disk cannot boot
+//     it either. Linode's kernel runs instead of the distro's — which
+//     silently disabled SELinux on a migrated CentOS Stream 9 instance even
+//     though /etc/selinux/config still said "enforcing" (see the F-19 history
+//     below).
+//
+// A stale convert script that predates the vmrepl-bootloader marker entirely
+// (bootloader field absent) falls back to the pre-F-19 rule (wholedisk =>
+// latest-64bit, else grub2), so an appliance/script version skew regresses to
+// something previously safe, not to something new and unvalidated.
+//
+// --- F-19 history (why bootloader, not partitioning, drives the decision) ---
+// Queried live via the API, Linode's stock CentOS Stream 9 and Ubuntu 24.04
 // images are BOTH partitionless (root filesystem directly on /dev/sda, no
-// partition table) yet BOTH boot via `linode/grub2` — which reads
-// boot/grub2/grub.cfg (or boot/grub/grub.cfg) straight off the root
-// filesystem; no on-disk MBR bootloader is required. Booting a migrated
-// partitionless image with `linode/latest-64bit` instead runs the machine on
-// Linode's OWN kernel rather than its own — which silently disabled SELinux on
-// a migrated CentOS Stream 9 instance even though /etc/selinux/config still
-// said "enforcing" (no matching policy/modules for that distro), and loses any
-// other distro-specific kernel modules the same way.
-//
-// So the decision is now driven by whether the image actually carries a
-// usable bootloader — the `vmrepl-bootloader:` marker machine-convert.sh
-// emits after inspecting the mounted image root (see detect_bootloader in
-// scripts/machine-convert.sh) — not by partitioning:
-//
-//   - vmrepl-bootloader: grub2  -> linode/grub2         (own kernel, any layout)
-//   - vmrepl-bootloader: none   -> linode/latest-64bit  (no usable bootloader)
-//   - marker absent             -> OLD behaviour (wholedisk => latest-64bit),
-//     for back-compat with a convert script from before this marker existed;
-//     an appliance running a stale script must not regress to something worse.
-func decideBootKernel(out string) string {
-	switch convertField(out, "vmrepl-bootloader:") {
-	case "grub2":
-		return "linode/grub2"
-	case "none":
-		return "linode/latest-64bit"
+// partition table) yet BOTH boot via `linode/grub2`; no on-disk MBR
+// bootloader is required for that. Booting a migrated partitionless image
+// with `linode/latest-64bit` instead runs the machine on Linode's OWN kernel
+// rather than its own — which silently disabled SELinux on a migrated CentOS
+// Stream 9 instance even though /etc/selinux/config still said "enforcing"
+// (no matching policy/modules for that distro), and loses any other
+// distro-specific kernel modules the same way.
+func decideBootTarget(out string) bootTargetResult {
+	bootloader := convertField(out, "vmrepl-bootloader:")
+	layout := convertField(out, "vmrepl-layout:")
+	mbrboot := convertField(out, "vmrepl-mbrboot:")
+	rootDevice := convertField(out, "vmrepl-root:")
+	if rootDevice == "" {
+		rootDevice = "/dev/sda"
 	}
-	// Marker absent: a pre-F-19 convert script. Fall back to the old rule so a
-	// stale appliance/script pairing keeps its previous (safe-if-suboptimal)
-	// behaviour instead of picking a kernel it never validated.
-	if strings.Contains(out, "vmrepl-layout: wholedisk") {
-		return "linode/latest-64bit"
+
+	if bootloader == "" {
+		// Pre-F-19 script: no markers at all. Old (safe-if-suboptimal) rule.
+		if strings.Contains(out, "vmrepl-layout: wholedisk") {
+			return bootTargetResult{kernel: "linode/latest-64bit", rootDevice: rootDevice}
+		}
+		return bootTargetResult{kernel: "linode/grub2", rootDevice: "/dev/sda"}
 	}
-	return "linode/grub2"
+
+	switch {
+	case layout == "wholedisk" && bootloader == "grub2":
+		return bootTargetResult{kernel: "linode/grub2", rootDevice: "/dev/sda"}
+	case layout == "partitioned" && mbrboot == "present":
+		// F-31 fix: direct-disk boots the MBR, which only exists on the WHOLE
+		// disk — never the root partition vmrepl-root reports.
+		return bootTargetResult{kernel: "linode/direct-disk", rootDevice: "/dev/sda"}
+	case bootloader == "none":
+		return bootTargetResult{kernel: "linode/latest-64bit", rootDevice: rootDevice}
+	case layout == "partitioned" && mbrboot != "present":
+		return bootTargetResult{
+			kernel:     "linode/latest-64bit",
+			rootDevice: rootDevice,
+			warn:       "cutover: this image is PARTITIONED with a bootloader config but no BIOS/MBR bootloader written to the disk (F-31) — Linode cannot read a GRUB config off a partition, and there is nothing in the MBR for direct-disk to boot either. Falling back to linode/latest-64bit, which boots this image on LINODE'S OWN kernel instead of the source's. That has silently disabled SELinux on a real migration even though /etc/selinux/config still said \"enforcing\" — verify the guest's boot and security posture on the Lish console before you decommission the source.",
+		}
+	default:
+		// Combination the ladder above did not name explicitly (e.g. the layout
+		// marker missing while bootloader is present). Keep the historically
+		// proven-good default rather than guessing.
+		return bootTargetResult{kernel: "linode/grub2", rootDevice: "/dev/sda"}
+	}
 }
 
 // oneLine collapses whitespace/newlines to single spaces and caps the length,
