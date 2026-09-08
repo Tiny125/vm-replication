@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/tiny125/vm-replication/internal/api"
@@ -44,7 +45,10 @@ type cutoverStream struct {
 }
 
 // registerCutoverStream mints a token authorizing the image download for one
-// migration's cutover and returns it.
+// migration's cutover and returns it. This is also the start of a fresh
+// cutover COPY ATTEMPT (first try or a Retry after failure), so it resets
+// this migration's copy-progress tracking (see resetCutoverCopy) to a clean
+// "waiting for paste" state with the known total.
 func (s *Server) registerCutoverStream(migID int64, path string, bytes int64, ttl time.Duration) string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
@@ -52,7 +56,210 @@ func (s *Server) registerCutoverStream(migID int64, path string, bytes int64, tt
 	expires := time.Now().Add(ttl)
 	s.cutoverStreams.Store(tok, &cutoverStream{migID: migID, path: path, bytes: bytes, expires: expires})
 	s.persistCutoverStream(migID, tok, path, bytes, expires, "")
+	s.resetCutoverCopy(migID, bytes)
 	return tok
+}
+
+// ---- Cutover copy progress: real feedback during the Lish paste ----
+//
+// A real user pasted the copy command into Lish and had no idea what was
+// happening, whether to close the Weblish window, or what came next — the
+// appliance HAD this information (the exact byte total, known before the
+// paste; every byte it streams) and threw it away. cutoverCopyState tracks
+// it so the console can show three real states: waiting for the paste,
+// copying N% (with byte counts/elapsed/ETA), and finished.
+//
+// Kept in Server.cutoverCopy, a SEPARATE sync.Map from cutoverStreams/
+// cutoverCmds: those are erased by dropCutoverStream the INSTANT the bytes
+// finish sending (so the operator's Lish command stops working and the
+// action-needed banner disappears) — which would erase "finished" before the
+// console ever got to render it. This mirrors the existing
+// setCutoverFreezing/cutoverFreezingFor pattern (a sync.Map of migID ->
+// phase) rather than inventing a new shape.
+//
+// In-memory only, like the maps it mirrors: an appliance restart also kills
+// the operator's in-flight pasted `sh`, so there is no valid percentage to
+// resume — see cutoverCopyMarkInterrupted, called from restoreCutoverStream.
+type cutoverCopyState struct {
+	mu         sync.Mutex
+	total      int64     // exact bytes expected this attempt (known before the paste)
+	sent       int64     // bytes served so far THIS request/attempt
+	attempt    int       // increments each time a fresh /cutover/image request starts (paste or re-paste)
+	pastedAt   time.Time // handleCutoverScript was hit (script downloaded) — zero until then; set once, idempotent
+	startedAt  time.Time // first byte of the CURRENT attempt was served — zero until then
+	finishedAt time.Time // explicitly marked done (instance confirmed powered off) — zero until then
+
+	// interrupted is set by cutoverCopyMarkInterrupted after an appliance
+	// restart lost this migration's in-memory progress. The console must say
+	// the copy was interrupted and needs a fresh paste — never fabricate a
+	// resumed percentage.
+	interrupted bool
+}
+
+// resetCutoverCopy starts a fresh copy-progress attempt for a migration: a
+// clean "waiting for paste" state with the known total. Called by
+// registerCutoverStream (every fresh cutover / Retry mints a new stream).
+func (s *Server) resetCutoverCopy(migID, total int64) {
+	s.cutoverCopy.Store(migID, &cutoverCopyState{total: total})
+}
+
+// cutoverCopyMarkInterrupted records that an appliance restart lost this
+// migration's in-flight copy progress (the counter is in-memory only, and a
+// restart also kills the pasted command's live HTTP connection, so the
+// operator must re-paste regardless of how far the old process had gotten).
+// Called from restoreCutoverStream when a persisted stream/cmd survives the
+// restart (so a fresh paste will work) but the byte-progress that went with
+// it cannot — the console must show "interrupted, please re-paste", never a
+// resumed percentage.
+func (s *Server) cutoverCopyMarkInterrupted(migID, total int64) {
+	s.cutoverCopy.Store(migID, &cutoverCopyState{total: total, interrupted: true})
+}
+
+// cutoverCopyMarkPasted records that the copy SCRIPT was downloaded — i.e.
+// the operator pasted the command. Idempotent (curl can retry the script
+// fetch): it only flips pastedAt on the FIRST call, and that return value is
+// what the caller uses to log exactly one "pasted" event instead of one per
+// retry.
+func (s *Server) cutoverCopyMarkPasted(migID int64) bool {
+	v, ok := s.cutoverCopy.Load(migID)
+	if !ok {
+		return false // no attempt registered (unknown/expired) — nothing to mark
+	}
+	cs := v.(*cutoverCopyState)
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if !cs.pastedAt.IsZero() {
+		return false
+	}
+	cs.pastedAt = time.Now()
+	return true
+}
+
+// cutoverCopyBeginRequest resets the byte counter at the start of EVERY
+// /cutover/image request: a re-paste re-downloads the image from byte 0, so
+// the percentage must restart there rather than accumulate past 100% across
+// attempts. Also bumps the attempt counter and clears any stale finishedAt
+// from a previous (interrupted) attempt.
+func (s *Server) cutoverCopyBeginRequest(migID int64) {
+	v, ok := s.cutoverCopy.Load(migID)
+	if !ok {
+		return
+	}
+	cs := v.(*cutoverCopyState)
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.sent = 0
+	cs.attempt++
+	cs.startedAt = time.Now()
+	cs.finishedAt = time.Time{}
+}
+
+// cutoverCopyAddBytes records n more bytes served for the CURRENT attempt.
+func (s *Server) cutoverCopyAddBytes(migID, n int64) {
+	v, ok := s.cutoverCopy.Load(migID)
+	if !ok {
+		return
+	}
+	cs := v.(*cutoverCopyState)
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.sent += n
+}
+
+// cutoverCopyMarkFinished marks the copy step as fully done. Called from
+// migrations.go once the instance is confirmed POWERED OFF (the true
+// "copy done" signal — the pasted script's last action) — NOT merely once
+// all bytes have been handed to the network, which only proves the
+// appliance's send side is done. dropCutoverStream already erased the
+// stream/cmd by the time this runs, which is exactly why this state lives
+// in its own map.
+func (s *Server) cutoverCopyMarkFinished(migID int64) {
+	v, ok := s.cutoverCopy.Load(migID)
+	if !ok {
+		return
+	}
+	cs := v.(*cutoverCopyState)
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.finishedAt = time.Now()
+}
+
+// cutoverCopyView is a point-in-time, lock-free snapshot for the console/API
+// view and for building activity-log/failure messages.
+type cutoverCopyView struct {
+	Phase       string // "waiting" | "copying" | "finished"
+	SentBytes   int64
+	TotalBytes  int64
+	Attempt     int
+	ElapsedSecs int64
+	ETASecs     int64 // -1 when unknown
+	Interrupted bool
+}
+
+// cutoverCopyViewFor snapshots a migration's current copy progress. ok is
+// false only when no copy has ever been registered for this migration (e.g.
+// it hasn't reached the disk-boot copy step yet, or never will — volume
+// boot).
+func (s *Server) cutoverCopyViewFor(migID int64) (cutoverCopyView, bool) {
+	v, ok := s.cutoverCopy.Load(migID)
+	if !ok {
+		return cutoverCopyView{}, false
+	}
+	cs := v.(*cutoverCopyState)
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	out := cutoverCopyView{
+		SentBytes:   cs.sent,
+		TotalBytes:  cs.total,
+		Attempt:     cs.attempt,
+		Interrupted: cs.interrupted,
+		ETASecs:     -1,
+	}
+	switch {
+	case !cs.finishedAt.IsZero():
+		out.Phase = "finished"
+		if !cs.startedAt.IsZero() {
+			out.ElapsedSecs = int64(cs.finishedAt.Sub(cs.startedAt).Seconds())
+		}
+	case !cs.startedAt.IsZero():
+		out.Phase = "copying"
+		elapsed := time.Since(cs.startedAt)
+		out.ElapsedSecs = int64(elapsed.Seconds())
+		if cs.sent > 0 && cs.total > cs.sent && elapsed.Seconds() > 0 {
+			rate := float64(cs.sent) / elapsed.Seconds()
+			if rate > 0 {
+				out.ETASecs = int64(float64(cs.total-cs.sent) / rate)
+			}
+		}
+	default:
+		out.Phase = "waiting"
+	}
+	return out, true
+}
+
+// cutoverCopyProgressSummary renders a short human summary of a copy's
+// progress, used both for periodic activity-log events during the wait and
+// for the copy-budget-timeout failure message — so a timeout says exactly
+// how far the copy actually got instead of a generic "it didn't finish".
+func cutoverCopyProgressSummary(cv cutoverCopyView) string {
+	switch cv.Phase {
+	case "copying":
+		msg := fmt.Sprintf("copying — %s of %s", humanBytes(cv.SentBytes), humanBytes(cv.TotalBytes))
+		if cv.TotalBytes > 0 {
+			msg = fmt.Sprintf("copying — %.1f%% (%s of %s)", float64(cv.SentBytes)/float64(cv.TotalBytes)*100, humanBytes(cv.SentBytes), humanBytes(cv.TotalBytes))
+		}
+		if cv.ElapsedSecs > 0 {
+			msg += fmt.Sprintf(", elapsed %s", (time.Duration(cv.ElapsedSecs) * time.Second).Round(time.Second))
+		}
+		if cv.ETASecs >= 0 {
+			msg += fmt.Sprintf(", ETA ~%s", (time.Duration(cv.ETASecs) * time.Second).Round(time.Second))
+		}
+		return msg
+	case "finished":
+		return "the copy finished; finishing up (attaching data volumes and booting)"
+	default: // "waiting", or no copy registered yet
+		return "still waiting for the copy command to be pasted in the instance's Lish console"
+	}
 }
 
 // ---- F-24: survive an appliance restart mid-cutover -----------------------
@@ -147,6 +354,12 @@ func (s *Server) restoreCutoverStream(migID int64) bool {
 	if rec.Cmd != "" {
 		s.cutoverCmds.Store(migID, rec.Cmd)
 	}
+	// The copy command survives the restart, but any in-flight copy's
+	// progress does not (in-memory only, and the restart also killed the
+	// pasted `sh`'s live HTTP connection) — the console must say the copy
+	// was interrupted and needs a fresh paste, never fabricate how far the
+	// old process had gotten.
+	s.cutoverCopyMarkInterrupted(migID, rec.Bytes)
 	return true
 }
 
@@ -357,13 +570,58 @@ func (s *Server) handleCutoverScript(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "invalid or expired cutover token — use the exact command shown on the migration card (Retry cutover mints a new one)")
 		return
 	}
+	// Record that the paste happened — idempotently, since curl can retry the
+	// script fetch — so the console can move off "waiting for paste" and the
+	// activity log gets exactly one "pasted" event, not one per retry.
+	if s.cutoverCopyMarkPasted(st.migID) && s.st != nil {
+		_ = s.st.AddEvent(s.ctx, st.migID, "info", "the copy command was pasted in the instance's Lish console — streaming the image now")
+	}
 	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
 	_, _ = w.Write([]byte(s.rescueCopyScript(token, st.bytes)))
+}
+
+// cutoverImageChunkBytes is how much handleCutoverImage streams per io.CopyN
+// call (see streamImageChunked): small enough to report progress well before
+// a multi-GiB transfer finishes, but large enough that each call still
+// qualifies for the zero-copy sendfile fast path (io.CopyN from an *os.File
+// to an http.ResponseWriter that implements io.ReaderFrom) — wrapping the
+// writer in a plain counting io.Writer would silently disable that for a
+// 30 GiB transfer. Var, not const, so tests can shrink it and exercise many
+// chunks without serving a real 32 MiB+ file.
+var cutoverImageChunkBytes int64 = 32 << 20
+
+// streamImageChunked copies exactly total bytes from src to dst in
+// chunkSize-sized io.CopyN calls, invoking onChunk with the number of bytes
+// each call actually sent (so a caller can track progress incrementally
+// instead of learning the total only after everything has been sent).
+func streamImageChunked(dst io.Writer, src io.Reader, total, chunkSize int64, onChunk func(int64)) error {
+	remaining := total
+	for remaining > 0 {
+		n := chunkSize
+		if remaining < n {
+			n = remaining
+		}
+		written, err := io.CopyN(dst, src, n)
+		if written > 0 && onChunk != nil {
+			onChunk(written)
+		}
+		remaining -= written
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // handleCutoverImage streams the converted image (GET /cutover/image). Exactly
 // st.bytes are sent — the shrunk filesystem, not the whole volume — with a
 // Content-Length so the guest-side download can detect truncation.
+//
+// The byte count is reset at the START of every request (cutoverCopyBeginRequest)
+// so a re-paste restarts the reported percentage instead of exceeding 100% by
+// accumulating across attempts, and streamed in cutoverImageChunkBytes slices
+// so the console can show real mid-transfer progress instead of only
+// learning the transfer happened after the fact.
 func (s *Server) handleCutoverImage(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	st, ok := s.lookupCutoverStream(token)
@@ -388,7 +646,14 @@ func (s *Server) handleCutoverImage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", st.bytes))
-	if _, err := io.CopyN(w, f, st.bytes); err != nil {
+	s.cutoverCopyBeginRequest(st.migID)
+	err = streamImageChunked(w, f, st.bytes, cutoverImageChunkBytes, func(n int64) {
+		s.cutoverCopyAddBytes(st.migID, n)
+		if s.testAfterCutoverChunk != nil {
+			s.testAfterCutoverChunk()
+		}
+	})
+	if err != nil {
 		// Mid-stream failure: the connection is already committed, so just log —
 		// the guest-side dd fails short and the operator re-pastes the command.
 		log.Printf("appliance: cutover image stream for migration %d aborted: %v", st.migID, err)

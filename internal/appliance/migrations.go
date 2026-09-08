@@ -2007,13 +2007,25 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	}
 	_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf("ACTION NEEDED — instance %q (id %d) is in RESCUE MODE. Open its Lish console (Cloud Manager → Linodes → %s → Launch LISH Console) and paste the copy command shown on this card. It streams %s onto the local disk with live progress, then powers the instance off; the appliance finishes automatically from there.", instLabel, inst.ID, instLabel, humanBytes(streamBytes)))
 
-	// The pasted command signals completion by powering the instance off. Wait in
-	// 15-minute slices up to the size-aware budget (which also absorbs the human
-	// delay before the paste), emitting a progress event per slice so the wait is
-	// visibly alive.
+	// The pasted command signals completion by powering the instance off. Poll
+	// at a much finer grain (copyWaitPollInterval) than the overall budget so
+	// byte progress can be checked and reported often: WaitInstanceStatus
+	// already polls Linode's API every 5s internally regardless of the slice
+	// passed to it, so shrinking the outer slice adds NO extra API load — it
+	// just gives this loop more chances to read cutoverCopyViewFor and emit a
+	// progress-aware event.
+	//
+	// This used to emit one IDENTICAL message every 15 minutes, reading the
+	// same whether nothing had been pasted yet or the copy was 90% done — a
+	// real user watching the card had no way to tell. Now it
+	// emits on ~copyProgressEventPctStep steps or every
+	// copyProgressEventMaxGap, whichever comes first, using the real
+	// tracked byte count (cutoverCopyAddBytes, fed by handleCutoverImage).
 	copyStart := time.Now()
+	lastEventAt := time.Time{}
+	lastEventPct := -1.0
 	for {
-		slice := 15 * time.Minute
+		slice := copyWaitPollInterval
 		if rem := copyBudget - time.Since(copyStart); rem < slice {
 			slice = rem
 		}
@@ -2030,12 +2042,28 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 			break // powered off — copy complete
 		}
 		if time.Since(copyStart) < copyBudget {
-			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: waiting for the rescue copy to finish (%s elapsed of up to %s) — if you haven't yet, paste the copy command from this card into the instance's Lish console", time.Since(copyStart).Round(time.Minute), copyBudget.Round(time.Minute)))
+			cv, _ := s.cutoverCopyViewFor(m.ID)
+			pct := 0.0
+			if cv.TotalBytes > 0 {
+				pct = float64(cv.SentBytes) / float64(cv.TotalBytes) * 100
+			}
+			if lastEventAt.IsZero() || pct-lastEventPct >= copyProgressEventPctStep || time.Since(lastEventAt) >= copyProgressEventMaxGap {
+				_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("cutover: %s (%s elapsed of up to %s budget)", cutoverCopyProgressSummary(cv), time.Since(copyStart).Round(time.Second), copyBudget.Round(time.Minute)))
+				lastEventAt = time.Now()
+				lastEventPct = pct
+			}
 			continue
 		}
-		s.fail(m.ID, fmt.Sprintf("the rescue copy did not power the instance off within %s. Open the instance's Lish console: if the copy command was never run, click Retry cutover and paste the fresh command it shows; if a copy is still running there, let it finish (the instance powers itself off), then Retry cutover. Last error: %s", copyBudget.Round(time.Minute), werr.Error()))
+		cv, _ := s.cutoverCopyViewFor(m.ID)
+		s.fail(m.ID, fmt.Sprintf("the rescue copy did not power the instance off within %s. Open the instance's Lish console: if the copy command was never run, click Retry cutover and paste the fresh command it shows; if a copy is still running there, let it finish (the instance powers itself off), then Retry cutover. Progress when this timed out: %s. Last error: %s", copyBudget.Round(time.Minute), cutoverCopyProgressSummary(cv), werr.Error()))
 		return
 	}
+	// The TRUE "copy done" signal is the instance's confirmed power-off (the
+	// pasted script's last action) — not merely that all bytes were handed to
+	// the network. Mark it BEFORE dropCutoverStream erases the stream/cmd
+	// (cutoverCopyMarkFinished lives in its own map for exactly this reason:
+	// so "finished" is still visible to the console after that).
+	s.cutoverCopyMarkFinished(m.ID)
 	s.dropCutoverStream(m.ID) // copy done: kill the token and hide the command now
 	_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("image copied onto the local disk in %s; booting from the local disk", time.Since(copyStart).Round(time.Minute)))
 
@@ -2049,6 +2077,12 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 			s.fail(m.ID, fmt.Sprintf("wait data disk %d clone (volume %d) active: %v", d.Index, dataClones[i], err))
 			return
 		}
+	}
+	// Fill the second silent gap (measured live: nothing was logged between
+	// "image copied" and the final completion event, even though several
+	// more distinct steps run here) — one event per step from here on.
+	if len(dataDisks) > 0 {
+		_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("%d data volume(s) fully hydrated and ready to attach", len(dataDisks)))
 	}
 
 	// 6) Boot from the local disk (sda) with the data volumes attached at sdb+.
@@ -2068,6 +2102,11 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		s.fail(m.ID, "create boot config: "+err.Error())
 		return
 	}
+	if len(dataClones) > 0 {
+		_ = s.st.AddEvent(sctx, m.ID, "info", "boot configuration created; attaching data volume(s) and booting")
+	} else {
+		_ = s.st.AddEvent(sctx, m.ID, "info", "boot configuration created; booting the instance from its local disk")
+	}
 	// The config above is what ATTACHES the data volumes, and that attach is
 	// asynchronous — booting immediately races it and Linode rejects the boot
 	// (F-25). Wait for every volume to report itself attached to this instance
@@ -2076,6 +2115,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 	// that might yet succeed.
 	if len(dataClones) > 0 {
 		waitCtx, cancelWait := context.WithTimeout(ctx, volumeAttachWait)
+		attached := false
 		for {
 			if volumesAttachedTo(dataClones, inst.ID, func(id int64) (int64, error) {
 				v, verr := cl.GetVolume(ctx, id)
@@ -2084,6 +2124,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 				}
 				return v.LinodeID, nil
 			}) {
+				attached = true
 				break
 			}
 			select {
@@ -2095,6 +2136,11 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 			break
 		}
 		cancelWait()
+		if attached {
+			_ = s.st.AddEvent(sctx, m.ID, "info", fmt.Sprintf("%d data volume(s) confirmed attached", len(dataClones)))
+		} else {
+			_ = s.st.AddEvent(sctx, m.ID, "warn", fmt.Sprintf("data volume(s) did not confirm attached within %s — booting anyway (a slow attach is a worse reason to abandon a completed copy than a boot that might yet succeed)", volumeAttachWait.Round(time.Second)))
+		}
 	}
 
 	// Retry an immediate boot failure. retryBusy does not cover this: Linode
@@ -2124,6 +2170,7 @@ func (s *Server) finalizeDisk(ctx context.Context, m api.Migration, cl *linode.C
 		s.fail(m.ID, "boot from local disk: "+bootErr.Error())
 		return
 	}
+	_ = s.st.AddEvent(sctx, m.ID, "info", "boot requested; waiting for the instance to come up")
 	if err := cl.WaitInstanceStatus(ctx, inst.ID, "running", 10*time.Minute); err != nil {
 		if canceled() {
 			return
@@ -2433,6 +2480,20 @@ func (s *Server) view(ctx context.Context, m api.Migration, token string) api.Mi
 	v.UninstallCmd = s.uninstallCmd()
 	v.CutoverCopyCmd = s.cutoverCopyCmdFor(m.ID)
 	v.CutoverFreezing = s.cutoverFreezingFor(m.ID)
+	// Disk-boot cutover copy progress: waiting for the paste / copying N% /
+	// finished. Populated whenever a copy attempt has ever been registered
+	// for this migration — including after CutoverCopyCmd above is cleared
+	// at copy completion, which is exactly why "finished" needs its own
+	// signal (see cutoverCopyViewFor).
+	if cv, ok := s.cutoverCopyViewFor(m.ID); ok {
+		v.CutoverCopyPhase = cv.Phase
+		v.CutoverCopySentBytes = cv.SentBytes
+		v.CutoverCopyTotalBytes = cv.TotalBytes
+		v.CutoverCopyElapsedSeconds = cv.ElapsedSecs
+		v.CutoverCopyETASeconds = cv.ETASecs
+		v.CutoverCopyAttempt = cv.Attempt
+		v.CutoverCopyInterrupted = cv.Interrupted
+	}
 	// F-14: the measured spread between this migration's disks' cutover-time
 	// captures, if any landed (recordCutoverSkew never sets one for a
 	// single-disk migration, which has no skew to report).
@@ -2932,6 +2993,21 @@ func oneLine(s string) string {
 	}
 	return s
 }
+
+// copyWaitPollInterval is how often finalizeDisk's copy-wait loop breaks out
+// to check byte progress and consider logging an event. It is NOT how often
+// Linode's API gets polled — WaitInstanceStatus already polls every 5s
+// internally for however long it's given — so shrinking this adds no extra
+// API load; it only controls how responsive the progress reporting is.
+const copyWaitPollInterval = 20 * time.Second
+
+// copyProgressEventPctStep/copyProgressEventMaxGap gate the copy-wait loop's
+// activity-log events: emit on this many percentage points of progress, or
+// after this much time, whichever comes first. Replaces the old flat
+// 15-minute cadence, which read identically whether nothing had been pasted
+// yet or the copy was 90% done.
+const copyProgressEventPctStep = 5.0
+const copyProgressEventMaxGap = 2 * time.Minute
 
 // diskCopyTimeout budgets how long the disk-mode cutover waits for the in-guest
 // copy (volume → local disk, which ends by powering the instance off). A fixed

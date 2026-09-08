@@ -557,8 +557,24 @@ constrained by the plan's disk size.
 > powers the instance off — the appliance then boots it from the local disk
 > automatically. Typical copy time for an 80 GiB image is **15–30 minutes**
 > (it reads the appliance's already-hydrated volume, not a slow fresh clone);
-> **no temporary volume is created**. The activity log posts a status line
-> every 15 minutes while it waits.
+> **no temporary volume is created**.
+>
+> The card tracks **three states** while this runs, and answers the question
+> operators actually have — whether it's safe to close the Lish/Weblish
+> window: **waiting for paste** (keep the window open), **copying N%** (byte
+> counts, elapsed time and an ETA, updated every second — keep the window
+> open until this reports finished), and **finished** (the instance already
+> powered itself off automatically — safe to close the window now; the
+> appliance is attaching any data volumes and booting from there). The
+> activity log gets a matching progress-aware event (roughly every 5% or
+> every couple of minutes, whichever comes first) instead of one identical
+> message on a fixed timer, plus one event for each remaining step (data
+> volumes hydrated, boot config created, volumes attached, boot requested) so
+> nothing between "image copied" and the final completion event goes silent.
+> If the appliance restarts mid-copy, the in-flight percentage cannot survive
+> (a restart also kills the pasted command's live connection) — the card
+> says the copy was interrupted and needs a fresh paste, rather than
+> guessing at a resumed percentage.
 
 The console then shows a **one-line command**, e.g.:
 

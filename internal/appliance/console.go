@@ -1151,6 +1151,24 @@ function liveDur(sinceISO,fallbackSecs){
   if(isNaN(t)||t<=0)return fmtDur(fallbackSecs);
   return '<span class="livedur" data-since="'+t+'">'+fmtDur((Date.now()-t)/1000)+'</span>';
 }
+// cutoverCopyStatusHTML renders the live status line inside the disk-boot
+// cutover's "paste the command" banner — 'waiting' or 'copying' (with real
+// % / bytes / elapsed / ETA) — and always answers whether the Weblish window
+// may be closed: keep it open here, since closing it mid-copy isn't
+// confirmed safe. Separate from the 'finished' banner (see migCard), which
+// renders once the command itself is gone.
+function cutoverCopyStatusHTML(v){
+  const phase=v.cutover_copy_phase||'waiting';
+  if(phase==='copying'){
+    const tot=v.cutover_copy_total_bytes||0,sent=v.cutover_copy_sent_bytes||0;
+    const pct=tot>0?Math.min(100,sent/tot*100):0;
+    return '<b>Status: copying — '+pct.toFixed(1)+'%</b> ('+fmtBytes(sent)+' of '+fmtBytes(tot)+'), elapsed '+fmtDur(v.cutover_copy_elapsed_seconds)+
+      (v.cutover_copy_eta_seconds>=0?(', ETA ~'+fmtDur(v.cutover_copy_eta_seconds)):'')+
+      '. <b>Keep this Weblish window open</b> until this card reports the copy has finished.';
+  }
+  return '<b>Status: waiting</b> for the command above to be pasted. <b>Keep this Weblish window open</b> — do not close it until this card reports the copy has finished.'+
+    (v.cutover_copy_interrupted?' <i>(A previous copy attempt was interrupted by an appliance restart — paste the fresh command above to start again.)</i>':'');
+}
 function diskTable(m){const d=disks(m);if(!d.length)return '';
   let h='<table><tr><th>Disk</th><th>Device</th><th>Size</th><th>Port</th><th>Baseline</th><th>Volume / note</th></tr>';
   for(const x of d){const note=x.last_error?('<span class="x">'+esc(x.last_error)+'</span>'):(x.artifact_id?esc(x.artifact_id):(x.volume_id?('vol '+x.volume_id):'file'));
@@ -1310,6 +1328,16 @@ function migCard(v){
   // Rescue Mode and is waiting for the operator to paste ONE command in its Lish
   // console (the command streams the image onto the local disk and powers the
   // instance off; the appliance finishes automatically from there).
+  //
+  // Three real states, driven by v.cutover_copy_phase: 'waiting' (paste
+  // banner + command), 'copying' (same banner, now with live % / bytes /
+  // elapsed / ETA via cutoverCopyStatusHTML — refreshed every second by the
+  // #cutstat cell below, same as the rest of the live progress), and
+  // 'finished'. dropCutoverStream erases v.cutover_copy_cmd the INSTANT the
+  // bytes finish sending, so 'finished' is rendered from a SEPARATE banner
+  // keyed off the phase field alone (which survives that) — otherwise the
+  // whole post-copy stretch (hydrating volumes, attaching, booting) would go
+  // back to being silent, which is the bug being fixed here.
   if(m.state==='migrating' && v.cutover_copy_cmd){
     b+='<div class="banner warn">'+
       '<b>Action needed — copy the image onto the local disk.</b>'+
@@ -1318,7 +1346,11 @@ function migCard(v){
       '<div style="margin-top:4px">3. Paste this one line there:</div>'+
       '<div style="display:flex;gap:8px;align-items:flex-start;margin-top:6px"><pre id="cutcmd'+m.id+'" style="flex:1;margin:0">'+esc(v.cutover_copy_cmd)+'</pre>'+
       '<button onclick="copyText(document.getElementById(\'cutcmd'+m.id+'\').textContent,this)">Copy</button></div>'+
-      '<div style="font-size:12px;margin-top:6px">The copy shows live progress in the Lish session and powers the instance off when it finishes — the appliance then boots your server from its local disk automatically. Nothing else to click here.</div></div>';
+      '<div id="cutstat'+m.id+'" style="font-size:12px;margin-top:8px">'+cutoverCopyStatusHTML(v)+'</div></div>';
+  } else if(m.state==='migrating' && v.cutover_copy_phase==='finished'){
+    b+='<div class="banner ok">'+
+      '<b>Image copy finished.</b>'+
+      '<div style="margin-top:6px">The instance already powered itself off automatically once the copy completed — <b>it is safe to close the Weblish window now</b>. The appliance is finishing up (attaching any data volumes and booting your server from its local disk); this card will update automatically. This can take a few minutes.</div></div>';
   }
 
   // Two groups: pre-migration (environment readiness while replicating) and
@@ -1530,6 +1562,7 @@ function startTimers(){
         set('#disks'+id,disks(m).length+' disk(s)<br>'+(allDone(m)?'baseline done':'baselining'));
         set('#prog'+id,progressLine(v,m));
         set('#rpo'+id,rpoText(v,m));
+        set('#cutstat'+id,cutoverCopyStatusHTML(v)); // live % / bytes / elapsed / ETA while the copy runs
       }).catch(()=>{});
     });
   },1000);
