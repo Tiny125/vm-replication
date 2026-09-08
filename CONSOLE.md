@@ -42,10 +42,30 @@ For the manual/CLI workflow instead, see [`GETTING_STARTED.md`](docs/GETTING_STA
 Migration is **block-for-block**: the exact disk contents, not just files,
 replicated continuously (an initial full sync, then deltas every ~60s). At
 cutover the boot image is converted for Linode (virtio drivers, GRUB/
-initramfs, network, serial console) and **validated as bootable before you're
-asked to power off the source**. The source's users, passwords and SSH keys
-carry over, and a migration is capped at **8 disks** (Linode device slots
+initramfs, network, serial console) and **its GRUB configuration is checked
+for errors before you're asked to power off the source**. That check reads
+the config the converter just wrote — it is not a live boot, and (F-31) is
+not sufficient by itself on a partitioned disk: Linode's `linode/grub2` boot
+mode does not read a guest's `grub.cfg` off a partition at all, so the
+appliance instead picks `linode/direct-disk` (boots the disk's own MBR
+bootloader) or the Linode kernel, as appropriate — see "Boot target
+selection" below. The guest's actual boot is verified separately, once you
+launch (an ICMP/TCP check against the new instance; see the migration card's
+boot-verification note). The source's users, passwords and SSH keys carry
+over, and a migration is capped at **8 disks** (Linode device slots
 `sda`–`sdh`).
+
+**Boot target selection (F-31).** `linode/grub2` only reads a guest `grub.cfg`
+for a **partitionless** disk (the shape Linode's own images use). For a
+**partitioned** disk — every AWS AMI, most on-prem and other-cloud images —
+the appliance instead uses `linode/direct-disk`, which boots whichever BIOS
+bootloader the conversion wrote into the disk's MBR, provided one was written
+successfully. A partitioned source with no MBR bootloader (UEFI-only, or a
+non-GRUB bootloader) falls back to Linode's own kernel with a loud warning,
+since that runs a different kernel than the source's own — this has silently
+disabled SELinux on at least one real RHEL-family migration even though
+`/etc/selinux/config` still said `enforcing`. Verify the guest boot on the
+Lish console before decommissioning the source whenever that warning appears.
 
 The boot disk lands on the new Linode's own **local NVMe disk** (free with the
 plan); any further disks are cloned onto attached **Block Storage volumes**

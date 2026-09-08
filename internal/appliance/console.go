@@ -831,10 +831,10 @@ async function startMig(id,btn){
   // operator confirms the source is already powered off or idle, they can tick
   // the box to skip that quiesce. Step 3 launches.
   const how='<div style="margin-bottom:8px"><b>Cutover has 3 steps:</b>'+
-    '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> stop replication, take a consistent final pass (the source root is briefly remounted read-only), then <b>convert the boot image and validate it is bootable</b> — all while the source is still running, so any problem surfaces before you power off.</div>'+
+    '<div style="margin-top:6px"><b>Step 1 — now (this button):</b> stop replication, take a consistent final pass (the source root is briefly remounted read-only), then <b>convert the boot image and check its GRUB configuration for errors</b> — all while the source is still running, so a conversion problem surfaces before you power off. This checks the configuration file, not a live boot; the guest’s actual boot is verified separately after you launch.</div>'+
     '<div style="margin-top:4px"><b>Step 2:</b> once step 1 reports the image is validated, power off the source server.</div>'+
     '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> — '+(disk?('creates a new Linode'+planNote+' in <b>Rescue Mode</b> and shows a one-line copy command on this card; paste it in the instance’s Lish console. The copy streams the validated image onto the local disk with live progress, then the instance boots from that disk automatically.'):(meta.linode_type?('clones the validated image and launches a new Linode'+planNote+'.'):'clones every disk into launchable volumes.'))+'</div></div>';
-  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the final pass is current. The final pass tries to remount the source root <b>read-only</b> for a perfectly clean image — if writers are still holding the root open (normal on a running system), the cutover <b>automatically falls back</b> to the current crash-consistent data, which is fsck-repaired on convert and validated as bootable before you power anything off. Tick the box below to skip the read-only attempt if the source is already powered off or idle.</div>';
+  const prep='<div class="muted" style="font-size:12px;margin-top:8px"><b>Before you click:</b> stop the source’s databases/heavy writers and let the <b>RPO lag drop to ~0</b> so the final pass is current. The final pass tries to remount the source root <b>read-only</b> for a perfectly clean image — if writers are still holding the root open (normal on a running system), the cutover <b>automatically falls back</b> to the current crash-consistent data, which is fsck-repaired on convert and has its GRUB configuration checked for errors before you power anything off (a real boot is verified separately, after you launch). Tick the box below to skip the read-only attempt if the source is already powered off or idle.</div>';
   // Optional names/credentials the cutover applies — both methods CREATE the
   // instance (and, for volume boot, the cutover volume) at this step.
   const defName=esc((meta.name||'')+'-cutover');
@@ -1292,15 +1292,15 @@ function migCard(v){
   // Step 1 in progress (drain + freeze): the operator must NOT power off yet.
   if(m.state==='migrating' && v.cutover_freezing){
     b+='<div class="banner warn">'+
-      '<b>Preparing &amp; validating the boot image — keep the source server running.</b>'+
-      '<div style="margin-top:6px">The appliance is finishing the last replication pass, then converting the boot image and checking it is bootable — all BEFORE you power off, so any problem surfaces while the source is still running (this can take a few minutes on a large disk).</div>'+
+      '<b>Preparing the boot image — keep the source server running.</b>'+
+      '<div style="margin-top:6px">The appliance is finishing the last replication pass, then converting the boot image and checking its GRUB configuration for errors — all BEFORE you power off, so a conversion problem surfaces while the source is still running (this can take a few minutes on a large disk). This checks the configuration, not a live boot; the guest’s actual boot is verified separately once you launch.</div>'+
       '<div style="margin-top:4px">This card will tell you when it is safe to power off the source — <b>do not power it off yet</b>.</div></div>';
   }
   // Step 1 done: NOW the operator powers the source off, then launches.
   if(m.state==='awaiting_cutover'){
     b+='<div class="banner warn">'+
       '<b>Action needed — it is now safe to power off the source server.</b>'+
-      '<div style="margin-top:6px">✓ <b>Step 1 done</b> — replication is stopped and the boot image has been <b>converted and validated as bootable</b>.</div>'+
+      '<div style="margin-top:6px">✓ <b>Step 1 done</b> — replication is stopped and the boot image has been <b>converted, with its GRUB configuration checked for errors</b>. This does not test an actual boot — the guest’s boot is verified separately once you launch.</div>'+
       '<div style="margin-top:4px"><b>Step 2 — now:</b> <b>power off the source server</b> (so the old and new machines aren’t both running at once).</div>'+
       '<div style="margin-top:4px"><b>Step 3:</b> click <b>Launch instance</b> below to clone the validated image and launch.</div></div>';
   }

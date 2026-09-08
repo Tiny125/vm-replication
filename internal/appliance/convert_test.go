@@ -1,6 +1,9 @@
 package appliance
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // decideBootTarget (F-31) replaces decideBootKernel. F-19 established that
 // "vmrepl-layout: wholedisk" alone does not mean "no bootloader" (Linode's
@@ -165,6 +168,63 @@ func TestConvertFailureMountIssue(t *testing.T) {
 	} {
 		if convertFailureMountIssue(out) {
 			t.Errorf("did not expect mount-issue for: %q", out)
+		}
+	}
+}
+
+// F-31 (commit 2): the product used to claim "VALIDATED as bootable" on the
+// strength of one grep over the config the converter itself just wrote — and
+// that check was SKIPPED ENTIRELY (while the script still exited 0) whenever
+// no grub-mkconfig/update-grub tool existed in the chroot. bootcfgNote must
+// state plainly what was actually checked for every vmrepl-bootcfg value,
+// and must never claim a real boot was validated.
+func TestBootcfgNote(t *testing.T) {
+	cases := []struct {
+		status       string
+		mustContain  string
+		mustNotClaim bool // "validated as bootable" / "VALIDATED" must not appear
+	}{
+		{status: "ok", mustContain: "checked", mustNotClaim: true},
+		{status: "skipped-notool", mustContain: "NOT", mustNotClaim: true},
+		{status: "skipped-nobootloader", mustContain: "no GRUB", mustNotClaim: true},
+		{status: "", mustContain: "could not be checked", mustNotClaim: true},
+	}
+	for _, c := range cases {
+		t.Run(c.status, func(t *testing.T) {
+			got := bootcfgNote(c.status)
+			if got == "" {
+				t.Fatalf("bootcfgNote(%q) returned empty", c.status)
+			}
+			if !strings.Contains(got, c.mustContain) {
+				t.Errorf("bootcfgNote(%q) = %q, want it to contain %q", c.status, got, c.mustContain)
+			}
+			if c.mustNotClaim && strings.Contains(strings.ToLower(got), "validated as bootable") {
+				t.Errorf("bootcfgNote(%q) = %q must not claim a real boot was validated", c.status, got)
+			}
+		})
+	}
+	// The skipped-notool note in particular must read as UNVALIDATED, not as
+	// a pass — this is the exact path that used to exit 0 with no signal.
+	if !strings.Contains(bootcfgNote("skipped-notool"), "UNVALIDATED") {
+		t.Error(`bootcfgNote("skipped-notool") must say the config is UNVALIDATED, not silently pass`)
+	}
+}
+
+// cutoverStep1DoneMsg is the guided-cutover "step 1 done" activity-log line
+// shown to the operator right before they are told it is safe to power off
+// the source (migrations.go, formerly "the boot image was converted and
+// VALIDATED as bootable"). F-31: that phrase is exactly what sent a real
+// operator to decommission a source whose migrated machine never booted. The
+// new message must never claim a real boot was validated, and must say
+// clearly that the guest boot is checked separately (see verifyGuestBoot).
+func TestCutoverStep1DoneMsg(t *testing.T) {
+	for _, status := range []string{"ok", "skipped-notool", "skipped-nobootloader", ""} {
+		msg := cutoverStep1DoneMsg(status)
+		if strings.Contains(msg, "VALIDATED as bootable") {
+			t.Errorf("cutoverStep1DoneMsg(%q) = %q must not claim VALIDATED as bootable (F-31)", status, msg)
+		}
+		if !strings.Contains(msg, "does NOT prove the guest will boot") {
+			t.Errorf("cutoverStep1DoneMsg(%q) = %q must say this does not prove the guest boots", status, msg)
 		}
 	}
 }

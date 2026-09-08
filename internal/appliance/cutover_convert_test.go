@@ -43,15 +43,25 @@ func TestConsoleNeutralizesPostCutoverChecks(t *testing.T) {
 	}
 }
 
-// The block cutover flow must tell the operator, in the dialog and on the card,
-// that the boot image is converted and VALIDATED before they power off the source
-// — the whole point of moving the conversion into phase 1.
-func TestConsoleBlockCutoverValidatesBeforePowerOff(t *testing.T) {
+// F-31: the console used to tell the operator the boot image was "VALIDATED
+// as bootable" — on the strength of one grep over a GRUB config the
+// converter had just written itself, which is not evidence of an actual
+// boot. A real AWS EC2 -> Linode migration reported exactly that and
+// produced a machine that sat at a grub> prompt. The dialog and the
+// awaiting-cutover banner must say what was actually checked (the GRUB
+// configuration, not a live boot) and must not claim a boot was validated.
+func TestConsoleBlockCutoverChecksConfigNotBoot(t *testing.T) {
 	js := extractJSFunc(t, "async function startMig(")
-	if !strings.Contains(js, "convert the boot image and validate") {
-		t.Error("cutover dialog should say step 1 converts + validates the boot image before power-off")
+	if !strings.Contains(js, "check its GRUB configuration") {
+		t.Error("cutover dialog should say step 1 converts the boot image and checks its GRUB configuration, not that it validates a boot")
 	}
-	if !strings.Contains(consoleHTML, "converted and validated as bootable") {
-		t.Error("awaiting-cutover banner should confirm the image was validated before power-off")
+	if strings.Contains(js, "validate it is bootable") {
+		t.Error(`cutover dialog must not say "validate it is bootable" (F-31: that is not what the check proves)`)
+	}
+	if !strings.Contains(consoleHTML, "GRUB configuration checked for errors") {
+		t.Error("awaiting-cutover banner should say the GRUB configuration was checked, not that the image was validated bootable")
+	}
+	if strings.Contains(consoleHTML, "converted and validated as bootable") {
+		t.Error(`awaiting-cutover banner must not say "converted and validated as bootable" (F-31)`)
 	}
 }

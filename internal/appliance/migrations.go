@@ -1431,8 +1431,7 @@ func (s *Server) finalize(ctx context.Context, m api.Migration, req api.Finalize
 		s.pendingCutover[m.ID] = req
 		s.recMu.Unlock()
 		_ = s.st.SetMigrationState(sctx, m.ID, api.MigAwaitingCutover, "")
-		_ = s.st.AddEvent(sctx, m.ID, "info",
-			"cutover step 1 done: the boot image was converted and VALIDATED as bootable. It is now safe to POWER OFF the source server — then click \"Launch instance\" to clone and launch.")
+		_ = s.st.AddEvent(sctx, m.ID, "info", cutoverStep1DoneMsg(co.bootcfg))
 		return
 	}
 	s.finalizeComplete(ctx, m, req)
@@ -1451,6 +1450,15 @@ type convertOutcome struct {
 	// had to be marked nofail because they did not.
 	fstab   fstabMarker
 	hasFtab bool
+	// bootcfg is machine-convert.sh's vmrepl-bootcfg marker (F-31): "ok" (the
+	// GRUB config was regenerated and checked for boot entries), "skipped-notool"
+	// (a grub.cfg existed but no grub-mkconfig/update-grub was found in the
+	// chroot, so it was left as-is, UNCHECKED), "skipped-nobootloader" (no
+	// bootloader on the image — nothing to check), or "" (a convert script
+	// from before this marker existed). The old text claimed the image was
+	// "VALIDATED as bootable" even on the skipped-notool path, where nothing
+	// was actually checked — see bootcfgNote / cutoverStep1DoneMsg.
+	bootcfg string
 }
 
 // storeCutoverConvert / takeCutoverConvert cache a guided cutover's phase-1
@@ -1520,6 +1528,14 @@ func (s *Server) convertBootDisk(ctx context.Context, m api.Migration, req api.F
 	co.rootDevice = bt.rootDevice
 	if bt.warn != "" {
 		_ = s.st.AddEvent(sctx, m.ID, "warn", bt.warn)
+	}
+	// F-31: the GRUB-config check is sometimes SKIPPED ENTIRELY (no
+	// grub-mkconfig/update-grub tool in the chroot) while the convert script
+	// still exits 0 — surface that distinctly here, not just fold it into a
+	// generic success message, so it cannot read as "checked and fine".
+	co.bootcfg = convertField(string(out), "vmrepl-bootcfg:")
+	if co.bootcfg == "skipped-notool" {
+		_ = s.st.AddEvent(sctx, m.ID, "warn", "cutover: the boot disk's GRUB configuration could NOT be checked — no grub-mkconfig/update-grub tool was found in the conversion environment, so the existing config was left as-is, UNVALIDATED. This is not a validated bootable image; check the guest boot carefully (Lish console) before decommissioning the source.")
 	}
 	co.fstab, co.hasFtab = parseFstabMarker(string(out))
 	// Surface unverifiable data mounts NOW. In a guided cutover this runs in
@@ -2841,6 +2857,39 @@ func decideBootTarget(out string) bootTargetResult {
 		// proven-good default rather than guessing.
 		return bootTargetResult{kernel: "linode/grub2", rootDevice: "/dev/sda"}
 	}
+}
+
+// bootcfgNote (F-31) turns machine-convert.sh's vmrepl-bootcfg marker into a
+// short, honest clause for the cutover activity log. The product used to say
+// the boot image was "VALIDATED as bootable" on the strength of one grep
+// over the GRUB config the converter had JUST WRITTEN ITSELF — which is not
+// evidence of an actual boot, and which was silently SKIPPED ENTIRELY
+// whenever the conversion environment had no grub-mkconfig/update-grub tool
+// (the script still exited 0). This never claims a real boot was tested —
+// only what was actually checked; verifyGuestBoot is what tests a real boot,
+// once the operator launches.
+func bootcfgNote(status string) string {
+	switch status {
+	case "ok":
+		return "its GRUB configuration was regenerated and checked for boot entries (this checks the config file, not a live boot)"
+	case "skipped-notool":
+		return "its GRUB configuration could NOT be checked — no grub-mkconfig/update-grub tool was found in the conversion environment, so the existing config was left as-is, UNVALIDATED"
+	case "skipped-nobootloader":
+		return "it has no GRUB configuration to check (this image boots via the Linode kernel instead)"
+	default:
+		return "its boot configuration could not be checked (an older conversion script that predates this check)"
+	}
+}
+
+// cutoverStep1DoneMsg is the guided-cutover "step 1 done" activity-log line
+// shown right before the operator is told it is safe to power off the
+// source. It used to read "the boot image was converted and VALIDATED as
+// bootable" — the exact phrase a real operator saw right before decommissioning
+// a source whose migrated machine never booted (F-31). It now states plainly
+// what was checked (see bootcfgNote) and that a real boot is verified
+// separately, once the operator launches (see verifyGuestBoot).
+func cutoverStep1DoneMsg(bootcfg string) string {
+	return fmt.Sprintf("cutover step 1 done: the boot image was converted; %s. This does NOT prove the guest will boot — the guest's boot is verified separately once you launch. It is now safe to POWER OFF the source server — then click \"Launch instance\" to clone and launch.", bootcfgNote(bootcfg))
 }
 
 // oneLine collapses whitespace/newlines to single spaces and caps the length,
